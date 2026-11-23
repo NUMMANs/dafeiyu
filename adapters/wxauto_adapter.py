@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bot_core import bot_core
 from config import UPLOADS_DIR, settings
+from pet_engine import pet_engine
 
 logger = logging.getLogger("dafeiyu.wxauto")
 
@@ -112,10 +113,20 @@ class WxAutoAdapter:
         return None
 
     def _dispatch_message(self, group_name: str, msg, chat, wx=None) -> None:
-        # 忽略启动前就已存在的历史消息，防止刚启动时刷屏回复旧消息
+        # 启动前就已存在的历史消息：不触发回复，但静默写入短期记忆，让大肥鱼刚启动就懂群里刚才在聊啥！
         create_time = getattr(msg, "create_time", None)
         if isinstance(create_time, (int, float)) and create_time > 0:
             if create_time < self._start_ts - 3:
+                raw_hist = self._clean_group_text(str(getattr(msg, "content", "") or ""))
+                if raw_hist and not self._is_non_text_xml(raw_hist):
+                    hist_sender = str(getattr(msg, "sender", "群友") or "群友")
+                    is_me = getattr(msg, "is_self", False) or str(getattr(msg, "attr", "")).lower() == "self"
+                    pet_engine.append_history(
+                        group_id=group_name,
+                        sender=settings.BOT_NAME if is_me else hist_sender,
+                        role="assistant" if is_me else "user",
+                        content=raw_hist[:200],
+                    )
                 return
 
         if getattr(msg, "is_self", False) or getattr(msg, "is_system", False):

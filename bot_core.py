@@ -394,10 +394,10 @@ class DaFeiYuBotCore:
                     # 用过一次后清除，避免后续普通聊天重复识同一张图
                     self._recent_group_images.pop((group_id, sender), None)
 
-        # 6. 调用 DeepSeek 多模态大脑
+        # 6. 调用 DeepSeek 多模态大脑（拉取最近 22 条群聊记录，保证多人群聊不断片）
         status = pet_engine.get_status()
         user_aff = pet_engine.get_user_affinity(group_id, sender)
-        recent = pet_engine.get_recent_history(group_id, limit=10)
+        recent = pet_engine.get_recent_history(group_id, limit=22)
         prompt_text = self._strip_trigger(clean_text)
 
         brain_reply = brain.reply(

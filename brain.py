@@ -331,7 +331,11 @@ class DaFeiYuBrain:
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
-        for item in recent_history[-8:]:
+        # 注入最近 20 条群聊上下文（排除刚写入的当前这条，避免重复），让大肥鱼真正跟得上群里聊的每一句
+        history_slice = recent_history[-21:]
+        if history_slice and history_slice[-1].get("role") == "user" and history_slice[-1].get("sender") == sender and (history_slice[-1].get("content") or "").strip() == text.strip():
+            history_slice = history_slice[:-1]
+        for item in history_slice[-20:]:
             role = "assistant" if item["role"] == "assistant" else "user"
             prefix = "" if role == "assistant" else f"[{item['sender']}]: "
             content = item["content"] or ("[发了一张图片]" if item.get("image_path") else "")
