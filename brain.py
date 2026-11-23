@@ -614,6 +614,41 @@ class DaFeiYuBrain:
             logger.warning("自主插嘴判断异常: %s", exc)
             return None
 
+    def is_talking_to_or_about_me(self, sender: str, text: str, recent_history: list[dict]) -> bool:
+        """
+        极轻量上下文指代判断（仅输出 YES / NO，~0.6秒）：
+        当群友没点名“大肥鱼”，但大肥鱼刚在群里说过话、或消息里提到了“你/他/它/头像/小号”等时，
+        结合最近几条上下文判断这句话是不是在跟大肥鱼继续聊或在议论大肥鱼。
+        """
+        if not settings.has_valid_api_key or not text.strip():
+            return False
+        ctx_lines = [
+            f"[{m['sender']}]: {m['content']}"
+            for m in recent_history[-6:]
+            if m.get("content")
+        ]
+        ctx = "\n".join(ctx_lines)
+        prompt = (
+            f"你是群里的「{settings.BOT_NAME}」（群友也叫你塔菲、鱼、机器人、小号）。\n"
+            f"刚才群里的聊天记录：\n{ctx}\n\n"
+            f"现在 [{sender}] 发了一句新消息：「{text}」\n"
+            f"请判断这句话是不是在继续跟你说话、接你的话茬、或者在议论你（比如评价你的头像、反应、智商、功能）？\n"
+            f"只输出 YES 或 NO，不要输出任何其他字。"
+        )
+        try:
+            resp = self._get_chat_client().chat.completions.create(
+                model=settings.DEEPSEEK_CHAT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            ans = (resp.choices[0].message.content or "").strip().upper()
+            logger.info("🧭 上下文指代判定 [%s]: %s -> %s", sender, text[:30], ans)
+            return "YES" in ans
+        except Exception as exc:
+            logger.warning("上下文指代判定异常: %s", exc)
+            return False
+
     def generate_autonomous_bubble(self, kind: str, status: PetStatus) -> BrainReply:
         """生成定时作息 / 饿扁催饭的主动冒泡发言"""
         if not settings.has_valid_api_key:

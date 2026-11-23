@@ -39,6 +39,12 @@ PRIVATE_LOGISTICS_CUES = (
 )
 
 
+# 即使没叫名字，也可能是在议论大肥鱼或延续对话的指代词
+ABOUT_ME_CUES = (
+    "你", "他", "它", "她", "这鱼", "那鱼", "机器人", "ai", "小号", "头像", "换了", "塔菲",
+)
+
+
 @dataclass
 class BotResponse:
     should_reply: bool
@@ -70,6 +76,7 @@ class DaFeiYuBotCore:
         self._unanswered_count: dict[str, int] = {}
         self._last_proactive_ts: dict[str, float] = {}
         self._last_assistant_ts: dict[str, float] = {}
+        self._last_bot_reply_ts: dict[str, float] = {}
         self._last_group_activity_ts: dict[str, float] = {}
         self._last_hungry_bubble_ts: dict[str, float] = {}
         self._last_evening_bubble_date: dict[str, str] = {}
@@ -356,8 +363,18 @@ class DaFeiYuBotCore:
                 )
                 return cmd_resp
 
-        # 4. 判断文本消息是否触发大肥鱼；若未直接触发，交给 HeartFlow 氛围电量引擎判断要不要冒泡
-        if image_path is None and not self._is_triggered(group_id, clean_text, force_trigger=force_trigger):
+        # 4. 判断文本消息是否触发大肥鱼；
+        # 若未直接命中关键词，先检查「对话粘性窗口(120秒内刚聊过)」或「群友在议论他」
+        triggered = self._is_triggered(group_id, clean_text, force_trigger=force_trigger)
+        if image_path is None and not triggered:
+            in_active_window = (now - self._last_bot_reply_ts.get(group_id, 0.0)) <= 120
+            mentions_pronoun = any(c in clean_text.lower() for c in ABOUT_ME_CUES)
+            if (in_active_window and len(clean_text) >= 2) or (mentions_pronoun and len(clean_text) >= 4):
+                recent_ctx = pet_engine.get_recent_history(group_id, limit=6)
+                if brain.is_talking_to_or_about_me(sender, clean_text, recent_ctx):
+                    triggered = True
+
+        if image_path is None and not triggered:
             return self._maybe_proactive_chime_in(group_id, sender, clean_text, now)
 
         # 一旦被正式触发，适当消耗社交电量并重置计数
@@ -405,8 +422,9 @@ class DaFeiYuBotCore:
             affinity_delta=3 if brain_reply.used_vision else 2,
         )
 
-        # 更新情绪惯性
+        # 更新情绪惯性 & 记录最近一次发言时间（激活 120 秒对话粘性窗口）
         emotion_sm.on_bot_reply(group_id, brain_reply.mood)
+        self._last_bot_reply_ts[group_id] = time.time()
 
         # 8. 如果 Agent 工具产出了附件图片（如桌面截屏），优先发附件；否则按概率发表情包
         sticker_path = None
