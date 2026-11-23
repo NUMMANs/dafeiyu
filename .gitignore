@@ -1,0 +1,18 @@
+# 严禁提交密钥与私密配置
+.env
+
+# 运行时数据、数据库、缓存与记忆文件
+data/
+state/
+stickers/web_cache/
+stickers/stolen/
+wechatauto_logs/
+*.log
+
+# Python 与临时文件
+__pycache__/
+*.py[cod]
+*.tmp
+*.bak
+.venv/
+venv/

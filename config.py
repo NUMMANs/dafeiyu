@@ -1,0 +1,94 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+STICKERS_DIR = BASE_DIR / "stickers"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STICKERS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 加载 .env（如不存在则回退环境变量）
+load_dotenv(BASE_DIR / ".env")
+
+
+def _parse_bool(val: str | None, default: bool = True) -> bool:
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_list(val: str | None, default: list[str]) -> list[str]:
+    if not val:
+        return default
+    items = [x.strip() for x in val.split(",") if x.strip()]
+    return items or default
+
+
+class Settings:
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+    DEEPSEEK_CHAT_MODEL: str = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-flash").strip()
+    DEEPSEEK_VISION_MODEL: str = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-flash").strip()
+
+    VISION_API_KEY: str = os.getenv("VISION_API_KEY", "").strip()
+    VISION_BASE_URL: str = os.getenv("VISION_BASE_URL", "").strip()
+
+    BOT_NAME: str = os.getenv("BOT_NAME", "大肥鱼").strip()
+    TRIGGER_KEYWORDS: list[str] = _parse_list(
+        os.getenv("TRIGGER_KEYWORDS"), ["@大肥鱼", "大肥鱼", "肥鱼"]
+    )
+    GROUP_AT_ONLY: bool = _parse_bool(os.getenv("GROUP_AT_ONLY"), True)
+    AUTO_ROAST_IMAGE_PROB: float = float(os.getenv("AUTO_ROAST_IMAGE_PROB", "0.35"))
+    STICKER_REPLY_PROB: float = float(os.getenv("STICKER_REPLY_PROB", "0.75"))
+
+    # 自主意识与联网搜索配置
+    ENABLE_WEB_SEARCH: bool = _parse_bool(os.getenv("ENABLE_WEB_SEARCH"), True)
+    ZHIPU_API_KEY: str = os.getenv("ZHIPU_API_KEY", "").strip()
+    BOCHA_API_KEY: str = os.getenv("BOCHA_API_KEY", "").strip()
+    TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "").strip()
+    SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "").strip()
+    ENABLE_PROACTIVE_CHIME: bool = _parse_bool(os.getenv("ENABLE_PROACTIVE_CHIME"), True)
+    PROACTIVE_MSG_THRESHOLD: int = int(os.getenv("PROACTIVE_MSG_THRESHOLD", "6"))
+    PROACTIVE_COOLDOWN_SEC: int = int(os.getenv("PROACTIVE_COOLDOWN_SEC", "480"))
+    ENABLE_SCHEDULED_BUBBLE: bool = _parse_bool(os.getenv("ENABLE_SCHEDULED_BUBBLE"), True)
+    QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "23"))
+    QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))
+
+    # 常规桌面 Agent 电脑操作权限
+    ENABLE_AGENT_TOOLS: bool = _parse_bool(os.getenv("ENABLE_AGENT_TOOLS"), True)
+    # 允许操纵电脑的主人昵称（逗号分隔，留空表示专用电脑/虚拟机内不限制；在多人大群里建议填你自己的微信名）
+    OWNER_NAMES: list[str] = [
+        x.strip() for x in os.getenv("OWNER_NAMES", "").split(",") if x.strip()
+    ]
+
+    RUN_MODE: str = os.getenv("RUN_MODE", "web").strip().lower()
+    WX_GROUP_WHITELIST: list[str] = _parse_list(
+        os.getenv("WX_GROUP_WHITELIST"), ["大肥鱼测试群"]
+    )
+    # QQ 群白名单（填 QQ 群号，多个用英文逗号分隔；留空表示允许所有已加入的 QQ 群）
+    QQ_GROUP_WHITELIST: list[str] = [
+        x.strip() for x in os.getenv("QQ_GROUP_WHITELIST", "").split(",") if x.strip()
+    ]
+    QQ_ONEBOT_TOKEN: str = os.getenv("QQ_ONEBOT_TOKEN", "").strip()
+
+    WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1").strip()
+    WEB_PORT: int = int(os.getenv("WEB_PORT", "8765"))
+
+    @property
+    def has_valid_api_key(self) -> bool:
+        return bool(self.DEEPSEEK_API_KEY) and not self.DEEPSEEK_API_KEY.startswith("sk-你的")
+
+    @property
+    def effective_vision_api_key(self) -> str:
+        return self.VISION_API_KEY or self.DEEPSEEK_API_KEY
+
+    @property
+    def effective_vision_base_url(self) -> str:
+        return self.VISION_BASE_URL or self.DEEPSEEK_BASE_URL
+
+
+settings = Settings()
