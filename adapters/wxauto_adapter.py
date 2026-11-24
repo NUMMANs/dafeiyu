@@ -8,6 +8,7 @@ from pathlib import Path
 from bot_core import bot_core
 from config import UPLOADS_DIR, settings
 from pet_engine import pet_engine
+from scheduler import scheduler
 
 logger = logging.getLogger("dafeiyu.wxauto")
 
@@ -180,13 +181,15 @@ class WxAutoAdapter:
             if idx < len(bubbles) - 1:
                 time.sleep(0.15)
 
-        if resp.sticker_path and resp.sticker_path.is_file():
+        if resp.sticker_path and resp.sticker_path.is_file() and resp.sticker_path.stat().st_size > 0:
             time.sleep(0.15)
             sticker_abs = str(resp.sticker_path.resolve())
             if hasattr(chat, "SendFiles"):
-                chat.SendFiles(sticker_abs)
+                send_res = chat.SendFiles(sticker_abs)
+                logger.info("[%s] 发送附件 [%s] 结果: %s", group_name, resp.sticker_path.name, send_res)
             elif hasattr(chat, "SendImage"):
-                chat.SendImage(sticker_abs)
+                send_res = chat.SendImage(sticker_abs)
+                logger.info("[%s] 发送图片 [%s] 结果: %s", group_name, resp.sticker_path.name, send_res)
 
     def run_forever(self) -> None:
         WeChat = None
@@ -238,12 +241,42 @@ class WxAutoAdapter:
             if hasattr(wx, "StartListening"):
                 wx.StartListening()
 
-            # 定时自主巡检（每 5 分钟检查一次：饿扁催饭 / 晚间冒泡）
+            # 后台巡检循环：每 15 秒检查用户自定义定时任务，每 5 分钟检查自主冒泡与夜间记忆养护
             last_heartbeat = time.time()
+            last_schedule_check = time.time()
             while not self._stop_event.is_set():
                 time.sleep(1.0)
-                if (time.time() - last_heartbeat) >= 300:
-                    last_heartbeat = time.time()
+                now_loop = time.time()
+
+                # 1. 每 15 秒检查到点的用户定时任务
+                if (now_loop - last_schedule_check) >= 15:
+                    last_schedule_check = now_loop
+                    for task in scheduler.pop_due_tasks():
+                        target_group = task.get("group_id")
+                        if not target_group:
+                            continue
+                        try:
+                            logger.info("⏰ 触发定时任务 #%s -> [%s]: %s", task.get("id"), target_group, task.get("content"))
+                            t_resp = bot_core.execute_scheduled_task(task)
+                            if t_resp and t_resp.should_reply:
+                                for idx, b in enumerate(t_resp.get_bubbles()):
+                                    wx.SendMsg(b, who=target_group)
+                                    if idx < len(t_resp.get_bubbles()) - 1:
+                                        time.sleep(0.15)
+                                if (
+                                    t_resp.sticker_path
+                                    and t_resp.sticker_path.is_file()
+                                    and t_resp.sticker_path.stat().st_size > 0
+                                ):
+                                    time.sleep(0.15)
+                                    send_res = wx.SendFiles(str(t_resp.sticker_path.resolve()), who=target_group)
+                                    logger.info("⏰ 定时任务发送附件 [%s] 结果: %s", t_resp.sticker_path.name, send_res)
+                        except Exception as exc:
+                            logger.warning("执行定时任务 #%s 异常: %s", task.get("id"), exc)
+
+                # 2. 每 5 分钟检查自主冒泡 & 23:50 夜间四层记忆养护
+                if (now_loop - last_heartbeat) >= 300:
+                    last_heartbeat = now_loop
                     for group in self.groups:
                         try:
                             hb = bot_core.check_autonomous_heartbeat(group)
@@ -251,7 +284,7 @@ class WxAutoAdapter:
                                 logger.info("[%s] 大肥鱼自主冒泡: %s", group, hb.text[:80])
                                 wx.SendMsg(hb.text, who=group)
                                 if hb.sticker_path and hb.sticker_path.is_file():
-                                    time.sleep(0.5)
+                                    time.sleep(0.2)
                                     wx.SendFiles(str(hb.sticker_path.resolve()), who=group)
                         except Exception as exc:
                             logger.warning("[%s] 自主冒泡发送异常: %s", group, exc)

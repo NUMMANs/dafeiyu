@@ -10,6 +10,7 @@ from memory import memory_store
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
 from roles.build_card import get_evolutions
+from scheduler import scheduler
 from sticker_manager import sticker_manager
 
 
@@ -314,6 +315,30 @@ class DaFeiYuBotCore:
             lines = ["✨ 【大肥鱼自我进化记录】"] + [f"• {e}" for e in evos]
             return BotResponse(should_reply=True, text="\n".join(lines), mood="happy", status=st)
 
+        if cmd in ("/定时", "查定时", "/定时任务"):
+            st = pet_engine.get_status()
+            tasks = scheduler.list_tasks(group_id=group_id)
+            if not tasks:
+                return BotResponse(
+                    should_reply=True,
+                    text="⏰ 当前群里还没有定时任务喵！直接对我说「10分钟后提醒我xxx」或「每天8点30查一下天气」就行",
+                    mood="happy",
+                    status=st,
+                )
+            lines = ["⏰ 【本群定时任务列表】"]
+            for t in tasks:
+                m_tag = "AI执行" if t.get("mode") == "ai_task" else "提醒"
+                lines.append(f"• #{t['id']}｜{t['desc']}｜[{m_tag}] {t['content']}")
+            return BotResponse(should_reply=True, text="\n".join(lines), mood="happy", status=st)
+
+        if cmd.startswith("/取消定时"):
+            tid = cmd[5:].strip()
+            st = pet_engine.get_status()
+            if not tid:
+                return BotResponse(should_reply=True, text="格式：/取消定时 任务ID（先发 /定时 看ID）", mood="smug", status=st)
+            _, msg = scheduler.delete_task(tid)
+            return BotResponse(should_reply=True, text=f"{msg}喵", mood="happy", status=st)
+
         return None
 
     def handle_message(
@@ -584,6 +609,40 @@ class DaFeiYuBotCore:
                 )
 
         return None
+
+    def execute_scheduled_task(self, task: dict) -> BotResponse:
+        """执行一条已到点的定时任务（支持直接提醒或 AI 自主执行联网/电脑任务）"""
+        group_id = task.get("group_id", "")
+        creator = task.get("creator", "群主")
+        content = task.get("content", "")
+        mode = task.get("mode", "remind")
+
+        if mode == "ai_task":
+            return self.handle_message(
+                group_id=group_id,
+                sender=creator,
+                text=f"定时任务时间到了，请立刻执行：{content}",
+                force_trigger=True,
+            )
+
+        msg = f"⏰ 定时提醒（{creator} 设的）：{content}"
+        sticker = sticker_manager.pick_sticker("happy", caption="到点啦喵")
+        pet_engine.append_history(
+            group_id=group_id,
+            sender=settings.BOT_NAME,
+            role="assistant",
+            content=msg,
+            sticker_url=sticker_manager.to_web_url(sticker),
+        )
+        return BotResponse(
+            should_reply=True,
+            text=msg,
+            bubbles=[msg],
+            sticker_path=sticker,
+            sticker_url=sticker_manager.to_web_url(sticker),
+            mood="happy",
+            status=pet_engine.get_status(),
+        )
 
 
 bot_core = DaFeiYuBotCore()

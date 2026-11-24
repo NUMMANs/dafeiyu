@@ -29,6 +29,7 @@ from memory import memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus
 from roles.build_card import evolve_persona, load_card
+from scheduler import scheduler
 from web_search import web_search
 
 logger = logging.getLogger("dafeiyu.brain")
@@ -44,6 +45,12 @@ PRE_SEARCH_CUES = (
     "什么时候上", "上线", "公测", "版本", "更新", "攻略", "出装", "评测",
     "好玩吗", "有必要玩", "搜一下", "查一下", "上网查", "百度", "官网", "报错",
     "夺冠", "冠军", "决赛", "比赛", "比分", "s16", "msi", "世界赛",
+)
+
+CODE_OR_FILE_CUES = (
+    ".html", ".py", ".js", ".css", ".md", ".txt", ".csv", ".json",
+    "html", "网页", "脚本", "代码", "写个文件", "写一个文件",
+    "发个文件", "发文件", "保存成", "生成文件",
 )
 
 SEARCH_TOOLS = [
@@ -129,6 +136,50 @@ SEARCH_TOOLS = [
                     }
                 },
                 "required": ["note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_schedule",
+            "description": (
+                "创建一个定时任务（持久化保存，重启不丢）。支持：一次性提醒（如10分钟后、今天22:00）、"
+                "每日定时（如每天08:30）、固定间隔循环（每N分钟）。"
+                "如果只是普通喊话/提醒用 mode='remind'；如果到点需要你去联网查天气/查比赛/截屏/执行命令，用 mode='ai_task'！"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_type": {"type": "string", "enum": ["once", "daily", "interval"]},
+                    "mode": {"type": "string", "enum": ["remind", "ai_task"], "description": "remind=到点直接发提醒文字；ai_task=到点触发AI自动执行任务"},
+                    "content": {"type": "string", "description": "提醒内容或要AI执行的指令（如：查一下今天北京天气并播报）"},
+                    "delay_minutes": {"type": "integer", "description": "task_type=once 时：多少分钟后执行（如 10）"},
+                    "run_at": {"type": "string", "description": "task_type=once 时：具体时间 YYYY-MM-DD HH:MM 或 HH:MM"},
+                    "daily_time": {"type": "string", "description": "task_type=daily 时：每日执行时间 HH:MM（如 08:30）"},
+                    "interval_minutes": {"type": "integer", "description": "task_type=interval 时：间隔分钟数（>=5）"},
+                },
+                "required": ["task_type", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_schedules",
+            "description": "查看当前群里已经设置的所有定时任务和任务 ID",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_schedule",
+            "description": "根据任务 ID 取消/删除某个定时任务",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "定时任务 6 位 ID"}},
+                "required": ["task_id"],
             },
         },
     },
@@ -399,23 +450,27 @@ class DaFeiYuBrain:
             used_vision = False
 
         used_search = bool(not used_vision and "pre_searched_block" in locals() and pre_searched_block)
+        is_code_or_file_task = (not used_vision) and any(c in text.lower() for c in CODE_OR_FILE_CUES)
         total_tokens = 0
         try:
-            # 联网查事实时降温防幻觉；普通闲聊提高温度 + 双惩罚 + 压短 max_tokens 逼它说直白大白话
-            temp = 0.45 if used_search else (0.65 if used_vision else 1.0)
-            freq_pen = 0.1 if (used_search or used_vision) else 0.45
-            pres_pen = 0.0 if (used_search or used_vision) else 0.4
-            # 若开启了工具，需要给足 max_tokens 防止写文件参数 JSON 被截断；普通闲聊仍靠 Prompt 保持极短气泡
+            # 联网查事实时降温防幻觉；写代码/文件任务关掉惩罚避免破坏 HTML/JSON 结构；闲聊保持高拟人度
+            if is_code_or_file_task:
+                temp = 0.45
+                freq_pen = 0.0
+                pres_pen = 0.0
+            else:
+                temp = 0.45 if used_search else (0.65 if used_vision else 1.0)
+                freq_pen = 0.1 if (used_search or used_vision) else 0.45
+                pres_pen = 0.0 if (used_search or used_vision) else 0.4
+            # 开启桌面工具时给足 4096 max_tokens，防止 deepseek-flash 思考 + .html/.py 参数 JSON 被截断
             kwargs: dict = {
                 "model": model,
                 "messages": messages,
                 "temperature": temp,
                 "frequency_penalty": freq_pen,
-                "pres_pen_dummy": None,
+                "presence_penalty": pres_pen,
+                "max_tokens": 4096 if (not used_vision and is_owner(sender)) else (800 if used_vision else 260),
             }
-            kwargs.pop("pres_pen_dummy")
-            kwargs["presence_penalty"] = pres_pen
-            kwargs["max_tokens"] = 900 if (not used_vision and is_owner(sender)) else (600 if used_vision else 220)
             # 挂载工具列表（普通工具 + 主人权限下的桌面 Agent 电脑操纵工具）
             available_tools = list(SEARCH_TOOLS) if (settings.ENABLE_WEB_SEARCH and not used_search) else [
                 t for t in SEARCH_TOOLS if t["function"]["name"] != "web_search"
@@ -434,7 +489,9 @@ class DaFeiYuBrain:
             for _step in range(4):
                 resp = client.chat.completions.create(**kwargs)
                 total_tokens += getattr(resp.usage, "total_tokens", 0) or 0
-                msg_obj = resp.choices[0].message
+                choice = resp.choices[0]
+                finish_reason = getattr(choice, "finish_reason", None)
+                msg_obj = choice.message
                 tool_calls = getattr(msg_obj, "tool_calls", None)
                 if not tool_calls:
                     raw_content = (msg_obj.content or "").strip()
@@ -446,8 +503,26 @@ class DaFeiYuBrain:
                     fn_args_raw = getattr(tc.function, "arguments", "{}")
                     try:
                         args = json.loads(fn_args_raw)
-                    except json.JSONDecodeError:
-                        args = {}
+                    except json.JSONDecodeError as json_exc:
+                        logger.warning(
+                            "工具 %s 参数 JSON 解析失败 (finish_reason=%s, len=%d): %s",
+                            fn_name,
+                            finish_reason,
+                            len(fn_args_raw or ""),
+                            json_exc,
+                        )
+                        tool_out = (
+                            f"工具 {fn_name} 的参数 JSON 解析失败（finish_reason={finish_reason}，"
+                            "可能内容过长被截断或引号未正确转义），请精简内容并确保输出合法完整的 JSON 后重试"
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": tool_out,
+                            }
+                        )
+                        continue
 
                     if fn_name == "web_search":
                         used_search = True
@@ -476,6 +551,28 @@ class DaFeiYuBrain:
                         note = str(args.get("note") or "").strip()
                         _, tool_out = evolve_persona(note)
                         logger.info("✨ 大肥鱼自我进化人格: %s -> %s", note, tool_out)
+                    elif fn_name == "add_schedule":
+                        _, tool_out = scheduler.add_task(
+                            group_id=group_id,
+                            creator=sender,
+                            task_type=str(args.get("task_type") or "once"),
+                            content=str(args.get("content") or ""),
+                            mode=str(args.get("mode") or "remind"),
+                            delay_minutes=args.get("delay_minutes"),
+                            run_at=args.get("run_at"),
+                            daily_time=args.get("daily_time"),
+                            interval_minutes=args.get("interval_minutes"),
+                        )
+                    elif fn_name == "list_schedules":
+                        tasks = scheduler.list_tasks(group_id=group_id)
+                        if not tasks:
+                            tool_out = "当前群里没有任何定时任务"
+                        else:
+                            tool_out = "\n".join(
+                                f"#{t['id']} [{t['desc']}|{t['mode']}] {t['content']}" for t in tasks
+                            )
+                    elif fn_name == "delete_schedule":
+                        _, tool_out = scheduler.delete_task(str(args.get("task_id") or ""))
                     elif fn_name in (
                         "run_shell",
                         "read_local_file",
@@ -496,9 +593,17 @@ class DaFeiYuBrain:
                         elif fn_name == "read_local_file":
                             tool_out = read_local_file(str(args.get("path") or ""))
                         elif fn_name == "write_local_file":
-                            tool_out = write_local_file(
-                                str(args.get("path") or ""), str(args.get("content") or "")
-                            )
+                            target_path = str(args.get("path") or "").strip()
+                            tool_out = write_local_file(target_path, str(args.get("content") or ""))
+                            if (
+                                attachment_path is None
+                                and target_path
+                                and any(k in text for k in ("发我", "发给我", "发群里", "发过来", "发送"))
+                            ):
+                                wp = Path(target_path).expanduser()
+                                if wp.is_file() and wp.stat().st_size > 0:
+                                    attachment_path = wp
+                                    tool_out += "（检测到需要发送到群里，已自动附带该文件）"
                         elif fn_name == "list_directory":
                             tool_out = list_directory(str(args.get("path") or "."))
                         elif fn_name == "open_url_or_app":
@@ -514,15 +619,15 @@ class DaFeiYuBrain:
                         elif fn_name == "fetch_webpage":
                             tool_out = fetch_webpage(str(args.get("url") or ""))
                         elif fn_name == "create_and_send_file":
-                            fname = str(args.get("filename") or "output.txt")
-                            logger.info("📄 Agent 生成并发送文件: %s", fname)
+                            fname = str(args.get("filename") or "").strip()
+                            logger.info("📄 Agent 生成并发送文件: %s", fname or "<empty>")
                             fpath, tool_out = create_and_send_file(fname, str(args.get("content") or ""))
-                            if fpath:
+                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
                                 attachment_path = fpath
                         elif fn_name == "send_existing_file":
                             logger.info("📎 Agent 发送已有文件: %s", args.get("path"))
                             fpath, tool_out = send_existing_file(str(args.get("path") or ""))
-                            if fpath:
+                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
                                 attachment_path = fpath
                         else:
                             tool_out = "未知工具"
@@ -537,11 +642,12 @@ class DaFeiYuBrain:
                         }
                     )
 
-                # 后续轮次放宽长度并降温，保证把工具执行结果准确说清楚
+                # 后续轮次保持 4096 tokens 且关闭惩罚，防止多步写文件/重传 JSON 被截断
                 kwargs["messages"] = messages
                 kwargs["temperature"] = 0.45
-                kwargs["frequency_penalty"] = 0.1
-                kwargs["max_tokens"] = 450
+                kwargs["frequency_penalty"] = 0.0
+                kwargs["presence_penalty"] = 0.0
+                kwargs["max_tokens"] = 4096
             else:
                 raw_content = "工具跑完一轮啦，结果已经在上面了喵"
 

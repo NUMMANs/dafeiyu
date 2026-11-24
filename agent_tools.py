@@ -89,11 +89,15 @@ def read_local_file(path: str, max_chars: int = 3000) -> str:
 
 
 def write_local_file(path: str, content: str) -> str:
+    if not (path or "").strip():
+        return "文件路径不能为空，拒绝写入"
+    if not (content or "").strip():
+        return "文件内容不能为空，拒绝写入 0 字节空文件"
     try:
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content or "", encoding="utf-8")
-        return f"已写入文件: {p}（{len(content or '')} 字符）"
+        p.write_text(content, encoding="utf-8")
+        return f"已写入文件: {p}（{len(content)} 字符）"
     except Exception as exc:
         return f"写入文件失败: {exc}"
 
@@ -181,15 +185,24 @@ def fetch_webpage(url: str, max_chars: int = 2200) -> str:
 
 def create_and_send_file(filename: str, content: str) -> tuple[Path | None, str]:
     """生成任意文本/代码/表格/文档文件（.md/.txt/.py/.csv/.html/.json等）并作为附件发到微信群"""
-    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", (filename or "output.txt").strip())
+    raw_name = (filename or "").strip()
+    if not raw_name:
+        return None, "文件名不能为空，请传入带后缀的文件名（如 page.html）后重新调用 create_and_send_file"
+    if not (content or "").strip():
+        return None, "文件内容不能为空，请传入完整的非空代码或正文后重新调用 create_and_send_file"
+    safe_name = re.sub(r'[\\/:*?"<>|]+', "_", raw_name)
     if not safe_name or safe_name.startswith("."):
-        safe_name = "dafeiyu_output.txt"
+        return None, "文件名无效，请传入带名称和后缀的文件名（如 page.html）"
     if "." not in safe_name:
         safe_name += ".txt"
     try:
         out = GENERATED_FILES_DIR / safe_name
-        out.write_text(content or "", encoding="utf-8")
-        return out, f"已生成文件 {out.name}（{out.stat().st_size}B），将随回复直接发送到聊天里"
+        out.write_text(content, encoding="utf-8")
+        size = out.stat().st_size
+        if size <= 0:
+            out.unlink(missing_ok=True)
+            return None, "生成文件为空（0字节），已拒绝发送"
+        return out, f"已生成文件 {out.name}（{size}B），将随回复直接发送到聊天里"
     except Exception as exc:
         return None, f"生成文件失败: {exc}"
 
@@ -200,9 +213,12 @@ def send_existing_file(path: str) -> tuple[Path | None, str]:
         p = Path(path).expanduser()
         if not p.is_file():
             return None, f"文件不存在: {p}"
-        if p.stat().st_size > 50 * 1024 * 1024:
+        size = p.stat().st_size
+        if size == 0:
+            return None, f"文件为空（0字节），拒绝发送: {p.name}"
+        if size > 50 * 1024 * 1024:
             return None, f"文件超过 50MB，拒绝发送: {p.name}"
-        return p, f"已准备发送文件 {p.name}（{p.stat().st_size}B）到当前聊天"
+        return p, f"已准备发送文件 {p.name}（{size}B）到当前聊天"
     except Exception as exc:
         return None, f"准备发送文件失败: {exc}"
 
