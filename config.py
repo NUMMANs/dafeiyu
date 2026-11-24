@@ -69,6 +69,14 @@ class Settings:
     AUTO_GIT_UPDATE: bool = _parse_bool(os.getenv("AUTO_GIT_UPDATE"), True)
     AUTO_GIT_POLL_SEC: int = max(15, int(os.getenv("AUTO_GIT_POLL_SEC", "60")))
 
+    # DeepSeek Harness (DSH) CLI 独立后台异步执行配置
+    ENABLE_DSH: bool = _parse_bool(os.getenv("ENABLE_DSH"), True)
+    DSH_BIN: str = os.getenv("DSH_BIN", "dsh").strip() or "dsh"
+    DSH_MODE: str = os.getenv("DSH_MODE", "workspace-write").strip() or "workspace-write"
+    DSH_MODEL: str = os.getenv("DSH_MODEL", "").strip()
+    DSH_WORKDIR: str = os.getenv("DSH_WORKDIR", "").strip()
+    DSH_TIMEOUT_SEC: int = max(60, int(os.getenv("DSH_TIMEOUT_SEC", "900")))
+
     RUN_MODE: str = os.getenv("RUN_MODE", "web").strip().lower()
     WX_GROUP_WHITELIST: list[str] = _parse_list(
         os.getenv("WX_GROUP_WHITELIST"), ["大肥鱼测试群"]

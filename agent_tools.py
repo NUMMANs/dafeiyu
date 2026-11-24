@@ -400,4 +400,49 @@ AGENT_TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_dsh",
+            "description": (
+                "将需要多步编程、创建完整多文件项目或复杂互动网页、深度调试修 Bug、多次执行命令试错、"
+                "或为大肥鱼自身开发大型新功能的耗时任务，异步交给脱离主进程的 DSH (DeepSeek Harness) CLI 后台执行。"
+                "即使主程序重启也不中断，干完会自动发回群里。注意：普通闲聊、简单搜索、定时提醒和单文件小回答不要调用此工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "交给 DSH 执行的清晰完整任务需求（包含期望产物、文件路径或验证要求）",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "可选：留空则新建独立会话；填 'last' 可续接本群最近一次 DSH 会话上下文继续迭代",
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "可选：指定工作目录，留空默认项目根目录",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_dsh_jobs",
+            "description": "查询当前和最近后台 DSH 任务的运行状态、耗时及结果摘要。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回条数，默认 5",
+                    }
+                },
+            },
+        },
+    },
 ]

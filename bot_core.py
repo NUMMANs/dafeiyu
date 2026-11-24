@@ -7,6 +7,7 @@ from pathlib import Path
 from agent_tools import is_owner
 from brain import brain
 from config import settings
+from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from memory import memory_store
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
@@ -252,6 +253,7 @@ class DaFeiYuBotCore:
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
                 f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
+                f"• `/dsh 任务` / `/dsh 续 指令` / `/dsh状态`：派发独立后台 DSH 重任务（仅主人）\n"
                 f"• `/更新` / `/重启`：从 GitHub 拉取新代码并重启（仅主人）"
             )
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
@@ -359,6 +361,51 @@ class DaFeiYuBotCore:
                 return BotResponse(should_reply=True, text="🛑 只有主人才可以重启大肥鱼哦~", mood="angry", status=st)
             restart_msg = request_restart(reason="主人发送 /重启 指令", notify_group=group_id)
             return BotResponse(should_reply=True, text=f"♻️ 收到！{restart_msg}", mood="happy", status=st)
+
+        if cmd in ("/dsh状态", "/后台任务", "/dsh任务"):
+            st = pet_engine.get_status()
+            if not is_owner(sender):
+                return BotResponse(should_reply=True, text="🛑 只有主人才可以查看后台 DSH 任务哦~", mood="angry", status=st)
+            ok_dsh, dsh_info = is_dsh_available()
+            jobs = list_dsh_jobs(group_id=group_id, limit=5)
+            lines = [f"🤖 【DSH 后台引擎】{'已就绪' if ok_dsh else '未就绪'}（{dsh_info}）"]
+            if not jobs:
+                lines.append("• 当前群暂无后台 DSH 任务记录")
+            else:
+                for j in jobs:
+                    preview = j["task"][:36] + ("..." if len(j["task"]) > 36 else "")
+                    lines.append(f"• #{j['job_id']} [{j['status']}｜{j['duration_sec']}s] {preview}")
+            return BotResponse(should_reply=True, text="\n".join(lines), mood="happy", status=st)
+
+        if cmd == "/dsh" or cmd.startswith("/dsh ") or cmd.startswith("/dsh\n"):
+            st = pet_engine.get_status()
+            if not is_owner(sender):
+                return BotResponse(should_reply=True, text="🛑 只有主人才可以派发后台 DSH 任务哦~", mood="angry", status=st)
+            body = cmd[4:].strip()
+            if not body:
+                return BotResponse(
+                    should_reply=True,
+                    text="格式：`/dsh 帮我写个xxx项目` 或 `/dsh 续 再加个暗黑模式`",
+                    mood="smug",
+                    status=st,
+                )
+            sid = ""
+            task_text = body
+            if body == "续" or body.startswith("续 ") or body.startswith("续\n"):
+                sid = "last"
+                task_text = body[1:].strip()
+                if not task_text:
+                    return BotResponse(should_reply=True, text="请在 `/dsh 续 ` 后面写明要追加的任务要求喵~", mood="smug", status=st)
+            ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task_text, session_id=sid)
+            if ok and isinstance(payload, dict):
+                reply_text = (
+                    f"🚀 已交给独立 DSH 后台开工（不卡群聊，重启也不中断）！\n"
+                    f"• 任务号：`{payload['job_id']}`\n"
+                    f"• 会话ID：`{payload['session_id']}`\n"
+                    f"做完会自动发回群里，中途发 `/dsh状态` 可看进度。"
+                )
+                return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
+            return BotResponse(should_reply=True, text=f"❌ 派单失败：{payload}", mood="angry", status=st)
 
         return None
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bot_core import bot_core
 from config import UPLOADS_DIR, settings
+from dsh_bridge import format_job_delivery, pop_finished_jobs
 from pet_engine import pet_engine
 from scheduler import scheduler
 from self_ops import check_remote_update, consume_restart_notice, git_pull_and_check, request_restart
@@ -254,10 +255,11 @@ class WxAutoAdapter:
                     except Exception as exc:
                         logger.warning("发送重启通知到 [%s] 失败: %s", tg, exc)
 
-            # 后台巡检循环：定时任务(15s)、Git远程更新(AUTO_GIT_POLL_SEC)、自主冒泡与夜间养护(300s)
+            # 后台巡检循环：DSH完工投递(5s)、定时任务(15s)、Git远程更新(AUTO_GIT_POLL_SEC)、自主冒泡与夜间养护(300s)
             last_heartbeat = time.time()
             last_schedule_check = time.time()
             last_git_check = time.time()
+            last_dsh_check = 0.0
             while not self._stop_event.is_set():
                 time.sleep(1.0)
                 now_loop = time.time()
@@ -334,6 +336,29 @@ class WxAutoAdapter:
                                         logger.warning("发送回滚告警到 [%s] 失败: %s", first_group, exc)
                     except Exception as exc:
                         logger.warning("自动检测 Git 更新异常: %s", exc)
+
+                # 4. 每 5 秒检查并投递已完成的后台 DSH 任务结果
+                if (now_loop - last_dsh_check) >= 5:
+                    last_dsh_check = now_loop
+                    try:
+                        for done_job in pop_finished_jobs():
+                            target_group = (done_job.get("group_id") or "").strip() or (
+                                self.groups[0] if self.groups else ""
+                            )
+                            if not target_group:
+                                continue
+                            msg_text, attach_path = format_job_delivery(done_job)
+                            wx.SendMsg(msg_text, who=target_group)
+                            logger.info("🤖 已投递 DSH 任务 #%s 结果到 [%s]", done_job.get("job_id"), target_group)
+                            if (
+                                attach_path is not None
+                                and attach_path.is_file()
+                                and attach_path.stat().st_size > 0
+                            ):
+                                time.sleep(0.2)
+                                wx.SendFiles(str(attach_path.resolve()), who=target_group)
+                    except Exception as exc:
+                        logger.warning("检查并投递 DSH 后台任务异常: %s", exc)
 
             if hasattr(wx, "StopListening"):
                 wx.StopListening()

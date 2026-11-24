@@ -25,6 +25,7 @@ from agent_tools import (
     write_local_file,
 )
 from config import settings
+from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from memory import memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus
@@ -585,6 +586,11 @@ class DaFeiYuBrain:
                         "fetch_webpage",
                         "create_and_send_file",
                         "send_existing_file",
+                        "self_pull_and_restart",
+                        "self_edit_code",
+                        "self_restart",
+                        "delegate_to_dsh",
+                        "check_dsh_jobs",
                     ):
                         if not is_owner(sender):
                             tool_out = "权限不足：当前发言人不在 OWNER_NAMES 主人白名单内，拒绝操纵电脑"
@@ -634,7 +640,10 @@ class DaFeiYuBrain:
                             logger.info("🔄 Agent 触发自更新与重启")
                             ok_pull, pull_detail = git_pull_and_check()
                             if ok_pull:
-                                restart_msg = request_restart(reason="从 GitHub 拉取最新代码")
+                                restart_msg = request_restart(
+                                    reason="从 GitHub 拉取最新代码",
+                                    notify_group=group_id,
+                                )
                                 tool_out = f"{pull_detail}\n{restart_msg}\n请先简洁告知用户即将重启，几秒后会回来。"
                             else:
                                 tool_out = pull_detail
@@ -648,7 +657,38 @@ class DaFeiYuBrain:
                         elif fn_name == "self_restart":
                             reason = str(args.get("reason") or "主人要求重启")
                             logger.info("♻️ Agent 触发重启: %s", reason)
-                            tool_out = request_restart(reason=reason)
+                            tool_out = request_restart(reason=reason, notify_group=group_id)
+                        elif fn_name == "delegate_to_dsh":
+                            task_text = str(args.get("task") or "")
+                            sid = str(args.get("session_id") or "")
+                            wdir = str(args.get("workdir") or "")
+                            logger.info("🤖 Agent 自动派单给 DSH 后台: %s", task_text[:80])
+                            ok_dsh, dsh_res = submit_dsh_job(
+                                group_id=group_id,
+                                sender=sender,
+                                task=task_text,
+                                session_id=sid,
+                                workdir=wdir,
+                            )
+                            if ok_dsh and isinstance(dsh_res, dict):
+                                tool_out = (
+                                    f"已成功将任务异步派发到独立 DSH 后台进程（重启也不中断，不阻塞当前群聊）："
+                                    f"job_id={dsh_res['job_id']}, session_id={dsh_res['session_id']}。"
+                                    "请直接用大肥鱼自然口吻先回复主人“收到，已派给后台 DSH 干活去了，干完会自动发回群里”。"
+                                )
+                            else:
+                                tool_out = f"派发 DSH 任务失败: {dsh_res}"
+                        elif fn_name == "check_dsh_jobs":
+                            limit = max(1, min(15, int(args.get("limit") or 5)))
+                            jobs = list_dsh_jobs(group_id=group_id, limit=limit)
+                            if not jobs:
+                                tool_out = "当前群暂无后台 DSH 任务记录"
+                            else:
+                                tool_out = "\n".join(
+                                    f"#{j['job_id']} [session={j['session_id']}] [{j['status']}|{j['duration_sec']}s] "
+                                    f"{j['task'][:40]} -> {j['summary'][:120]}"
+                                    for j in jobs
+                                )
                         else:
                             tool_out = "未知工具"
                     else:
