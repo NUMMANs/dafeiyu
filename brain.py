@@ -28,7 +28,7 @@ from config import settings
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from memory import memory_store
 from persona_runtime import emotion_sm, slang_book
-from pet_engine import PetStatus
+from pet_engine import PetStatus, pet_engine
 from roles.build_card import evolve_persona, load_card
 from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
@@ -186,6 +186,29 @@ SEARCH_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_group_image",
+            "description": (
+                "重新查看本群历史聊天记录里的某张图片细节。当群友问「上面那张图」「刚才截图」「第二张图」"
+                "「之前发的战绩图」「帮我看看群里那张照片」等需要看具体画面或文字时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "倒数第几张图（1=最新一张，2=倒数第二张，范围 1~8，默认 1）",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "重点识别或确认的图片问题/细节（可选）",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -199,6 +222,7 @@ class BrainReply:
     used_search: bool = False
     sticker_caption: str = ""
     attachment_path: Path | None = None
+    vision_summary: str = ""
 
 
 def split_human_bubbles(text: str) -> list[str]:
@@ -352,6 +376,47 @@ class DaFeiYuBrain:
         cleaned = re.sub(r"^#{1,4}\s*", "", cleaned, flags=re.M)
         return cleaned.strip(), mood, caption
 
+    def summarize_image(self, image_path: Path) -> str | None:
+        """后台静默概括图片核心内容，仅使用智谱免费视觉模型（不消耗 DeepSeek Token）。"""
+        if not image_path.is_file() or not settings.ZHIPU_API_KEY:
+            return None
+        desc = _inspect_image_with_zhipu(
+            image_path,
+            "请用一两句简洁客观的中文概括图片核心内容与关键文字/数据",
+        )
+        if not desc:
+            return None
+        return re.sub(r"\s+", " ", desc).strip()[:180]
+
+    def inspect_image_detail(self, image_path: Path, question: str = "") -> str:
+        """深度查看历史图片细节，优先智谱视觉，未配时回退 DeepSeek/自定义视觉模型。"""
+        if not image_path.is_file():
+            return "图片文件不存在或已被清理"
+        desc = _inspect_image_with_zhipu(image_path, question)
+        if desc:
+            return desc
+        if not settings.has_valid_api_key:
+            return "未配置视觉模型 API Key，无法识别历史图片"
+        try:
+            prompt = question.strip() or "请用简洁客观的中文描述这张图片里的关键文字、数字和画面细节"
+            data_url = _encode_image_data_url(image_path)
+            resp = self._get_vision_client().chat.completions.create(
+                model=settings.DEEPSEEK_VISION_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                        ],
+                    }
+                ],
+                max_tokens=600,
+            )
+            return ((resp.choices[0].message.content or "").strip()) or "未能识别出图片内容"
+        except Exception as exc:
+            return f"查看历史图片失败: {exc}"
+
     def reply(
         self,
         sender: str,
@@ -361,6 +426,7 @@ class DaFeiYuBrain:
         recent_history: list[dict],
         image_path: Path | None = None,
         group_id: str = "",
+        image_sender: str = "",
     ) -> BrainReply:
         if not settings.has_valid_api_key:
             if image_path is not None:
@@ -396,12 +462,19 @@ class DaFeiYuBrain:
             if content:
                 messages.append({"role": role, "content": f"{prefix}{content}"})
 
+        vision_summary = ""
         if image_path is not None and image_path.is_file():
+            owner_desc = (
+                f"[{sender}] 正在询问 [{image_sender}] 之前发的图片"
+                if (image_sender and image_sender != sender)
+                else f"[{sender}] 发了张图"
+            )
             # 优先使用智谱免费深度思考视觉模型 glm-4.1v-thinking-flash 高精看图，再交给 DeepSeek 塔菲大脑自然回复
             zhipu_vision_desc = _inspect_image_with_zhipu(image_path, text)
             if zhipu_vision_desc:
+                vision_summary = re.sub(r"\s+", " ", zhipu_vision_desc).strip()[:220]
                 user_msg = (
-                    f"[{sender}] 发了张图"
+                    f"{owner_desc}"
                     + (f"并说：{text}" if text.strip() else "")
                     + f"\n\n（你的眼睛已经把这张图的细节看得一清二楚：\n{zhipu_vision_desc}\n请直接以塔菲真人群友的短气泡口吻吐槽或回答，别说“根据视觉描述”）"
                 )
@@ -411,9 +484,9 @@ class DaFeiYuBrain:
                 used_vision = True
             else:
                 user_prompt = (
-                    f"[{sender}] 发了张图并问：{text}\n（请先仔细辨认图里所有文字、数字、画面细节，再直接自然回答，别瞎猜也别用 Markdown 格式）"
+                    f"{owner_desc}并问：{text}\n（请先仔细辨认图里所有文字、数字、画面细节，再直接自然回答，别瞎猜也别用 Markdown 格式）"
                     if text.strip()
-                    else f"[{sender}] 在群里发了张图。请你仔细看清图里的文字和画面内容，像真群友一样简短吐槽或接梗（别瞎编图里没有的东西，别用 Markdown 格式）。"
+                    else f"{owner_desc}。请你仔细看清图里的文字和画面内容，像真群友一样简短吐槽或接梗（别瞎编图里没有的东西，别用 Markdown 格式）。"
                 )
                 data_url = _encode_image_data_url(image_path)
                 messages.append(
@@ -576,6 +649,26 @@ class DaFeiYuBrain:
                             )
                     elif fn_name == "delete_schedule":
                         _, tool_out = scheduler.delete_task(str(args.get("task_id") or ""))
+                    elif fn_name == "inspect_group_image":
+                        recent_imgs = pet_engine.get_recent_images(group_id, limit=8)
+                        try:
+                            idx = max(1, min(8, int(args.get("index") or 1)))
+                        except (TypeError, ValueError):
+                            idx = 1
+                        if not recent_imgs:
+                            tool_out = "当前群聊记录里还没有可查看的历史图片"
+                        elif idx > len(recent_imgs):
+                            tool_out = f"本群最近只记录了 {len(recent_imgs)} 张图片，没有第 {idx} 张"
+                        else:
+                            target_img = recent_imgs[idx - 1]
+                            img_file = Path(target_img["image_path"])
+                            detail = self.inspect_image_detail(img_file, str(args.get("question") or ""))
+                            pet_engine.update_history_content_by_image(
+                                group_id,
+                                target_img["image_path"],
+                                re.sub(r"\s+", " ", detail).strip()[:180],
+                            )
+                            tool_out = f"第 {idx} 张图（由 {target_img['sender']} 发送）：\n{detail}"
                     elif fn_name in (
                         "run_shell",
                         "read_local_file",
@@ -757,6 +850,7 @@ class DaFeiYuBrain:
                 used_search=used_search,
                 sticker_caption=sticker_caption,
                 attachment_path=attachment_path,
+                vision_summary=vision_summary,
             )
         except Exception as exc:
             err_msg = str(exc)

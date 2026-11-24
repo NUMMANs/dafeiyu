@@ -355,5 +355,69 @@ class PetEngine:
             ).fetchall()
             return [dict(r) for r in reversed(rows)]
 
+    def update_history_content_by_image(self, group_id: str, image_path: str, caption: str) -> None:
+        clean_cap = " ".join((caption or "").split()).strip()[:220]
+        clean_path = (image_path or "").strip()
+        if not clean_cap or not clean_path:
+            return
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, content FROM chat_history
+                WHERE group_id = ? AND image_path = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (group_id, clean_path),
+            ).fetchone()
+            if not row:
+                return
+            cur_content = (row["content"] or "").strip()
+            if not cur_content:
+                new_content = f"[发了一张图片：{clean_cap}]"
+            elif "[图片内容：" not in cur_content and "[发了一张图片：" not in cur_content:
+                new_content = f"{cur_content}\n[图片内容：{clean_cap}]"
+            else:
+                return
+            self._conn.execute(
+                "UPDATE chat_history SET content = ? WHERE id = ?",
+                (new_content, row["id"]),
+            )
+            self._conn.commit()
+
+    def get_recent_images(self, group_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        max_limit = max(1, limit)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT sender, content, image_path, created_ts
+                FROM chat_history
+                WHERE group_id = ? AND role = 'user' AND image_path IS NOT NULL AND image_path != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (group_id, max(max_limit * 3, 24)),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for r in rows:
+            img_str = str(r["image_path"] or "").strip()
+            if not img_str:
+                continue
+            p = Path(img_str)
+            if not p.is_file() or p.stat().st_size <= 0:
+                continue
+            results.append(
+                {
+                    "index": len(results) + 1,
+                    "sender": str(r["sender"] or "群友"),
+                    "image_path": img_str,
+                    "content": str(r["content"] or ""),
+                    "created_ts": float(r["created_ts"] or 0.0),
+                }
+            )
+            if len(results) >= max_limit:
+                break
+        return results
+
 
 pet_engine = PetEngine()

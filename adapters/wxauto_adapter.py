@@ -3,6 +3,7 @@ import random
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from bot_core import bot_core
@@ -34,6 +35,7 @@ class WxAutoAdapter:
         self.last_error: str | None = None
         self._start_ts: float = time.time()
         self._media_downloader = None
+        self._prestart_img_count: dict[str, int] = {}
 
     def _clean_group_text(self, raw: str) -> str:
         text = (raw or "").strip()
@@ -53,6 +55,70 @@ class WxAutoAdapter:
             or t.startswith("<videomsg")
         )
 
+    def _parse_wechat_xml_message(self, raw: str) -> tuple[str, str]:
+        """解析微信引用回复(type=57)与合并转发聊天记录(type=19) XML，返回 (可读文本, quoted_sender)。"""
+        xml_str = (raw or "").strip()
+        if not xml_str:
+            return "", ""
+        first_lt = xml_str.find("<")
+        if first_lt > 0:
+            xml_str = xml_str[first_lt:]
+        try:
+            root = ET.fromstring(xml_str)
+        except Exception:
+            return "", ""
+
+        appmsg = root if root.tag == "appmsg" else root.find("appmsg")
+        if appmsg is None:
+            return "", ""
+
+        msg_type_str = (appmsg.findtext("type") or "").strip()
+
+        if msg_type_str == "57":
+            title = (appmsg.findtext("title") or "").strip()
+            refer = appmsg.find("refermsg")
+            if refer is None:
+                return title, ""
+            ref_type = (refer.findtext("type") or "").strip()
+            disp = (refer.findtext("displayname") or refer.findtext("chatusr") or "群友").strip()
+            if ref_type == "3":
+                return f"[引用了 {disp} 发的一张图片] {title}".strip(), disp
+            if ref_type == "1":
+                ref_text = self._clean_group_text(refer.findtext("content") or "")
+                ref_preview = " ".join(ref_text.split())[:80]
+                return f"[引用 {disp}：「{ref_preview}」] {title}".strip(), ""
+            return f"[引用 {disp} 的消息] {title}".strip(), ""
+
+        if msg_type_str == "19":
+            title = (appmsg.findtext("title") or "聊天记录").strip()
+            des = (appmsg.findtext("des") or "").strip()
+            record_xml = (appmsg.findtext("recorditem") or "").strip()
+            snippets: list[str] = []
+            img_count = 0
+            if record_xml.startswith("<"):
+                try:
+                    rec_root = ET.fromstring(record_xml)
+                    for item in rec_root.findall(".//dataitem"):
+                        dtype = (item.attrib.get("datatype") or "").strip()
+                        src_name = (item.findtext("sourcename") or "").strip()
+                        desc = (item.findtext("datadesc") or item.findtext("datatitle") or "").strip()
+                        if dtype == "2":
+                            img_count += 1
+                            if len(snippets) < 6:
+                                snippets.append(f"{src_name}: [图片]" if src_name else "[图片]")
+                        elif desc and len(snippets) < 6:
+                            clean_d = " ".join(desc.split())[:80]
+                            snippets.append(f"{src_name}: {clean_d}" if src_name else clean_d)
+                except Exception:
+                    pass
+
+            body = "\n".join(snippets) if snippets else des[:400]
+            img_note = f"（含 {img_count} 张图片）" if img_count > 0 else ""
+            header = f"[合并转发聊天记录：{title}{img_note}]"
+            return (f"{header}\n{body}" if body else header)[:700], ""
+
+        return "", ""
+
     def _get_media_downloader(self, chat, wx=None):
         if self._media_downloader is not None:
             return self._media_downloader
@@ -69,15 +135,15 @@ class WxAutoAdapter:
             logger.warning("初始化 MediaDownloader 失败: %s", exc)
             return None
 
-    def _extract_image_path(self, group_name: str, msg, chat, wx=None) -> Path | None:
+    def _extract_image_path(self, group_name: str, msg, chat, wx=None, quick: bool = False) -> Path | None:
         # 1. 优先用 wechatauto MediaDownloader 直接本地解密 DB 图片（先等高清/压缩版 full，避免拿到糊成马赛克的 _t 缩略图）
         local_id = getattr(msg, "local_id", None)
         if local_id is not None:
             downloader = self._get_media_downloader(chat, wx)
             if downloader is not None:
                 user_key = getattr(chat, "_wxid", None) or group_name
-                # 前 3 次优先等高清/标准图 full（绝不用极糊的缩略图），第 4 次兜底 best
-                for attempt, tier in enumerate(("full", "full", "full", "best")):
+                tiers = ("best",) if quick else ("full", "full", "full", "best")
+                for attempt, tier in enumerate(tiers):
                     try:
                         out_path = downloader.download_image(
                             user=user_key,
@@ -92,7 +158,7 @@ class WxAutoAdapter:
                                 return p
                     except Exception as exc:
                         logger.warning("MediaDownloader 第 %d 次解密图片失败 (tier=%s): %s", attempt + 1, tier, exc)
-                    if attempt < 3:
+                    if not quick and attempt < len(tiers) - 1:
                         time.sleep(1.2)
 
         # 2. wxauto4: FriendImageMessage.download(dir_path=...)
@@ -120,10 +186,29 @@ class WxAutoAdapter:
         create_time = getattr(msg, "create_time", None)
         if isinstance(create_time, (int, float)) and create_time > 0:
             if create_time < self._start_ts - 3:
+                hist_sender = str(getattr(msg, "sender", "群友") or "群友")
+                is_me = getattr(msg, "is_self", False) or str(getattr(msg, "attr", "")).lower() == "self"
+                hist_type = str(getattr(msg, "type", "")).lower()
+                hist_cls = msg.__class__.__name__.lower()
+                if (hist_type == "image" or "image" in hist_cls) and not is_me:
+                    cnt = self._prestart_img_count.get(group_name, 0)
+                    if cnt < 3:
+                        p = self._extract_image_path(group_name, msg, chat, wx=wx, quick=True)
+                        if p is not None:
+                            self._prestart_img_count[group_name] = cnt + 1
+                            pet_engine.append_history(
+                                group_id=group_name,
+                                sender=hist_sender,
+                                role="user",
+                                content="",
+                                image_path=str(p),
+                            )
+                    return
+
                 raw_hist = self._clean_group_text(str(getattr(msg, "content", "") or ""))
+                if raw_hist and self._is_non_text_xml(raw_hist):
+                    raw_hist, _ = self._parse_wechat_xml_message(raw_hist)
                 if raw_hist and not self._is_non_text_xml(raw_hist):
-                    hist_sender = str(getattr(msg, "sender", "群友") or "群友")
-                    is_me = getattr(msg, "is_self", False) or str(getattr(msg, "attr", "")).lower() == "self"
                     pet_engine.append_history(
                         group_id=group_name,
                         sender=settings.BOT_NAME if is_me else hist_sender,
@@ -163,6 +248,12 @@ class WxAutoAdapter:
                 force_trigger=force_trigger,
             )
         else:
+            quoted_sender = ""
+            if content and self._is_non_text_xml(content):
+                parsed_text, quoted_sender = self._parse_wechat_xml_message(content)
+                if not parsed_text:
+                    return
+                content = parsed_text
             if not content or self._is_non_text_xml(content):
                 return
             logger.info("[%s] 收到 %s: %s", group_name, sender, content[:80])
@@ -171,6 +262,7 @@ class WxAutoAdapter:
                 sender=sender,
                 text=content,
                 force_trigger=force_trigger,
+                quoted_sender=quoted_sender,
             )
 
         if not resp.should_reply:

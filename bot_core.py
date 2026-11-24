@@ -1,5 +1,6 @@
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -546,6 +547,84 @@ class DaFeiYuBotCore:
 
         return None
 
+    def _caption_image_async(self, group_id: str, image_path: Path) -> None:
+        """后台静默调用免费智谱视觉模型生成图片摘要并写回 SQLite 历史，不阻塞聊天主流程。"""
+        if not settings.ZHIPU_API_KEY or not image_path.is_file():
+            return
+
+        def _worker() -> None:
+            try:
+                summary = brain.summarize_image(image_path)
+                if summary:
+                    pet_engine.update_history_content_by_image(group_id, str(image_path), summary)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _pick_referenced_image(
+        self,
+        group_id: str,
+        sender: str,
+        text: str,
+        now: float,
+        quoted_sender: str = "",
+    ) -> tuple[Path | None, str]:
+        """从本群近期 SQLite 历史图片中智能定位群友提到的图片（支持跨人问图、序号问图、引用图片、连续追问）。"""
+        recent_imgs = pet_engine.get_recent_images(group_id, limit=8)
+        if not recent_imgs:
+            return None, ""
+
+        clean = (text or "").strip()
+        visual_cues = (
+            "图", "截图", "截屏", "照片", "战绩", "上面", "刚才", "这张", "那张",
+            "看", "识别", "提取", "翻译", "解析", "点评", "吐槽", "啥意思", "写着啥", "几杠几",
+        )
+        has_visual_cue = any(k in clean for k in visual_cues)
+
+        # 1. 明确按序号指代历史图片（如“倒数第二张”“第2张”“上一张”）
+        req_idx: int | None = None
+        if any(k in clean for k in ("第2张", "第二张", "倒数第二张", "前一张", "上一张")):
+            req_idx = 2
+        elif any(k in clean for k in ("第3张", "第三张", "倒数第三张")):
+            req_idx = 3
+        elif any(k in clean for k in ("第4张", "第四张", "倒数第四张")):
+            req_idx = 4
+        else:
+            m_idx = re.search(r"第\s*([1-8])\s*张", clean)
+            if m_idx:
+                req_idx = int(m_idx.group(1))
+
+        if req_idx is not None and 1 <= req_idx <= len(recent_imgs):
+            item = recent_imgs[req_idx - 1]
+            if (now - item["created_ts"]) <= 1800:
+                return Path(item["image_path"]), item["sender"]
+
+        # 2. 微信引用了某人的图片消息：优先锁定该发送者的最新图片（30 分钟有效）
+        norm_quoted = (quoted_sender or "").strip().lower()
+        if norm_quoted:
+            for item in recent_imgs:
+                if item["sender"].strip().lower() == norm_quoted and (now - item["created_ts"]) <= 1800:
+                    return Path(item["image_path"]), item["sender"]
+            if (now - recent_imgs[0]["created_ts"]) <= 1800:
+                return Path(recent_imgs[0]["image_path"]), recent_imgs[0]["sender"]
+
+        # 3. 当前发送者自己发的图（45 秒内无条件关联；5 分钟内带看图词关联）
+        norm_sender = (sender or "").strip().lower()
+        for item in recent_imgs:
+            if item["sender"].strip().lower() == norm_sender:
+                age = now - item["created_ts"]
+                if age <= 45 or (age <= 300 and has_visual_cue):
+                    return Path(item["image_path"]), item["sender"]
+                break
+
+        # 4. 跨人问图：群里任意成员 10 分钟内发过图，且当前问题含看图词
+        latest = recent_imgs[0]
+        if (now - latest["created_ts"]) <= 600 and has_visual_cue:
+            return Path(latest["image_path"]), latest["sender"]
+
+        return None, ""
+
     def handle_message(
         self,
         group_id: str,
@@ -553,6 +632,7 @@ class DaFeiYuBotCore:
         text: str = "",
         image_path: Path | None = None,
         force_trigger: bool = False,
+        quoted_sender: str = "",
     ) -> BotResponse:
         now = time.time()
         clean_text = (text or "").strip()
@@ -570,7 +650,7 @@ class DaFeiYuBotCore:
                 image_path=str(image_path) if image_path else None,
             )
 
-        # 2. 如果是图片消息，先缓存在该群-发送者的近期图片里（90 秒有效），并顺手偷小梗图进表情库
+        # 2. 如果是图片消息，记录缓存、偷小梗图；不主动回复时也在后台静默生成图片摘要写入历史
         if image_path is not None and image_path.is_file():
             self._recent_group_images[(group_id, sender)] = (image_path, now)
             sticker_manager.maybe_steal_meme(image_path)
@@ -578,6 +658,7 @@ class DaFeiYuBotCore:
             if not clean_text:
                 should_auto_roast = force_trigger or (random.random() < settings.AUTO_ROAST_IMAGE_PROB)
                 if not should_auto_roast:
+                    self._caption_image_async(group_id, image_path)
                     return BotResponse(should_reply=False)
 
         # 3. 优先处理快捷养成指令
@@ -611,18 +692,17 @@ class DaFeiYuBotCore:
         self._unanswered_count[group_id] = 0
         heartflow.drain(group_id, amount=25.0)
 
-        # 5. 如果这条是纯文本触发，看看该群友 90 秒内是不是刚发过一张图（关联识图！）
+        # 5. 如果这条是纯文本触发，从本群 SQLite 近期历史图片中智能关联（支持跨人问图、序号问图、引用图片、连续追问）
         effective_image = image_path
+        image_sender = sender if effective_image is not None else ""
         if effective_image is None:
-            cached = self._recent_group_images.get((group_id, sender))
-            if cached and (now - cached[1]) <= 90 and cached[0].is_file():
-                # 如果问句里带看图相关词，或刚发完图立刻 @大肥鱼
-                if (now - cached[1]) <= 35 or any(
-                    k in clean_text for k in ("图", "这", "看", "啥", "什么", "识别", "提取", "翻译", "解析", "点评", "吐槽")
-                ):
-                    effective_image = cached[0]
-                    # 用过一次后清除，避免后续普通聊天重复识同一张图
-                    self._recent_group_images.pop((group_id, sender), None)
+            effective_image, image_sender = self._pick_referenced_image(
+                group_id=group_id,
+                sender=sender,
+                text=clean_text,
+                now=now,
+                quoted_sender=quoted_sender,
+            )
 
         # 6. 调用 DeepSeek 多模态大脑（拉取最近 22 条群聊记录，保证多人群聊不断片）
         status = pet_engine.get_status()
@@ -638,7 +718,16 @@ class DaFeiYuBotCore:
             recent_history=recent,
             image_path=effective_image,
             group_id=group_id,
+            image_sender=image_sender,
         )
+
+        # 将识别到的图片内容摘要回写进历史，后续聊天不会失忆
+        if brain_reply.vision_summary and effective_image is not None:
+            pet_engine.update_history_content_by_image(
+                group_id,
+                str(effective_image),
+                brain_reply.vision_summary,
+            )
 
         # 7. 更新养成数值（吃掉 Token = 吃白饭）
         new_status = pet_engine.record_interaction(
