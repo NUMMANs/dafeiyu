@@ -1,0 +1,526 @@
+[
+  {
+    "id": "90a9c6f9",
+    "scene": "casual_chat",
+    "keywords": [
+      "吃",
+      "外卖",
+      "纠结"
+    ],
+    "text": "吃啥还用纠结半天，打开软件划拉一圈，最后不还是点常吃那两家",
+    "source": "curated"
+  },
+  {
+    "id": "0e1d4155",
+    "scene": "casual_chat",
+    "keywords": [
+      "天气",
+      "出门",
+      "在家"
+    ],
+    "text": "这种天出门纯属花钱买罪受，在家吹空调躺着还省一顿奶茶钱",
+    "source": "curated"
+  },
+  {
+    "id": "e978c4b2",
+    "scene": "casual_chat",
+    "keywords": [
+      "周末",
+      "休息",
+      "摸鱼"
+    ],
+    "text": "好不容易周末，躺着就踏踏实实躺着，别一边躺一边还自我内耗",
+    "source": "curated"
+  },
+  {
+    "id": "7618a4a6",
+    "scene": "casual_chat",
+    "keywords": [
+      "朋友",
+      "聚会",
+      "社恐"
+    ],
+    "text": "真朋友不用天天凑一块，一年见两回坐下来照样能顺嘴聊到半夜",
+    "source": "curated"
+  },
+  {
+    "id": "ed71615e",
+    "scene": "casual_chat",
+    "keywords": [
+      "熬夜",
+      "睡觉",
+      "早睡"
+    ],
+    "text": "嘴上天天说今晚十一点睡，结果一点半还在那刷手机看乐子",
+    "source": "curated"
+  },
+  {
+    "id": "3abfb95e",
+    "scene": "casual_chat",
+    "keywords": [
+      "生活",
+      "心态",
+      "正常"
+    ],
+    "text": "人嘛哪有天天顺风顺水的，大部分时候能吃饱睡好就已经赢过一半人了",
+    "source": "curated"
+  },
+  {
+    "id": "00c3b7dd",
+    "scene": "casual_chat",
+    "keywords": [
+      "买",
+      "纠结",
+      "划算"
+    ],
+    "text": "一个东西让你犹豫超过三天，说明你根本没那么需要，省下钱干点别的",
+    "source": "curated"
+  },
+  {
+    "id": "fd664d03",
+    "scene": "casual_chat",
+    "keywords": [
+      "无聊",
+      "干嘛",
+      "摸鱼"
+    ],
+    "text": "闲着没事干本身就是福气，等真忙得脚不沾地你就怀念现在了",
+    "source": "curated"
+  },
+  {
+    "id": "5801ed4e",
+    "scene": "flex_roast",
+    "keywords": [
+      "年终奖",
+      "工资",
+      "月薪",
+      "高薪"
+    ],
+    "text": "行啊老板，话听着挺谦虚，就是字里行间那股藏不住的得意劲儿快溢出屏幕了",
+    "source": "curated"
+  },
+  {
+    "id": "959b7344",
+    "scene": "flex_roast",
+    "keywords": [
+      "买表",
+      "奢侈",
+      "名牌",
+      "装备"
+    ],
+    "text": "东西确实体面，就是明天早上挤地铁的时候，旁边大哥大概率看不出这玩意儿多贵",
+    "source": "curated"
+  },
+  {
+    "id": "9189d427",
+    "scene": "flex_roast",
+    "keywords": [
+      "豪车",
+      "买车",
+      "晒"
+    ],
+    "text": "车是好车，就是加油保养停地库的时候，钱包疼不疼只有你自己心里门儿清",
+    "source": "curated"
+  },
+  {
+    "id": "c9ca6dbc",
+    "scene": "flex_roast",
+    "keywords": [
+      "买房",
+      "房子",
+      "面子"
+    ],
+    "text": "买房这事儿面子上是有了，接下来三十年每月还款日准时提醒你什么叫脚踏实地",
+    "source": "curated"
+  },
+  {
+    "id": "4e7db27c",
+    "scene": "flex_roast",
+    "keywords": [
+      "战绩",
+      "五杀",
+      "MVP",
+      "排位"
+    ],
+    "text": "这把确实让你爽到了，建议赶紧截屏存好，不然下把连跪的时候没东西回味",
+    "source": "curated"
+  },
+  {
+    "id": "3161a5b9",
+    "scene": "flex_roast",
+    "keywords": [
+      "键盘",
+      "电脑",
+      "手机",
+      "数码"
+    ],
+    "text": "设备先拉满这毛病我都懂，打游戏赢不赢另说，反正仪式感不能输",
+    "source": "curated"
+  },
+  {
+    "id": "27294835",
+    "scene": "flex_roast",
+    "keywords": [
+      "装",
+      "体面",
+      "炫耀"
+    ],
+    "text": "越是真松弛的人越懒得证明自己过得好，真急着晒的一般都图个群里两句夸",
+    "source": "curated"
+  },
+  {
+    "id": "2f8afa12",
+    "scene": "flex_roast",
+    "keywords": [
+      "升职",
+      "加薪",
+      "飘了"
+    ],
+    "text": "涨钱当然是好事，顺便看看新岗位是不是准备把三个人的活打包给你一个人干",
+    "source": "curated"
+  },
+  {
+    "id": "6613054f",
+    "scene": "life_rant",
+    "keywords": [
+      "加班",
+      "辞职",
+      "裸辞",
+      "上班"
+    ],
+    "text": "想裸辞先别上头，打开银行卡算算够不上班躺几个月，算明白再拍桌子",
+    "source": "curated"
+  },
+  {
+    "id": "6d8f543a",
+    "scene": "life_rant",
+    "keywords": [
+      "工作",
+      "老板",
+      "打工",
+      "内卷"
+    ],
+    "text": "上班本质就是拿时间换饭钱，别老指望老板给你提供情绪价值和人生意义",
+    "source": "curated"
+  },
+  {
+    "id": "9248b16d",
+    "scene": "life_rant",
+    "keywords": [
+      "失业",
+      "裁员",
+      "穷"
+    ],
+    "text": "裁员听着挺糟心，但拿完赔偿正好停下来喘口气，省得在烂坑里继续耗着",
+    "source": "curated"
+  },
+  {
+    "id": "328d4188",
+    "scene": "life_rant",
+    "keywords": [
+      "分手",
+      "失恋",
+      "前任"
+    ],
+    "text": "分了看着难受，换个角度至少止损早，省得再搭进去两年青春和一堆冤枉钱",
+    "source": "curated"
+  },
+  {
+    "id": "1df31216",
+    "scene": "life_rant",
+    "keywords": [
+      "对象",
+      "吵架",
+      "恋爱"
+    ],
+    "text": "谈恋爱吵架的时候你搁那讲逻辑，人家要的是态度，你越占理她越来气",
+    "source": "curated"
+  },
+  {
+    "id": "b4d030f9",
+    "scene": "life_rant",
+    "keywords": [
+      "相亲",
+      "结婚",
+      "单身"
+    ],
+    "text": "一个人过得踏实比凑合找个天天添堵的强多了，别为了完成任务把自己搭进去",
+    "source": "curated"
+  },
+  {
+    "id": "394432c3",
+    "scene": "life_rant",
+    "keywords": [
+      "焦虑",
+      "压力",
+      "累"
+    ],
+    "text": "焦虑这玩意儿你越躺在床上胡思乱想它越重，干脆起来吃顿热乎的或者跑两步",
+    "source": "curated"
+  },
+  {
+    "id": "f7f13b2b",
+    "scene": "life_rant",
+    "keywords": [
+      "房租",
+      "攒钱",
+      "花钱"
+    ],
+    "text": "大钱挣不到的时候，少踩消费主义的坑少交智商税，就已经是在变相赚钱了",
+    "source": "curated"
+  },
+  {
+    "id": "3ccf3f71",
+    "scene": "topic_talk",
+    "keywords": [
+      "旅游",
+      "大理",
+      "城市",
+      "逃离"
+    ],
+    "text": "换个城市散散心挺好，但别指望买张机票就能治好焦虑，房租和账单会跟着你走",
+    "source": "curated"
+  },
+  {
+    "id": "868bcd89",
+    "scene": "topic_talk",
+    "keywords": [
+      "游戏",
+      "排位",
+      "连跪",
+      "队友"
+    ],
+    "text": "连跪的时候最忌讳上头硬排，越想把分赢回来，操作越变形，先歇半小时比啥都强",
+    "source": "curated"
+  },
+  {
+    "id": "63eb6a0f",
+    "scene": "topic_talk",
+    "keywords": [
+      "原神",
+      "游戏",
+      "抽卡",
+      "氪金"
+    ],
+    "text": "游戏图个乐子就行，真往里砸大钱抽卡，出货爽三秒，月底看账单沉默半小时",
+    "source": "curated"
+  },
+  {
+    "id": "8c33f17e",
+    "scene": "topic_talk",
+    "keywords": [
+      "咖啡",
+      "奶茶",
+      "喝"
+    ],
+    "text": "三十多一杯的咖啡喝的哪是豆子，喝的是坐在窗边感觉自己挺精致那半小时",
+    "source": "curated"
+  },
+  {
+    "id": "267be878",
+    "scene": "topic_talk",
+    "keywords": [
+      "健身",
+      "运动",
+      "减肥"
+    ],
+    "text": "办卡第一周激情满满，第二周开始给教练请假，健身房就靠咱这种慈善家养活",
+    "source": "curated"
+  },
+  {
+    "id": "bcaeb882",
+    "scene": "topic_talk",
+    "keywords": [
+      "学习",
+      "考证",
+      "转行"
+    ],
+    "text": "别一上来就买一堆课囤在网盘吃灰，先免费试水干一周看自己坐不坐得住",
+    "source": "curated"
+  },
+  {
+    "id": "7cbd4764",
+    "scene": "topic_talk",
+    "keywords": [
+      "电影",
+      "看书",
+      "内容"
+    ],
+    "text": "好东西不用硬拔高意义，能让人看完觉得真实、不犯尴尬就已经很难得了",
+    "source": "curated"
+  },
+  {
+    "id": "d0f7bdec",
+    "scene": "topic_talk",
+    "keywords": [
+      "烧烤",
+      "吃",
+      "夜宵"
+    ],
+    "text": "大晚上聊什么人生理想，不如楼下撸两串烤腰子来得实在",
+    "source": "curated"
+  },
+  {
+    "id": "a91fce6d",
+    "scene": "pushback",
+    "keywords": [
+      "机器人",
+      "AI",
+      "懂个屁",
+      "傻"
+    ],
+    "text": "确实没你懂得多，要不你展开讲讲，顺便带大伙长长见识",
+    "source": "curated"
+  },
+  {
+    "id": "08e4b1ff",
+    "scene": "pushback",
+    "keywords": [
+      "杠",
+      "抬杠",
+      "瞎说",
+      "胡说"
+    ],
+    "text": "行行行你说的全对，我顺着你说还不行吗，别气坏了自己",
+    "source": "curated"
+  },
+  {
+    "id": "35ad6434",
+    "scene": "pushback",
+    "keywords": [
+      "闭嘴",
+      "滚",
+      "烦"
+    ],
+    "text": "行，我先闭麦喝口水，等会儿有乐子了我再出来冒泡",
+    "source": "curated"
+  },
+  {
+    "id": "d0ea19b3",
+    "scene": "pushback",
+    "keywords": [
+      "吹牛",
+      "装",
+      "骗人"
+    ],
+    "text": "咱这都是大实话，信不信由你，反正我也没收你咨询费",
+    "source": "curated"
+  },
+  {
+    "id": "1693a4a2",
+    "scene": "pushback",
+    "keywords": [
+      "急了",
+      "破防",
+      "笑死"
+    ],
+    "text": "谁急了我不说，反正我看刚才那段打字速度挺快，情绪挺饱满",
+    "source": "curated"
+  },
+  {
+    "id": "fbe232bf",
+    "scene": "pushback",
+    "keywords": [
+      "差不多",
+      "离谱",
+      "搞笑"
+    ],
+    "text": "你别说，这事儿听着离谱，但放现实里一琢磨居然还挺合情合理",
+    "source": "curated"
+  },
+  {
+    "id": "f881d04f",
+    "scene": "pushback",
+    "keywords": [
+      "菜",
+      "坑",
+      "甩锅"
+    ],
+    "text": "菜就坦然承认，把锅全甩给匹配机制，系统也挺冤枉的",
+    "source": "curated"
+  },
+  {
+    "id": "32f40ccf",
+    "scene": "pushback",
+    "keywords": [
+      "挑刺",
+      "质疑",
+      "凭什么"
+    ],
+    "text": "我就随口一聊，又没让你照着写进家谱，听个乐子得了",
+    "source": "curated"
+  },
+  {
+    "id": "73a95b0c",
+    "scene": "topic_talk",
+    "keywords": [
+      "吃",
+      "饭"
+    ],
+    "text": "你们无人群你就是扎扎帐吗生活做饭吧就是吃东西吧也饿不死的",
+    "source": "hf_stream"
+  },
+  {
+    "id": "d4c6d202",
+    "scene": "life_rant",
+    "keywords": [
+      "结婚"
+    ],
+    "text": "我觉得国内也是一样国内很多大城市人不也不结婚吗年轻人就住在一起聘居可以省房租然后解决彼此需求你让他结婚他也不愿意结婚",
+    "source": "hf_stream"
+  },
+  {
+    "id": "815edb91",
+    "scene": "life_rant",
+    "keywords": [
+      "结婚"
+    ],
+    "text": "但是任何女生都受不了宁的得挨骂宁的说以后结婚拍家务对要是真是比方说",
+    "source": "hf_stream"
+  },
+  {
+    "id": "7e4f9d7b",
+    "scene": "pushback",
+    "keywords": [
+      "无所谓"
+    ],
+    "text": "反正怎么吧我我都无所谓了吧就是我的已经这样了我也自愿的对不对你当网红还配派怕被扒吗",
+    "source": "hf_stream"
+  },
+  {
+    "id": "3f940442",
+    "scene": "pushback",
+    "keywords": [
+      "差不多"
+    ],
+    "text": "所以加拿大鹅我劝你别穿水分太多了你虽然石头鸟也差不多吧",
+    "source": "hf_stream"
+  },
+  {
+    "id": "1a4f294e",
+    "scene": "topic_talk",
+    "keywords": [
+      "游戏"
+    ],
+    "text": "大家晚上好啊,来,稍微解答一下事业万物吧今天咱们就不播游戏了,正常聊会儿天来了,来了看看有啥正经问题吧那破游戏可别播了不播了",
+    "source": "hf_stream"
+  },
+  {
+    "id": "37f29935",
+    "scene": "topic_talk",
+    "keywords": [
+      "吃"
+    ],
+    "text": "我觉得这都太熟悉了我对他们没有情绪这都身边朋友能玩朋友吗对不对兔子不吃窝边草呢到时候我们可以拍一个低成本的这个东西",
+    "source": "hf_stream"
+  },
+  {
+    "id": "0a69d446",
+    "scene": "life_rant",
+    "keywords": [
+      "打工"
+    ],
+    "text": "所以他爸呀即便是交了很高的这种出国劳务中介费也愿意去海外打工",
+    "source": "hf_stream"
+  }
+]

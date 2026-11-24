@@ -42,6 +42,7 @@ class Settings:
     VISION_BASE_URL: str = os.getenv("VISION_BASE_URL", "").strip()
 
     BOT_NAME: str = os.getenv("BOT_NAME", "大肥鱼").strip()
+    DEFAULT_PERSONA: str = os.getenv("DEFAULT_PERSONA", "fengge").strip().lower() or "fengge"
     TRIGGER_KEYWORDS: list[str] = _parse_list(
         os.getenv("TRIGGER_KEYWORDS"), ["@大肥鱼", "大肥鱼", "肥鱼"]
     )

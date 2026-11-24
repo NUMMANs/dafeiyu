@@ -21,7 +21,7 @@ from image_fetcher import download_image_url, search_and_download_image
 from memory import memory_store
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
-from roles.build_card import get_evolutions
+from roles.build_card import get_active_persona, get_evolutions, list_personas, set_active_persona
 from safety_guard import (
     assess_danger,
     cancel_pending_action,
@@ -326,6 +326,7 @@ class DaFeiYuBotCore:
                 f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
                 f"• `/搜图 关键词`（或图片链接）：联网搜图并直接发群里\n"
+                f"• `/切换人设 峰哥` / `/切换人设 塔菲` / `/当前人设`：零重启热切换语言风格\n"
                 f"• `/dsh 任务` / `/dsh 续 指令` / `/dsh状态`：派发独立后台 DSH 重任务（仅主人）\n"
                 f"• `/确认 码` / `/取消 码` / `/待确认`：审批或取消高危操作的群内二次确认\n"
                 f"• `/更新` / `/重启`：从 GitHub 拉取新代码并重启（仅主人）"
@@ -391,9 +392,38 @@ class DaFeiYuBotCore:
 
         if cmd in ("/人设", "查人设", "/进化"):
             st = pet_engine.get_status()
-            evos = get_evolutions()
-            lines = ["✨ 【大肥鱼自我进化记录】"] + [f"• {e}" for e in evos]
+            active = get_active_persona()
+            evos = get_evolutions(active)
+            lines = [f"✨ 【当前人设：{active}｜自我进化记录】"] + [f"• {e}" for e in evos]
             return BotResponse(should_reply=True, text="\n".join(lines), mood="happy", status=st)
+
+        if cmd in ("/当前人设", "/人设列表", "人设列表"):
+            st = pet_engine.get_status()
+            lines = ["🎭 【可用人设列表】"]
+            for p in list_personas():
+                mark = "✅ 当前" if p["active"] else "  可选"
+                lines.append(f"• {mark}：{p['label']} (`{p['key']}`)")
+            lines.append("发 `/切换人设 峰哥` 或 `/切换人设 塔菲` 即可热切换（无需重启）")
+            return BotResponse(should_reply=True, text="\n".join(lines), mood="happy", status=st)
+
+        switch_match = re.match(r"^/(?:切换人设|换人设)(?:\s*(.*))?$", cmd)
+        if switch_match:
+            st = pet_engine.get_status()
+            target_p = (switch_match.group(1) or "").strip()
+            if not target_p:
+                return BotResponse(
+                    should_reply=True,
+                    text="格式：`/切换人设 峰哥` 或 `/切换人设 塔菲`（发 `/当前人设` 查看全部）",
+                    mood="smug",
+                    status=st,
+                )
+            ok_sw, msg_sw = set_active_persona(target_p)
+            return BotResponse(
+                should_reply=True,
+                text=f"🎭 {msg_sw}" if ok_sw else f"❌ {msg_sw}",
+                mood="happy" if ok_sw else "smug",
+                status=st,
+            )
 
         if cmd in ("/定时", "查定时", "/定时任务"):
             st = pet_engine.get_status()

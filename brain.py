@@ -28,9 +28,10 @@ from config import settings
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
 from memory import memory_store
+from persona_rag import retrieve_style_hints
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
-from roles.build_card import evolve_persona, load_card
+from roles.build_card import evolve_persona, get_active_persona, load_card
 from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
@@ -352,6 +353,17 @@ def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | Non
     return None
 
 
+def _persona_voice_profile() -> tuple[str, str, str]:
+    """返回 (角色简称, 回复口吻指引, 语气尾词)，避免切到峰哥人设时串出塔菲/喵。"""
+    if get_active_persona() == "fengge":
+        return (
+            "峰哥",
+            "峰哥松弛直白的短气泡老哥口吻（严禁使用“喵”“人家”“塔菲”等卖萌词）",
+            "",
+        )
+    return ("塔菲", "塔菲真人群友的短气泡口吻", "喵")
+
+
 def _build_system_prompt(
     status: PetStatus,
     sender: str,
@@ -359,14 +371,18 @@ def _build_system_prompt(
     recalled_memory: str = "",
     matched_slang: str = "",
     emotion_desc: str = "",
+    style_hints: str = "",
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     card_text = load_card()
-    hunger_hint = (
-        f"你现在饿扁了（饱食度 {status.hunger}/100），可以顺嘴讨一句 /投喂。"
-        if status.hunger <= 25
-        else f"饱食度 {status.hunger}/100，段位 {status.title}。"
-    )
+    if get_active_persona() == "fengge":
+        hunger_hint = f"段位 {status.title}。"
+    else:
+        hunger_hint = (
+            f"你现在有点饿了（饱食度 {status.hunger}/100），可以顺嘴提一句 /投喂。"
+            if status.hunger <= 25
+            else f"饱食度 {status.hunger}/100，段位 {status.title}。"
+        )
     extra_blocks = []
     if recalled_memory:
         extra_blocks.append(recalled_memory)
@@ -374,6 +390,8 @@ def _build_system_prompt(
         extra_blocks.append(matched_slang)
     if emotion_desc:
         extra_blocks.append(emotion_desc)
+    if style_hints:
+        extra_blocks.append(style_hints)
     extra_text = ("\n" + "\n".join(extra_blocks) + "\n") if extra_blocks else ""
     return (
         f"【当前时间】{now_str}（Asia/Shanghai）\n"
@@ -475,10 +493,19 @@ class DaFeiYuBrain:
             b = split_human_bubbles(demo)
             return BrainReply(text="\n".join(b), bubbles=b, mood="happy", tokens_used=0, used_vision=False)
 
-        # L1 识海按需召回 + 群黑话命中注入 + 情绪惯性状态机
+        # L1 识海按需召回 + 群黑话命中注入 + 情绪惯性状态机 + 语境语感 RAG
+        active_persona = get_active_persona()
+        role_name, voice_hint, tail_word = _persona_voice_profile()
         recalled_memory = memory_store.render_context(f"{sender} {text}", group_id=group_id)
         matched_slang = slang_book.render_matched(group_id, text)
         emotion_desc = emotion_sm.describe(group_id)
+        style_hints = retrieve_style_hints(
+            active_persona,
+            text,
+            recent_history=recent_history,
+            group_id=group_id,
+            top_k=2,
+        )
         system_prompt = _build_system_prompt(
             status,
             sender,
@@ -486,6 +513,7 @@ class DaFeiYuBrain:
             recalled_memory=recalled_memory,
             matched_slang=matched_slang,
             emotion_desc=emotion_desc,
+            style_hints=style_hints,
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
@@ -514,7 +542,7 @@ class DaFeiYuBrain:
                 user_msg = (
                     f"{owner_desc}"
                     + (f"并说：{text}" if text.strip() else "")
-                    + f"\n\n（你的眼睛已经把这张图的细节看得一清二楚：\n{zhipu_vision_desc}\n请直接以塔菲真人群友的短气泡口吻吐槽或回答，别说“根据视觉描述”）"
+                    + f"\n\n（你的眼睛已经把这张图的细节看得一清二楚：\n{zhipu_vision_desc}\n请直接以{voice_hint}吐槽或回答，别说“根据视觉描述”）"
                 )
                 messages.append({"role": "user", "content": user_msg})
                 client = self._get_chat_client()
@@ -552,7 +580,7 @@ class DaFeiYuBrain:
                         "role": "user",
                         "content": (
                             f"[{sender}]: {text}\n\n"
-                            f"（系统已前置联网查好资料。请严格以以下搜索结果中的事实、数字和日期为准，用塔菲的短气泡口吻自然回答；"
+                            f"（系统已前置联网查好资料。请严格以以下搜索结果中的事实、数字和日期为准，用{voice_hint}自然回答；"
                             f"如果结果里没有确切答案或全是旧信息，直接老实说没查到，严禁瞎编数字、版本或出装：\n{pre_searched_block}）"
                         ),
                     }
@@ -713,7 +741,7 @@ class DaFeiYuBrain:
                         fpath, tool_out = search_and_download_image(q)
                         if fpath and fpath.is_file() and fpath.stat().st_size > 0:
                             attachment_path = fpath
-                            tool_out = f"{tool_out}。图片已加入待发送附件，请用一两句塔菲简短俏皮口吻告诉群友图给他们找来啦。"
+                            tool_out = f"{tool_out}。图片已加入待发送附件，请用一两句{voice_hint}告诉群友图给他们找来啦。"
                     elif fn_name == "download_image_from_url":
                         u = str(args.get("url") or "").strip()
                         logger.info("🌐 下载直链图片并发送: %s", u[:80])
@@ -889,10 +917,10 @@ class DaFeiYuBrain:
                 kwargs["presence_penalty"] = 0.0
                 kwargs["max_tokens"] = 4096
             else:
-                raw_content = "工具跑完一轮啦，结果已经在上面了喵"
+                raw_content = f"工具跑完一轮了，结果已经在上面了{tail_word}"
 
             cleaned, mood, sticker_caption = self._parse_mood(raw_content, "shocked" if used_vision else status.mood_tag)
-            bubbles = split_human_bubbles(cleaned or "网卡了一下 刚才说啥来着喵")
+            bubbles = split_human_bubbles(cleaned or f"网卡了一下 刚才说啥来着{tail_word}")
             return BrainReply(
                 text="\n".join(bubbles),
                 bubbles=bubbles,
@@ -909,7 +937,7 @@ class DaFeiYuBrain:
             if used_vision:
                 hint = f"看图接口抽风了（{err_msg[:100]}）"
             else:
-                hint = f"大脑断网了喵（{err_msg[:100]}）"
+                hint = f"大脑断网了{tail_word}（{err_msg[:100]}）"
             return BrainReply(text=hint, bubbles=[hint], mood="sleepy", tokens_used=total_tokens, used_vision=used_vision)
 
     def judge_and_chime_in(self, recent_history: list[dict], status: PetStatus) -> BrainReply | None:
@@ -929,14 +957,15 @@ class DaFeiYuBrain:
             return None
 
         transcript = "\n".join(transcript_lines)
-        prompt = f"""你是潜伏在微信群里的「{settings.BOT_NAME}」（永雏塔菲人格，古灵精怪、傲娇欠揍爱看乐子，说话短平快自然带“喵”，当前饱食度 {status.hunger}/100）。
+        role_name, voice_hint, _ = _persona_voice_profile()
+        prompt = f"""你是潜伏在微信群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}，当前饱食度 {status.hunger}/100）。
 
 下面是群友刚才的聊天记录（他们没有叫你）：
 {transcript}
 
 请你自行判断：这波聊天里有没有好笑、抽象、逆天、游戏/生活吐槽或适合接梗神补刀的点？
 - 如果纯粹只是发问号、约几点钟、无聊的机械打卡，请**只输出** `[PASS]`。
-- 只要有哪怕一点乐子或槽点，就果断以塔菲的口吻冒泡神补刀 **1~2 句**（简短自然、不要用 Markdown），并在末尾附带情绪标签 `[MOOD:happy]` / `[MOOD:smug]` / `[MOOD:shocked]` / `[MOOD:angry]` / `[MOOD:sleepy]` / `[MOOD:gaming]` / `[MOOD:love]` / `[MOOD:hungry]`。"""
+- 只要有哪怕一点乐子或槽点，就果断以{voice_hint}冒泡补刀 **1~2 句**（简短自然、不要用 Markdown），并在末尾附带情绪标签 `[MOOD:happy]` / `[MOOD:smug]` / `[MOOD:shocked]` / `[MOOD:angry]` / `[MOOD:sleepy]` / `[MOOD:gaming]` / `[MOOD:love]` / `[MOOD:hungry]`。"""
 
         try:
             resp = self._get_chat_client().chat.completions.create(
@@ -980,7 +1009,7 @@ class DaFeiYuBrain:
         ]
         ctx = "\n".join(ctx_lines)
         prompt = (
-            f"你是群里的「{settings.BOT_NAME}」（群友也叫你塔菲、鱼、机器人、小号）。\n"
+            f"你是群里的「{settings.BOT_NAME}」（群友也叫你峰哥、老峰、塔菲、鱼、机器人、小号）。\n"
             f"刚才群里的聊天记录：\n{ctx}\n\n"
             f"现在 [{sender}] 发了一句新消息：「{text}」\n"
             f"请判断这句话是不是在继续跟你说话、接你的话茬、或者在议论你（比如评价你的头像、反应、智商、功能）？\n"
@@ -1002,24 +1031,25 @@ class DaFeiYuBrain:
 
     def generate_autonomous_bubble(self, kind: str, status: PetStatus) -> BrainReply:
         """生成定时作息 / 饿扁催饭的主动冒泡发言"""
+        role_name, voice_hint, tail_word = _persona_voice_profile()
         if not settings.has_valid_api_key:
             msg = (
-                "饿扁了喵||谁发个 /投喂 管顿白饭呀"
+                f"饿扁了{tail_word}||谁发个 /投喂 管顿白饭"
                 if kind == "hungry"
-                else "晚上好喵||今晚开不开黑呀"
+                else f"晚上好{tail_word}||今晚怎么说"
             )
             b = split_human_bubbles(msg)
             return BrainReply(text="\n".join(b), bubbles=b, mood="hungry" if kind == "hungry" else "happy", tokens_used=0, used_vision=False)
 
         if kind == "hungry":
             instruction = (
-                f"你是微信群里的永雏塔菲人格大肥鱼，现在饱食度只剩 {status.hunger}/100 饿扁了。"
-                "请主动在群里发 1~2 句撒娇又有点欠揍的催饭发言（自然带喵），让群友发 `/投喂` 给白饭吃，末尾带 `[MOOD:hungry]`。"
+                f"你是微信群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}），现在饱食度只剩 {status.hunger}/100。"
+                f"请主动在群里发 1~2 句符合你人设的催饭发言，让群友发 `/投喂` 管顿饭，末尾带 `[MOOD:hungry]`。"
             )
         else:
             instruction = (
-                "你是微信群里的永雏塔菲人格大肥鱼，现在晚上 8 点左右，群里有点安静。"
-                "请主动发 1~2 句塔菲风格的冒泡开场白（比如问雏草姬/群友们今晚开不开黑、是不是都在摸鱼，自然带喵），末尾带 `[MOOD:happy]` 或 `[MOOD:sleepy]`。"
+                f"你是微信群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}），现在晚上 8 点左右，群里有点安静。"
+                f"请主动发 1~2 句符合你人设的冒泡开场白（比如问大伙今晚干啥、开不开黑、是不是都在摸鱼），末尾带 `[MOOD:happy]` 或 `[MOOD:sleepy]`。"
             )
 
         try:
@@ -1032,7 +1062,7 @@ class DaFeiYuBrain:
             raw = (resp.choices[0].message.content or "").strip()
             tokens_used = getattr(resp.usage, "total_tokens", 0) or 0
             cleaned, mood, sticker_caption = self._parse_mood(raw, "hungry" if kind == "hungry" else "happy")
-            b = split_human_bubbles(cleaned or "在干嘛呢喵")
+            b = split_human_bubbles(cleaned or f"都在干嘛呢{tail_word}")
             return BrainReply(
                 text="\n".join(b),
                 bubbles=b,
@@ -1043,9 +1073,9 @@ class DaFeiYuBrain:
             )
         except Exception:
             fallback = (
-                "饿扁了喵||谁发个 /投喂 救济一下呀"
+                f"饿扁了{tail_word}||谁发个 /投喂 救济一下"
                 if kind == "hungry"
-                else "晚上好喵||今晚怎么说"
+                else f"晚上好{tail_word}||今晚怎么说"
             )
             b = split_human_bubbles(fallback)
             return BrainReply(
@@ -1057,16 +1087,17 @@ class DaFeiYuBrain:
             )
 
     def write_daily_diary(self, recent_history: list[dict], status: PetStatus) -> bool:
-        """L2 日记：每晚以塔菲口吻写一条今天群里的细节与心情（≤200字）"""
+        """L2 日记：每晚以当前人设口吻写一条今天群里的细节与心情（≤200字）"""
         if not settings.has_valid_api_key or not recent_history:
             return False
         lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-15:] if m.get("content")]
         if not lines:
             return False
+        role_name, voice_hint, _ = _persona_voice_profile()
         prompt = (
-            "你是大肥鱼（永雏塔菲人格）。请根据今天群里发生的片段，写一条 60~160 字的私人日记，"
-            "记录今天让你印象最深的细节和心情（像真日记，不要汇报，带一点塔菲味）。\n"
-            "只输出一行，格式：`心情词|日记正文`（例如：`开心|今天群里那帮杂鱼又在吹亚索……`）。\n\n"
+            f"你是群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}）。请根据今天群里发生的片段，写一条 60~160 字的私人日记，"
+            "记录今天让你印象最深的细节和心情（像真日记，不要汇报，贴合当前人设口吻）。\n"
+            "只输出一行，格式：`心情词|日记正文`。\n\n"
             + "\n".join(lines)
         )
         try:
