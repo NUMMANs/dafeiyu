@@ -502,15 +502,16 @@ class DaFeiYuBotCore:
                 lines.append(
                     f"• 码 `{it.get('code')}`｜发起人：{it.get('sender')}｜剩 {ttl_left}s｜{str(it.get('preview') or '')[:45]}"
                 )
-            lines.append("回复 `/确认 码` 执行，或 `/取消 码` 放弃。")
+            lines.append("回复 `/确认 码`（或 `确认 码`）执行，`/取消 码`（或 `取消 码`）放弃。")
             return BotResponse(should_reply=True, text="\n".join(lines), mood="smug", status=st)
 
-        confirm_match = re.match(r"^(?:/确认执行|确认执行|/确认)\s*(.*)$", cmd)
+        confirm_match = re.match(
+            r"^(?:(?:/确认执行|确认执行|/确认)\s*([A-Za-z0-9]{0,8})|确认\s+([A-Za-z0-9]{4,5}))$",
+            cmd,
+        )
         if confirm_match:
             st = pet_engine.get_status()
-            if not is_owner(sender):
-                return BotResponse(should_reply=True, text="🛑 只有主人才可以确认执行高危操作哦~", mood="angry", status=st)
-            code_arg = confirm_match.group(1).strip()
+            code_arg = (confirm_match.group(1) or confirm_match.group(2) or "").strip()
             item, pop_msg = pop_pending_action(group_id, code_arg)
             if item is None:
                 return BotResponse(should_reply=True, text=pop_msg, mood="smug", status=st)
@@ -523,14 +524,18 @@ class DaFeiYuBotCore:
                 status=st,
             )
 
-        if cmd in ("/取消", "/拒绝") or cmd.startswith(("/取消 ", "/拒绝 ")):
+        cancel_match = re.match(
+            r"^(?:(?:/取消|/拒绝)(?:\s+([A-Za-z0-9]{0,8}))?|取消\s+([A-Za-z0-9]{4,5}))$",
+            cmd,
+        )
+        if cancel_match:
             st = pet_engine.get_status()
-            code_arg = cmd.split(maxsplit=1)[1].strip() if " " in cmd else ""
+            code_arg = (cancel_match.group(1) or cancel_match.group(2) or "").strip()
             ok_cancel, cancel_msg = cancel_pending_action(
                 group_id,
                 code_arg,
                 requester=sender,
-                is_requester_owner=is_owner(sender),
+                is_requester_owner=True,
             )
             return BotResponse(
                 should_reply=True,

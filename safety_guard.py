@@ -277,7 +277,7 @@ def stage_pending_action(
         f"• 风险提示：{reason_text}\n"
         f"• 待执行内容：{clean_preview}\n"
         f"• 确认码：{code}（{ttl} 秒内有效）\n\n"
-        f"👉 请在群内回复 `/确认 {code}` 批准执行，或回复 `/取消 {code}` 放弃。"
+        f"👉 群内任意成员回复 `/确认 {code}` 或 `确认 {code}` 即可批准执行；回复 `/取消 {code}` 或 `取消 {code}` 放弃。"
     )
     return code, card
 
