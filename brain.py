@@ -30,6 +30,7 @@ from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus
 from roles.build_card import evolve_persona, load_card
 from scheduler import scheduler
+from self_ops import git_pull_and_check, request_restart, self_edit_code
 from web_search import web_search
 
 logger = logging.getLogger("dafeiyu.brain")
@@ -629,6 +630,25 @@ class DaFeiYuBrain:
                             fpath, tool_out = send_existing_file(str(args.get("path") or ""))
                             if fpath and fpath.is_file() and fpath.stat().st_size > 0:
                                 attachment_path = fpath
+                        elif fn_name == "self_pull_and_restart":
+                            logger.info("🔄 Agent 触发自更新与重启")
+                            ok_pull, pull_detail = git_pull_and_check()
+                            if ok_pull:
+                                restart_msg = request_restart(reason="从 GitHub 拉取最新代码")
+                                tool_out = f"{pull_detail}\n{restart_msg}\n请先简洁告知用户即将重启，几秒后会回来。"
+                            else:
+                                tool_out = pull_detail
+                        elif fn_name == "self_edit_code":
+                            logger.info("🛠️ Agent 尝试自修改代码: %s", args.get("rel_path"))
+                            tool_out = self_edit_code(
+                                str(args.get("rel_path") or ""),
+                                str(args.get("target") or ""),
+                                str(args.get("replacement") or ""),
+                            )
+                        elif fn_name == "self_restart":
+                            reason = str(args.get("reason") or "主人要求重启")
+                            logger.info("♻️ Agent 触发重启: %s", reason)
+                            tool_out = request_restart(reason=reason)
                         else:
                             tool_out = "未知工具"
                     else:

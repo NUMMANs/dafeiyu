@@ -65,6 +65,10 @@ class Settings:
         x.strip() for x in os.getenv("OWNER_NAMES", "").split(",") if x.strip()
     ]
 
+    # Git 自动拉取更新与看门狗守护配置
+    AUTO_GIT_UPDATE: bool = _parse_bool(os.getenv("AUTO_GIT_UPDATE"), True)
+    AUTO_GIT_POLL_SEC: int = max(15, int(os.getenv("AUTO_GIT_POLL_SEC", "60")))
+
     RUN_MODE: str = os.getenv("RUN_MODE", "web").strip().lower()
     WX_GROUP_WHITELIST: list[str] = _parse_list(
         os.getenv("WX_GROUP_WHITELIST"), ["大肥鱼测试群"]

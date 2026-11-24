@@ -9,6 +9,7 @@ from bot_core import bot_core
 from config import UPLOADS_DIR, settings
 from pet_engine import pet_engine
 from scheduler import scheduler
+from self_ops import check_remote_update, consume_restart_notice, git_pull_and_check, request_restart
 
 logger = logging.getLogger("dafeiyu.wxauto")
 
@@ -241,9 +242,22 @@ class WxAutoAdapter:
             if hasattr(wx, "StartListening"):
                 wx.StartListening()
 
-            # 后台巡检循环：每 15 秒检查用户自定义定时任务，每 5 分钟检查自主冒泡与夜间记忆养护
+            notice = consume_restart_notice()
+            if notice and notice.get("msg"):
+                time.sleep(0.6)
+                target_group = (notice.get("group_id") or "").strip()
+                notify_targets = [target_group] if target_group else (list(self.groups[:1]) if self.groups else [])
+                for tg in notify_targets:
+                    try:
+                        wx.SendMsg(notice["msg"], who=tg)
+                        logger.info("📢 已向 [%s] 发送重启回归通知: %s", tg, notice["msg"][:80])
+                    except Exception as exc:
+                        logger.warning("发送重启通知到 [%s] 失败: %s", tg, exc)
+
+            # 后台巡检循环：定时任务(15s)、Git远程更新(AUTO_GIT_POLL_SEC)、自主冒泡与夜间养护(300s)
             last_heartbeat = time.time()
             last_schedule_check = time.time()
+            last_git_check = time.time()
             while not self._stop_event.is_set():
                 time.sleep(1.0)
                 now_loop = time.time()
@@ -288,6 +302,38 @@ class WxAutoAdapter:
                                     wx.SendFiles(str(hb.sticker_path.resolve()), who=group)
                         except Exception as exc:
                             logger.warning("[%s] 自主冒泡发送异常: %s", group, exc)
+
+                # 3. 定期检测 GitHub 是否有新提交（推送即自动拉取 + 语法校验 + 重启）
+                if settings.AUTO_GIT_UPDATE and (now_loop - last_git_check) >= settings.AUTO_GIT_POLL_SEC:
+                    last_git_check = now_loop
+                    try:
+                        has_update, update_info = check_remote_update()
+                        if has_update:
+                            logger.info("🛰️ 检测到远程新提交: %s", update_info)
+                            ok_pull, pull_detail = git_pull_and_check()
+                            first_group = self.groups[0] if self.groups else ""
+                            if ok_pull:
+                                pre_notice = f"🛰️ 检测到 Git 新提交（{update_info}），代码校验通过，即将重启更新..."
+                                if first_group:
+                                    try:
+                                        wx.SendMsg(pre_notice, who=first_group)
+                                    except Exception as exc:
+                                        logger.warning("发送更新预告到 [%s] 失败: %s", first_group, exc)
+                                request_restart(
+                                    reason=f"GitHub 自动更新 ({update_info})",
+                                    notify_group=first_group,
+                                    delay_sec=2.0,
+                                )
+                                self._stop_event.set()
+                            else:
+                                logger.warning("自动拉取未通过检查: %s", pull_detail)
+                                if first_group and "语法错误" in pull_detail:
+                                    try:
+                                        wx.SendMsg(f"⚠️ 检测到 Git 新提交（{update_info}），但 {pull_detail}", who=first_group)
+                                    except Exception as exc:
+                                        logger.warning("发送回滚告警到 [%s] 失败: %s", first_group, exc)
+                    except Exception as exc:
+                        logger.warning("自动检测 Git 更新异常: %s", exc)
 
             if hasattr(wx, "StopListening"):
                 wx.StopListening()

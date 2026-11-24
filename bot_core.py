@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from agent_tools import is_owner
 from brain import brain
 from config import settings
 from memory import memory_store
@@ -11,6 +12,7 @@ from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
 from roles.build_card import get_evolutions
 from scheduler import scheduler
+from self_ops import git_pull_and_check, request_restart
 from sticker_manager import sticker_manager
 
 
@@ -248,7 +250,9 @@ class DaFeiYuBotCore:
                 f"• 发图自动高清识图吐槽，发完图再叫大肥鱼必识别\n"
                 f"• `/投喂` / `/摸鱼` / `/状态` / `/鱼塘榜`：养鱼互动\n"
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
-                f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记"
+                f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
+                f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
+                f"• `/更新` / `/重启`：从 GitHub 拉取新代码并重启（仅主人）"
             )
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
 
@@ -338,6 +342,23 @@ class DaFeiYuBotCore:
                 return BotResponse(should_reply=True, text="格式：/取消定时 任务ID（先发 /定时 看ID）", mood="smug", status=st)
             _, msg = scheduler.delete_task(tid)
             return BotResponse(should_reply=True, text=f"{msg}喵", mood="happy", status=st)
+
+        if cmd in ("/更新", "/拉代码", "/gitpull"):
+            st = pet_engine.get_status()
+            if not is_owner(sender):
+                return BotResponse(should_reply=True, text="🛑 只有主人才可以让我拉取代码更新哦~", mood="angry", status=st)
+            ok, detail = git_pull_and_check()
+            if ok:
+                restart_msg = request_restart(reason="主人指令更新代码", notify_group=group_id)
+                return BotResponse(should_reply=True, text=f"🔄 {detail}\n♻️ {restart_msg}", mood="happy", status=st)
+            return BotResponse(should_reply=True, text=f"📦 {detail}", mood="smug", status=st)
+
+        if cmd in ("/重启", "/restart"):
+            st = pet_engine.get_status()
+            if not is_owner(sender):
+                return BotResponse(should_reply=True, text="🛑 只有主人才可以重启大肥鱼哦~", mood="angry", status=st)
+            restart_msg = request_restart(reason="主人发送 /重启 指令", notify_group=group_id)
+            return BotResponse(should_reply=True, text=f"♻️ 收到！{restart_msg}", mood="happy", status=st)
 
         return None
 

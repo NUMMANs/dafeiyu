@@ -345,4 +345,59 @@ AGENT_TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "self_pull_and_restart",
+            "description": (
+                "从 GitHub origin/main 拉取最新代码，自动校验全部 Python 文件语法（若有新依赖则安装），"
+                "若拉取到新版本且校验通过，则安排进程在约 2 秒后通过看门狗自动重启。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "self_edit_code",
+            "description": (
+                "安全修改大肥鱼自身项目代码（支持精确局部替换或创建新文件），自动执行全量 Python 语法校验，"
+                "语法错误会自动回滚；禁止修改 .env、watchdog.py、self_ops.py 和 .git。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rel_path": {
+                        "type": "string",
+                        "description": "相对项目根目录的文件路径（如 brain.py、persona_runtime.py 或新插件文件路径）",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "要替换的精确原代码片段（若新建文件则传空字符串）",
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "替换后的新代码（或新建文件的完整内容）",
+                    },
+                },
+                "required": ["rel_path", "target", "replacement"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "self_restart",
+            "description": "让大肥鱼优雅保存状态并在约 2 秒后退出，由看门狗进程自动重新拉起（适合改完代码或配置后生效）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "重启原因说明（例如：应用刚修改的性格配置）",
+                    }
+                },
+            },
+        },
+    },
 ]
