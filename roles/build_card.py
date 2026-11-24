@@ -1,7 +1,8 @@
 """
 L0 角色卡合并脚本：
 将只读模板 roles/大肥鱼.人格.md + roles/大肥鱼.操作.md 与运行期进化记录 data/persona_evolutions.json
-原子合并输出至 data/大肥鱼.compiled.md（上限 6000 字），不修改受 Git 跟踪的模板文件。
+原子合并输出至 roles/大肥鱼.md（上限 6000 字），覆盖旧的角色卡快照，
+不修改人格/操作模板文件；运行期进化记录仍存放在 data/persona_evolutions.json。
 """
 import json
 import os
@@ -13,7 +14,7 @@ from config import DATA_DIR
 ROLES_DIR = Path(__file__).resolve().parent
 PERSONA_PATH = ROLES_DIR / "大肥鱼.人格.md"
 OPS_PATH = ROLES_DIR / "大肥鱼.操作.md"
-OUT_PATH = DATA_DIR / "大肥鱼.compiled.md"
+OUT_PATH = ROLES_DIR / "大肥鱼.md"
 EVOLUTIONS_PATH = DATA_DIR / "persona_evolutions.json"
 CHAR_LIMIT = 6000
 EVOLVE_HEADER = "## 我的自我进化记录"
@@ -108,7 +109,7 @@ def evolve_persona(note: str) -> tuple[bool, str]:
     """
     允许大肥鱼在安全边界内「自我升级/改造人格」：
     - 进化记录持久化写入 data/persona_evolutions.json，绝不改写受 Git 跟踪的模板文件
-    - 每天上限 2 条，最多保留最近 15 条，并自动重建 data/大肥鱼.compiled.md
+    - 每天上限 2 条，最多保留最近 15 条，并自动重建 roles/大肥鱼.md
     """
     clean = (note or "").strip().replace("\n", " ")[:120]
     if len(clean) < 4:
