@@ -153,7 +153,7 @@ def submit_dsh_job(
         resolved_sid = f"dfy-{uuid.uuid4().hex[:8]}"
 
     resolved_workdir = _resolve_workdir(workdir)
-    resolved_mode = (mode or settings.DSH_MODE or "workspace-write").strip()
+    resolved_mode = (mode or settings.DSH_MODE or "danger-full-access").strip()
     job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     job_dir = DSH_JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +166,7 @@ def submit_dsh_job(
         "task": clean_task,
         "dsh_bin": dsh_bin,
         "mode": resolved_mode,
+        "approval_policy": settings.DSH_APPROVAL_POLICY,
         "model": settings.DSH_MODEL,
         "workdir": str(resolved_workdir),
         "timeout_sec": settings.DSH_TIMEOUT_SEC,

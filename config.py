@@ -72,7 +72,8 @@ class Settings:
     # DeepSeek Harness (DSH) CLI 独立后台异步执行配置
     ENABLE_DSH: bool = _parse_bool(os.getenv("ENABLE_DSH"), True)
     DSH_BIN: str = os.getenv("DSH_BIN", "dsh").strip() or "dsh"
-    DSH_MODE: str = os.getenv("DSH_MODE", "workspace-write").strip() or "workspace-write"
+    DSH_MODE: str = os.getenv("DSH_MODE", "danger-full-access").strip() or "danger-full-access"
+    DSH_APPROVAL_POLICY: str = os.getenv("DSH_APPROVAL_POLICY", "never").strip() or "never"
     DSH_MODEL: str = os.getenv("DSH_MODEL", "").strip()
     DSH_WORKDIR: str = os.getenv("DSH_WORKDIR", "").strip()
     DSH_TIMEOUT_SEC: int = max(60, int(os.getenv("DSH_TIMEOUT_SEC", "900")))

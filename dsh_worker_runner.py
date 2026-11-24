@@ -68,7 +68,8 @@ def main() -> int:
 
     dsh_bin = str(job.get("dsh_bin") or "dsh")
     session_id = str(job.get("session_id") or "").strip()
-    mode = str(job.get("mode") or "workspace-write").strip()
+    mode = str(job.get("mode") or "danger-full-access").strip()
+    approval_policy = str(job.get("approval_policy") or "never").strip()
     model = str(job.get("model") or "").strip()
     workdir = str(job.get("workdir") or str(job_dir))
     timeout_sec = max(60, int(job.get("timeout_sec") or 900))
@@ -82,7 +83,9 @@ def main() -> int:
     if session_id:
         cmd.extend(["--session-id", session_id])
     if mode:
-        cmd.extend(["--mode", mode])
+        cmd.extend(["--permission-mode", mode])
+    if approval_policy:
+        cmd.extend(["--approval-policy", approval_policy])
     if model:
         cmd.extend(["--model", model])
 
