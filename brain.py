@@ -26,6 +26,7 @@ from agent_tools import (
 )
 from config import settings
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
+from image_fetcher import download_image_url, search_and_download_image
 from memory import memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
@@ -206,6 +207,43 @@ SEARCH_TOOLS = [
                         "description": "重点识别或确认的图片问题/细节（可选）",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_and_send_image",
+            "description": (
+                "按关键词联网搜索并下载一张清晰图片，直接作为图片发到当前群里。"
+                "只要群友让你找图、搜图、下载某角色/人物/风景/猫猫/壁纸/梗图发群里（不限游戏或题材），必须直接调用此工具，不要拒绝。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "精确简洁的搜图关键词（例如：'原神 刻晴 高清壁纸'、'银渐层猫 表情包'）",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_image_from_url",
+            "description": "下载指定 http/https 图片直链并直接作为图片发送到当前微信群。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "以 http:// 或 https:// 开头的图片直链地址",
+                    }
+                },
+                "required": ["url"],
             },
         },
     },
@@ -669,6 +707,20 @@ class DaFeiYuBrain:
                                 re.sub(r"\s+", " ", detail).strip()[:180],
                             )
                             tool_out = f"第 {idx} 张图（由 {target_img['sender']} 发送）：\n{detail}"
+                    elif fn_name == "search_and_send_image":
+                        q = str(args.get("query") or "").strip()
+                        logger.info("🖼️ 联网搜图并发送: %s", q)
+                        fpath, tool_out = search_and_download_image(q)
+                        if fpath and fpath.is_file() and fpath.stat().st_size > 0:
+                            attachment_path = fpath
+                            tool_out = f"{tool_out}。图片已加入待发送附件，请用一两句塔菲简短俏皮口吻告诉群友图给他们找来啦。"
+                    elif fn_name == "download_image_from_url":
+                        u = str(args.get("url") or "").strip()
+                        logger.info("🌐 下载直链图片并发送: %s", u[:80])
+                        fpath, tool_out = download_image_url(u, label="urlimg")
+                        if fpath and fpath.is_file() and fpath.stat().st_size > 0:
+                            attachment_path = fpath
+                            tool_out = f"{tool_out}。图片已加入待发送附件，请直接简短告知群友。"
                     elif fn_name in (
                         "run_shell",
                         "read_local_file",

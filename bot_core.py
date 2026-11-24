@@ -17,6 +17,7 @@ from agent_tools import (
 from brain import brain
 from config import settings
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
+from image_fetcher import download_image_url, search_and_download_image
 from memory import memory_store
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
@@ -324,6 +325,7 @@ class DaFeiYuBotCore:
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
                 f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
+                f"• `/搜图 关键词`（或图片链接）：联网搜图并直接发群里\n"
                 f"• `/dsh 任务` / `/dsh 续 指令` / `/dsh状态`：派发独立后台 DSH 重任务（仅主人）\n"
                 f"• `/确认 码` / `/取消 码` / `/待确认`：审批或取消高危操作的群内二次确认\n"
                 f"• `/更新` / `/重启`：从 GitHub 拉取新代码并重启（仅主人）"
@@ -490,6 +492,32 @@ class DaFeiYuBotCore:
                 )
                 return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
             return BotResponse(should_reply=True, text=f"❌ 派单失败：{payload}", mood="angry", status=st)
+
+        search_img_match = re.match(r"^/(?:搜图|找图|发图)(?:\s*(.*))?$", cmd)
+        if search_img_match:
+            st = pet_engine.get_status()
+            target_q = (search_img_match.group(1) or "").strip()
+            if not target_q:
+                return BotResponse(
+                    should_reply=True,
+                    text="格式：`/搜图 关键词` 或 `/搜图 图片直链`（比如：`/搜图 原神 刻晴`）",
+                    mood="smug",
+                    status=st,
+                )
+            if target_q.startswith(("http://", "https://")):
+                img_path, desc = download_image_url(target_q, label="direct")
+            else:
+                img_path, desc = search_and_download_image(target_q)
+            if img_path is not None and img_path.is_file():
+                return BotResponse(
+                    should_reply=True,
+                    text=f"🖼️ {desc}",
+                    sticker_path=img_path,
+                    sticker_url=sticker_manager.to_web_url(img_path),
+                    mood="happy",
+                    status=st,
+                )
+            return BotResponse(should_reply=True, text=f"😵 {desc}", mood="angry", status=st)
 
         if cmd in ("/待确认", "待确认"):
             st = pet_engine.get_status()
