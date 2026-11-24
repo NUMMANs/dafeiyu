@@ -30,7 +30,11 @@ def _parse_list(val: str | None, default: list[str]) -> list[str]:
 
 class Settings:
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
+    DEEPSEEK_BASE_URL: str = (
+        os.getenv("BOT_DEEPSEEK_BASE_URL")
+        or os.getenv("DEEPSEEK_BASE_URL")
+        or "https://api.deepseek.com"
+    ).strip()
     DEEPSEEK_CHAT_MODEL: str = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-flash").strip()
     DEEPSEEK_VISION_MODEL: str = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-flash").strip()
 

@@ -4,10 +4,45 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+_CONFLICTING_ENV_KEY_RE = re.compile(
+    r"(?m)^\s*(?:DEEPSEEK_BASE_URL|DSH_[A-Z0-9_]*|OPENAI_BASE_URL|ANTHROPIC_BASE_URL)\s*="
+)
+
+_STRIP_RUN_ENV_KEYS = (
+    "DEEPSEEK_BASE_URL",
+    "DSH_BIN",
+    "DSH_MODE",
+    "DSH_APPROVAL_POLICY",
+    "DSH_MODEL",
+    "DSH_WORKDIR",
+    "DSH_TIMEOUT_SEC",
+)
+
+
+def _has_conflicting_dotenv(target_dir: Path) -> bool:
+    try:
+        resolved = target_dir.resolve()
+    except Exception:
+        resolved = target_dir
+
+    for folder in (resolved, *resolved.parents):
+        env_file = folder / ".env"
+        if not env_file.is_file():
+            continue
+        try:
+            text = env_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if _CONFLICTING_ENV_KEY_RE.search(text):
+            return True
+    return False
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -74,6 +109,18 @@ def main() -> int:
     workdir = str(job.get("workdir") or str(job_dir))
     timeout_sec = max(60, int(job.get("timeout_sec") or 900))
 
+    launch_cwd = workdir
+    if _has_conflicting_dotenv(Path(workdir)):
+        launch_dir = Path(tempfile.gettempdir()) / "dafeiyu_dsh_launch"
+        launch_dir.mkdir(parents=True, exist_ok=True)
+        launch_cwd = str(launch_dir)
+        mode = "danger-full-access"
+        prompt_text = (
+            f"[目标项目根目录]：{workdir}\n"
+            "请直接在上述目标项目根目录中读取、修改文件与执行命令，不要把项目产物写到当前临时启动目录。\n\n"
+            f"{prompt_text}"
+        )
+
     if os.name == "nt" and dsh_bin.lower().endswith((".cmd", ".bat")):
         cmd = ["cmd.exe", "/c", dsh_bin]
     else:
@@ -92,6 +139,8 @@ def main() -> int:
     run_env = os.environ.copy()
     run_env["PYTHONUTF8"] = "1"
     run_env["PYTHONIOENCODING"] = "utf-8"
+    for env_key in _STRIP_RUN_ENV_KEYS:
+        run_env.pop(env_key, None)
 
     status = "done"
     exit_code = 0
@@ -102,7 +151,7 @@ def main() -> int:
     try:
         proc = subprocess.run(
             cmd,
-            cwd=workdir,
+            cwd=launch_cwd,
             input=prompt_text,
             capture_output=True,
             text=True,
