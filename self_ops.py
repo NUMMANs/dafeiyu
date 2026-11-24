@@ -163,6 +163,16 @@ def git_pull_and_check(auto_pip: bool = True) -> tuple[bool, str]:
     if code_remote == 0 and before_commit and before_commit == remote_head:
         return False, f"当前已经是最新提交 ({before_commit[:7]})，无需重启"
 
+    stash_note = ""
+    _, dirty_out, _ = _run_git(["status", "--porcelain", "--untracked-files=no"], timeout=10)
+    if dirty_out.strip():
+        stash_msg = f"auto-before-pull-{time.strftime('%Y%m%d_%H%M%S')}"
+        code_stash, _, stash_err = _run_git(["stash", "push", "-m", stash_msg], timeout=15)
+        if code_stash == 0:
+            stash_note = f"（已自动暂存本地修改: {stash_msg}）"
+        else:
+            logger.warning("拉取前自动 stash 失败: %s", stash_err)
+
     code_pull, pull_out, pull_err = _run_git(["pull", "--ff-only", "origin", "main"], timeout=45)
     if code_pull != 0:
         return False, (
@@ -212,7 +222,7 @@ def git_pull_and_check(auto_pip: bool = True) -> tuple[bool, str]:
         state["failed_commit"] = ""
         save_watchdog_state(state)
 
-    return True, f"已更新至 {commit_msg or after_commit[:7]}{pip_note}；{compile_msg}"
+    return True, f"已更新至 {commit_msg or after_commit[:7]}{pip_note}{stash_note}；{compile_msg}"
 
 
 def _resolve_editable_path(rel_path: str) -> tuple[Path | None, str, str]:
