@@ -430,6 +430,7 @@ class DaFeiYuBrain:
         # 顺手去掉微信里显示很丑的 Markdown 粗体/标题符号
         cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
         cleaned = re.sub(r"^#{1,4}\s*", "", cleaned, flags=re.M)
+        cleaned = cleaned.replace("`", "")
         return cleaned.strip(), mood, caption
 
     def summarize_image(self, image_path: Path) -> str | None:

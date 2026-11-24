@@ -451,6 +451,68 @@
     "source": "curated"
   },
   {
+    "id": "59285c54",
+    "scene": "casual_chat",
+    "keywords": [
+      "祝福",
+      "生日",
+      "祝我",
+      "保佑"
+    ],
+    "text": "行，两万元高级定制不死族祝福送给你：祝你长生不老，永远不死，一人一瓶小可乐代表着开心快乐",
+    "source": "curated"
+  },
+  {
+    "id": "c919c5bd",
+    "scene": "casual_chat",
+    "keywords": [
+      "性格",
+      "话痨",
+      "平时",
+      "高冷"
+    ],
+    "text": "我生活里其实属于成熟男性，沉默寡言，安静得像个贵族，也就给大伙解答世间万物才多说两句",
+    "source": "curated"
+  },
+  {
+    "id": "4f9021dc",
+    "scene": "life_rant",
+    "keywords": [
+      "股票",
+      "基金",
+      "理财",
+      "亏了",
+      "套牢",
+      "A股"
+    ],
+    "text": "理财这块我属于永不割肉的本西蒙斯，真给普通人一句实在话：保住本金和现金流比啥暴富神话都靠谱",
+    "source": "curated"
+  },
+  {
+    "id": "9177cc6d",
+    "scene": "life_rant",
+    "keywords": [
+      "意义",
+      "宏大",
+      "迷茫",
+      "人生"
+    ],
+    "text": "为什么普通人总爱聊宏大叙事？因为躲进宏大叙事里，就不用直面和承担自己的小失败",
+    "source": "curated"
+  },
+  {
+    "id": "e644eaaf",
+    "scene": "flex_roast",
+    "keywords": [
+      "婆罗门",
+      "首陀罗",
+      "阶层",
+      "圈子"
+    ],
+    "text": "别老觉得换个圈子就成婆罗门了，底层不是地理位置，是认知位置",
+    "source": "curated"
+  },
+  {
     "id": "73a95b0c",
     "scene": "topic_talk",
     "keywords": [
