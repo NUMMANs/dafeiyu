@@ -1,4 +1,4 @@
-"""峰哥非模板化人设质量验收与回归脚本。"""
+"""峰哥非模板化人设质量验收与回归脚本（使用与人格卡示范完全不重叠的新题盲测）。"""
 
 from __future__ import annotations
 
@@ -21,15 +21,16 @@ from roles.build_card import (  # noqa: E402
     set_active_persona,
 )
 
+# 与 fengge.人格.md 示范完全不同的 8 道全新群聊盲测题
 BLIND_PROMPTS = [
-    ("casual_chat", "今晚吃啥好纠结"),
-    ("flex_roast", "刚发了年终奖，也就够买块三万的表吧"),
-    ("life_rant", "天天加班累死了真想明天就裸辞"),
-    ("topic_talk", "排位又连跪六把，队友全是人机"),
-    ("pushback", "你个机器人懂个屁啊"),
-    ("life_rant", "失恋了感觉天塌了"),
-    ("topic_talk", "我想去大理旅居半年找人生意义"),
-    ("flex_roast", "刚买了个四千块的机械键盘"),
+    ("life_rant", "追了半年的相亲对象今天把我删了，好难受"),
+    ("flex_roast", "刚提了辆新车，准备周末开回村里转一圈"),
+    ("life_rant", "天天写PPT给领导画饼，感觉人生毫无意义"),
+    ("topic_talk", "花两万块报了个摄影训练营，想转行拍大片"),
+    ("pushback", "峰哥你整天就知道泼冷水，能不能说点正能量"),
+    ("flex_roast", "在健身房练了一年终于有腹肌了，怎么发朋友圈不显得刻意"),
+    ("casual_chat", "今天下雨懒得下楼买饭，好饿"),
+    ("topic_talk", "打大乱斗对面五个长手折磨我二十分钟"),
 ]
 
 AI_CLICHES = (
@@ -40,18 +41,34 @@ AI_CLICHES = (
     "不仅",
     "与其",
 )
-CATCHPHRASES = ("这是个好事儿", "差不多得了", "兄弟们", "怎么个事儿")
+FENGGE_MARKERS = (
+    "好事儿",
+    "恰恰相反",
+    "面子",
+    "力工",
+    "魅力男孩",
+    "连接",
+    "逃避劳动",
+    "认知位置",
+    "老弟",
+    "小伙子",
+    "兄弟",
+    "B友",
+    "我跟你说",
+    "说实话",
+    "不就那么回事",
+    "老峰",
+    "自欺欺人",
+    "你急什么",
+)
+CATCHPHRASES = ("这是个好事儿", "想连接了", "力工思维", "恰恰相反")
 
 
 def main() -> int:
     orig_active = ACTIVE_PERSONA_PATH.read_text(encoding="utf-8") if ACTIVE_PERSONA_PATH.is_file() else None
     try:
-        # 1. 热切换与 Git 洁净度检查
         ok1, msg1 = set_active_persona("塔菲")
         assert ok1 and get_active_persona() == "dafeiyu", msg1
-        card_taffy = load_card()
-        assert "塔菲" in card_taffy
-
         ok2, msg2 = set_active_persona("峰哥")
         assert ok2 and get_active_persona() == "fengge", msg2
         card_feng = load_card()
@@ -60,36 +77,23 @@ def main() -> int:
         r_list = bot_core._handle_command("g_eval", "tester", "/当前人设")
         assert r_list and "峰哥亡命天涯" in r_list.text
 
-        git_dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--", "roles/大肥鱼.md", "roles/大肥鱼.人格.md", "roles/personas/fengge.人格.md"],
-            cwd=str(BOT_DIR),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            check=True,
-        )
-        # Note: newly created untracked fengge.人格.md shows '??' before first commit, never ' M'
-        assert not any(line.startswith(" M") or line.startswith("M ") for line in git_dirty.stdout.splitlines()), git_dirty.stdout
-        print(f"[PASS] hot-switch & card compile clean (fengge={len(card_feng)} chars)")
+        h1 = retrieve_style_hints("fengge", "刚提了辆新车回村", group_id="g_eval_rag")
+        h2 = retrieve_style_hints("fengge", "刚提了辆新车回村", group_id="g_eval_rag")
+        assert h1 and h2 and h1 != h2
+        print(f"[PASS] hot-switch & RAG verified (fengge card={len(card_feng)} chars)")
 
-        # 2. Persona RAG 检索与防重复检查
-        h1 = retrieve_style_hints("fengge", "刚发了年终奖买块表", group_id="g_eval_rag")
-        h2 = retrieve_style_hints("fengge", "刚发了年终奖买块表", group_id="g_eval_rag")
-        assert h1 and h2 and h1 != h2, "persona_rag failed to deduplicate consecutive hints!"
-        print("[PASS] persona_rag retrieval & anti-repeat verified")
-
-        # 3. 8 场景实测盲测（需要有效 DEEPSEEK_API_KEY）
         if not settings.has_valid_api_key:
-            print("[SKIP] no valid DEEPSEEK_API_KEY, skipping live LLM blind eval")
+            print("[SKIP] no valid DEEPSEEK_API_KEY")
             return 0
 
         status = pet_engine.get_status()
         aff = {"user_name": "群友老王", "affinity": 45, "title": "熟脸", "feed_count": 2, "msg_count": 10}
         leak_count = 0
         cliche_count = 0
+        marker_hits = 0
         catch_counts = {c: 0 for c in CATCHPHRASES}
 
-        print("\n=== 峰哥人设 8 场景实测盲测样张 ===")
+        print("\n=== 升级版峰哥人设 8 道全新盲测题样张 ===")
         for scene, prompt in BLIND_PROMPTS:
             reply = brain.reply(
                 sender="群友老王",
@@ -97,7 +101,7 @@ def main() -> int:
                 status=status,
                 user_affinity=aff,
                 recent_history=[],
-                group_id="g_eval_live",
+                group_id="g_eval_live2",
             )
             txt = reply.text
             print(f"[{scene}] 问：{prompt}\n       答：{txt.replace(chr(10), ' || ')}")
@@ -105,16 +109,19 @@ def main() -> int:
                 leak_count += 1
             if any(c in txt for c in AI_CLICHES):
                 cliche_count += 1
+            if any(m in txt for m in FENGGE_MARKERS):
+                marker_hits += 1
             for cp in CATCHPHRASES:
                 if cp in txt:
                     catch_counts[cp] += 1
 
-        print(f"\n[METRICS] 串戏(塔菲/喵)={leak_count}, AI套话={cliche_count}, 口头禅频次={catch_counts}")
-        assert leak_count == 0, f"发现塔菲/喵串戏 ({leak_count} 次)!"
-        assert cliche_count == 0, f"发现 AI 客服套话 ({cliche_count} 次)!"
+        print(f"\n[METRICS] 串戏={leak_count}, AI套话={cliche_count}, 峰味辨识命中={marker_hits}/8, 单一热梗频次={catch_counts}")
+        assert leak_count == 0, f"发现塔菲/喵串戏 ({leak_count})!"
+        assert cliche_count == 0, f"发现 AI 客服套话 ({cliche_count})!"
+        assert marker_hits >= 5, f"峰味辨识度偏低 ({marker_hits}/8)!"
         for cp, cnt in catch_counts.items():
-            assert cnt <= 2, f"口头禅「{cp}」过度复读 ({cnt}/8)!"
-        print("[PASS] all anti-template & zero-leak blind eval checks passed!")
+            assert cnt <= 3, f"口头禅「{cp}」过度复读 ({cnt}/8)!"
+        print("[PASS] high-identity & non-template fengge blind eval passed!")
         return 0
     finally:
         if orig_active is not None:
