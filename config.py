@@ -78,6 +78,10 @@ class Settings:
     DSH_WORKDIR: str = os.getenv("DSH_WORKDIR", "").strip()
     DSH_TIMEOUT_SEC: int = max(60, int(os.getenv("DSH_TIMEOUT_SEC", "900")))
 
+    # 高危操作群内二次确认保险
+    ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)
+    DANGER_CONFIRM_TTL_SEC: int = max(30, int(os.getenv("DANGER_CONFIRM_TTL_SEC", "180")))
+
     RUN_MODE: str = os.getenv("RUN_MODE", "web").strip().lower()
     WX_GROUP_WHITELIST: list[str] = _parse_list(
         os.getenv("WX_GROUP_WHITELIST"), ["大肥鱼测试群"]

@@ -1,10 +1,18 @@
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from agent_tools import is_owner
+from agent_tools import (
+    is_owner,
+    open_url_or_app,
+    read_local_file,
+    run_shell,
+    send_existing_file,
+    write_local_file,
+)
 from brain import brain
 from config import settings
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
@@ -12,8 +20,15 @@ from memory import memory_store
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
 from roles.build_card import get_evolutions
+from safety_guard import (
+    assess_danger,
+    cancel_pending_action,
+    list_pending_actions,
+    pop_pending_action,
+    stage_pending_action,
+)
 from scheduler import scheduler
-from self_ops import git_pull_and_check, request_restart
+from self_ops import git_pull_and_check, request_restart, self_edit_code
 from sticker_manager import sticker_manager
 
 
@@ -63,6 +78,61 @@ class BotResponse:
         if self.bubbles:
             return self.bubbles
         return [self.text] if self.text else []
+
+
+def _execute_confirmed_action(group_id: str, sender: str, item: dict) -> tuple[str, Path | None]:
+    action_type = str(item.get("action_type") or "")
+    params = item.get("params") if isinstance(item.get("params"), dict) else {}
+    code = str(item.get("code") or "")
+
+    if action_type == "delegate_to_dsh":
+        ok, payload = submit_dsh_job(
+            group_id=group_id,
+            sender=sender,
+            task=str(params.get("task") or ""),
+            session_id=str(params.get("session_id") or ""),
+            workdir=str(params.get("workdir") or ""),
+        )
+        if ok and isinstance(payload, dict):
+            return (
+                f"✅ 二次确认通过（`{code}`），已交给独立 DSH 后台开工！\n"
+                f"• 任务号：`{payload['job_id']}`\n"
+                f"• 会话ID：`{payload['session_id']}`\n"
+                f"做完会自动发回群里。",
+                None,
+            )
+        return f"❌ 确认后派单失败（`{code}`）：{payload}", None
+
+    if action_type == "run_shell":
+        out = run_shell(str(params.get("command") or ""))
+        return f"✅ 已确认执行命令（`{code}`）：\n{out}", None
+
+    if action_type == "write_local_file":
+        out = write_local_file(str(params.get("path") or ""), str(params.get("content") or ""))
+        return f"✅ 已确认写入文件（`{code}`）：\n{out}", None
+
+    if action_type == "read_local_file":
+        out = read_local_file(str(params.get("path") or ""))
+        return f"✅ 已确认读取文件（`{code}`）：\n{out}", None
+
+    if action_type == "send_existing_file":
+        fpath, out = send_existing_file(str(params.get("path") or ""))
+        valid_path = fpath if (fpath and fpath.is_file() and fpath.stat().st_size > 0) else None
+        return f"✅ 已确认发送文件（`{code}`）：{out}", valid_path
+
+    if action_type == "open_url_or_app":
+        out = open_url_or_app(str(params.get("target") or ""))
+        return f"✅ 已确认打开目标（`{code}`）：{out}", None
+
+    if action_type == "self_edit_code":
+        out = self_edit_code(
+            str(params.get("rel_path") or ""),
+            str(params.get("target") or ""),
+            str(params.get("replacement") or ""),
+        )
+        return f"✅ 已确认修改源码（`{code}`）：\n{out}", None
+
+    return f"⚠️ 未知的待确认操作类型：{action_type}", None
 
 
 class DaFeiYuBotCore:
@@ -254,6 +324,7 @@ class DaFeiYuBotCore:
                 f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
                 f"• `/dsh 任务` / `/dsh 续 指令` / `/dsh状态`：派发独立后台 DSH 重任务（仅主人）\n"
+                f"• `/确认 码` / `/取消 码` / `/待确认`：审批或取消高危操作的群内二次确认\n"
                 f"• `/更新` / `/重启`：从 GitHub 拉取新代码并重启（仅主人）"
             )
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
@@ -396,6 +467,18 @@ class DaFeiYuBotCore:
                 task_text = body[1:].strip()
                 if not task_text:
                     return BotResponse(should_reply=True, text="请在 `/dsh 续 ` 后面写明要追加的任务要求喵~", mood="smug", status=st)
+            dsh_params = {"task": task_text, "session_id": sid}
+            is_danger, reasons = assess_danger("delegate_to_dsh", dsh_params, user_text=task_text)
+            if is_danger:
+                _, confirm_card = stage_pending_action(
+                    group_id=group_id,
+                    sender=sender,
+                    action_type="delegate_to_dsh",
+                    params=dsh_params,
+                    reasons=reasons,
+                    preview=task_text,
+                )
+                return BotResponse(should_reply=True, text=confirm_card, mood="shocked", status=st)
             ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task_text, session_id=sid)
             if ok and isinstance(payload, dict):
                 reply_text = (
@@ -406,6 +489,55 @@ class DaFeiYuBotCore:
                 )
                 return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
             return BotResponse(should_reply=True, text=f"❌ 派单失败：{payload}", mood="angry", status=st)
+
+        if cmd in ("/待确认", "待确认"):
+            st = pet_engine.get_status()
+            items = list_pending_actions(group_id)
+            if not items:
+                return BotResponse(should_reply=True, text="🛡️ 当前群里没有待确认的高危操作", mood="happy", status=st)
+            now_ts = time.time()
+            lines = ["⚠️ 【本群待二次确认操作】"]
+            for it in items:
+                ttl_left = max(0, int(float(it.get("expires_at") or now_ts) - now_ts))
+                lines.append(
+                    f"• 码 `{it.get('code')}`｜发起人：{it.get('sender')}｜剩 {ttl_left}s｜{str(it.get('preview') or '')[:45]}"
+                )
+            lines.append("回复 `/确认 码` 执行，或 `/取消 码` 放弃。")
+            return BotResponse(should_reply=True, text="\n".join(lines), mood="smug", status=st)
+
+        confirm_match = re.match(r"^(?:/确认执行|确认执行|/确认)\s*(.*)$", cmd)
+        if confirm_match:
+            st = pet_engine.get_status()
+            if not is_owner(sender):
+                return BotResponse(should_reply=True, text="🛑 只有主人才可以确认执行高危操作哦~", mood="angry", status=st)
+            code_arg = confirm_match.group(1).strip()
+            item, pop_msg = pop_pending_action(group_id, code_arg)
+            if item is None:
+                return BotResponse(should_reply=True, text=pop_msg, mood="smug", status=st)
+            result_text, attach_path = _execute_confirmed_action(group_id, sender, item)
+            return BotResponse(
+                should_reply=True,
+                text=result_text,
+                sticker_path=attach_path,
+                mood="happy",
+                status=st,
+            )
+
+        if cmd in ("/取消", "/拒绝") or cmd.startswith(("/取消 ", "/拒绝 ")):
+            st = pet_engine.get_status()
+            code_arg = cmd.split(maxsplit=1)[1].strip() if " " in cmd else ""
+            ok_cancel, cancel_msg = cancel_pending_action(
+                group_id,
+                code_arg,
+                requester=sender,
+                is_requester_owner=is_owner(sender),
+            )
+            return BotResponse(
+                should_reply=True,
+                text=cancel_msg,
+                mood="happy" if ok_cancel else "smug",
+                status=st,
+            )
 
         return None
 

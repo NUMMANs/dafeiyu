@@ -30,6 +30,7 @@ from memory import memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus
 from roles.build_card import evolve_persona, load_card
+from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
 from web_search import web_search
@@ -592,8 +593,42 @@ class DaFeiYuBrain:
                         "delegate_to_dsh",
                         "check_dsh_jobs",
                     ):
+                        is_danger = False
+                        danger_reasons: list[str] = []
+                        if is_owner(sender) and fn_name in (
+                            "run_shell",
+                            "read_local_file",
+                            "write_local_file",
+                            "open_url_or_app",
+                            "send_existing_file",
+                            "self_edit_code",
+                            "delegate_to_dsh",
+                        ):
+                            is_danger, danger_reasons = assess_danger(
+                                fn_name,
+                                args if isinstance(args, dict) else {},
+                                user_text=text,
+                            )
+
                         if not is_owner(sender):
                             tool_out = "权限不足：当前发言人不在 OWNER_NAMES 主人白名单内，拒绝操纵电脑"
+                        elif is_danger:
+                            logger.warning("🛡️ 高危操作 [%s] 已拦截并生成二次确认码: %s", fn_name, danger_reasons)
+                            _, confirm_card = stage_pending_action(
+                                group_id=group_id,
+                                sender=sender,
+                                action_type=fn_name,
+                                params=args if isinstance(args, dict) else {},
+                                reasons=danger_reasons,
+                            )
+                            return BrainReply(
+                                text=confirm_card,
+                                bubbles=[confirm_card],
+                                mood="shocked",
+                                tokens_used=total_tokens,
+                                used_vision=used_vision,
+                                used_search=used_search,
+                            )
                         elif fn_name == "run_shell":
                             logger.info("💻 Agent 执行命令: %s", str(args.get("command", ""))[:80])
                             tool_out = run_shell(str(args.get("command") or ""))
