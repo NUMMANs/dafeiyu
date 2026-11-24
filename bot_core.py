@@ -158,6 +158,12 @@ class DaFeiYuBotCore:
         self._last_evening_bubble_date: dict[str, str] = {}
         self._last_nightly_date: str = ""
 
+    def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
+        """峰哥人设不发表情包（仅保留搜图/截屏/文件等功能性附件），塔菲人设正常发表情包。"""
+        if get_active_persona() == "fengge":
+            return None
+        return sticker_manager.pick_sticker(mood, caption=caption)
+
     def is_quiet_hours(self) -> bool:
         """23:00 ~ 次日 08:00 默认静默睡觉，绝不半夜扰民"""
         hour = datetime.now().hour
@@ -222,7 +228,7 @@ class DaFeiYuBotCore:
                 f"累计吃白饭：{st.total_tokens} Tokens｜锐评图片：{st.total_images} 张\n"
                 f"你（{sender}）的关系：{aff['title']}（好感度 {aff['affinity']}/100）"
             )
-            sticker = sticker_manager.pick_sticker(st.mood_tag)
+            sticker = self._maybe_pick_sticker(st.mood_tag)
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -248,7 +254,7 @@ class DaFeiYuBotCore:
                 f"饱食度 → {st.hunger}/100｜心情 → {st.mood}/100｜"
                 f"对 {sender} 的好感度涨到 {aff['affinity']}（{aff['title']}）啦喵！"
             )
-            sticker = sticker_manager.pick_sticker("happy")
+            sticker = self._maybe_pick_sticker("happy")
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -282,7 +288,7 @@ class DaFeiYuBotCore:
                 )
                 reply_text = f"杂鱼 {sender} 别光动手动脚不给饭吃喵！快发 `/投喂` 进贡白饭！"
                 mood = "hungry"
-            sticker = sticker_manager.pick_sticker(mood)
+            sticker = self._maybe_pick_sticker(mood)
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -305,7 +311,7 @@ class DaFeiYuBotCore:
                         f"{medals[idx]} {item['user_name']} — 好感 {item['affinity']}（{item['title']}｜投喂 {item['feed_count']} 次）"
                     )
                 reply_text = "\n".join(lines)
-            sticker = sticker_manager.pick_sticker("happy")
+            sticker = self._maybe_pick_sticker("happy")
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -808,7 +814,7 @@ class DaFeiYuBotCore:
         if brain_reply.attachment_path and brain_reply.attachment_path.is_file():
             sticker_path = brain_reply.attachment_path
         elif random.random() < settings.STICKER_REPLY_PROB:
-            sticker_path = sticker_manager.pick_sticker(
+            sticker_path = self._maybe_pick_sticker(
                 brain_reply.mood,
                 caption=brain_reply.sticker_caption or None,
             )
@@ -864,7 +870,7 @@ class DaFeiYuBotCore:
             exp_delta=5,
             affinity_delta=0,
         )
-        sticker_path = sticker_manager.pick_sticker(chime.mood) if random.random() < 0.6 else None
+        sticker_path = self._maybe_pick_sticker(chime.mood) if random.random() < 0.6 else None
         sticker_url = sticker_manager.to_web_url(sticker_path)
         pet_engine.append_history(
             group_id=group_id,
@@ -916,7 +922,7 @@ class DaFeiYuBotCore:
             if (now - last_hungry) >= 3 * 3600:
                 self._last_hungry_bubble_ts[group_id] = now
                 bubble = brain.generate_autonomous_bubble("hungry", status)
-                sticker = sticker_manager.pick_sticker("hungry")
+                sticker = self._maybe_pick_sticker("hungry")
                 sticker_url = sticker_manager.to_web_url(sticker)
                 pet_engine.append_history(
                     group_id=group_id,
@@ -942,7 +948,7 @@ class DaFeiYuBotCore:
             if (now - last_act) >= 5400:
                 self._last_evening_bubble_date[group_id] = today
                 bubble = brain.generate_autonomous_bubble("evening", status)
-                sticker = sticker_manager.pick_sticker(bubble.mood)
+                sticker = self._maybe_pick_sticker(bubble.mood)
                 sticker_url = sticker_manager.to_web_url(sticker)
                 pet_engine.append_history(
                     group_id=group_id,
@@ -978,7 +984,7 @@ class DaFeiYuBotCore:
             )
 
         msg = f"⏰ 定时提醒（{creator} 设的）：{content}"
-        sticker = sticker_manager.pick_sticker("happy", caption="到点啦喵")
+        sticker = self._maybe_pick_sticker("happy", caption="到点啦喵")
         pet_engine.append_history(
             group_id=group_id,
             sender=settings.BOT_NAME,
