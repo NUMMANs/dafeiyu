@@ -94,6 +94,19 @@ class BotResponse:
         return [self.text] if self.text else []
 
 
+# 派活成功后先回一句占位（纯模板，不走模型、不写 L3）。
+# 为什么用模板：这句话的作用只是告诉群里「收到了、在弄」，用模型反而多一次往返，
+# 还容易跟人设语气跑偏；而且它不该进历史，否则以后每轮 L3 全量注入都会带上
+# 「我答应了某件事」，模型会以为自己一直在等。
+DISPATCH_ACKS = (
+    "行，我瞅一眼，弄好了说",
+    "等着，我看下这事儿",
+    "稍等，我去翻一下",
+    "我看看，别催",
+    "行，这就去弄，一会儿给你结果",
+)
+
+
 def _execute_confirmed_action(group_id: str, sender: str, item: dict) -> tuple[str, Path | None]:
     action_type = str(item.get("action_type") or "")
     params = item.get("params") if isinstance(item.get("params"), dict) else {}
@@ -179,6 +192,8 @@ class DaFeiYuBotCore:
         self._last_metrics_date: str = ""
         # L3 会话层占用检查：每群每天 0 点后查一次
         self._last_l3_check_day: dict[str, str] = {}
+        # 工具路由：正在后台跑 DSH 任务的群（群号 → {job_id, task, sender, since, deadline}）
+        self._dsh_running: dict[str, dict] = {}
 
     def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
         """峰哥人设不发表情包（仅保留搜图/截屏/文件等功能性附件），塔菲人设正常发表情包。"""
@@ -1312,6 +1327,89 @@ class DaFeiYuBotCore:
             image_path=image_path,
         )
 
+    # ------------------------------------------------------------------
+    # 工具路由：小模型判「要不要派活」→ DSH 后台干活 → 群里先回一句模板占位
+    # ------------------------------------------------------------------
+
+    def _dsh_busy(self, group_id: str) -> dict | None:
+        """本群是否有 DSH 任务还在后台跑；任务结束或超时后自动清理记录。"""
+        info = self._dsh_running.get(group_id)
+        if not info:
+            return None
+        if time.time() > float(info.get("deadline") or 0.0):
+            self._dsh_running.pop(group_id, None)
+            return None
+        try:
+            jobs = list_dsh_jobs(group_id=group_id, limit=6)
+        except Exception:
+            return info
+        job_id = str(info.get("job_id") or "")
+        cur = next((j for j in jobs if str(j.get("job_id") or "") == job_id), None)
+        if cur is None or str(cur.get("status")) in ("done", "timeout", "error"):
+            self._dsh_running.pop(group_id, None)
+            return None
+        info["elapsed"] = int(time.time() - float(info.get("since") or time.time()))
+        return info
+
+    def _bg_note(self, group_id: str) -> str:
+        """大肥鱼回复时告诉她「后台还有活在跑」，避免她重复派活或假装已经做完。"""
+        info = self._dsh_busy(group_id)
+        if not info:
+            return ""
+        task = str(info.get("task") or "")[:60]
+        return (
+            f"【后台工作中】你刚把「{task}」派给执行助手了，现在还在后台跑"
+            f"（已 {int(info.get('elapsed') or 0)} 秒）。\n"
+            "别重复派活，也别说“我这就去做”；有人问进度就照实说还在弄，问别的正常聊。"
+        )
+
+    def _route_tool_task(self, group_id: str, sender: str, text: str) -> str:
+        """
+        让轻量判定器决定这句话要不要派活，需要就异步交给 DSH，返回任务描述。
+
+        三道前置条件先挡掉绝大多数无用调用：
+        1. 关掉工具路由 / 没有 API Key / 文字太短 → 不判；
+        2. DSH 不可用 → 不判（此时大肥鱼自己挂着电脑工具，走老路）；
+        3. 本群已有任务在跑 → 不判（避免派一堆重复任务，等上一轮出结果）。
+        返回空字符串表示「不派活」，调用方继续走普通聊天。
+        """
+        if not settings.ENABLE_TOOL_ROUTER:
+            return ""
+        body = (text or "").strip()
+        if len(body) < settings.TOOL_ROUTER_MIN_CHARS:
+            return ""
+        ok_dsh, _detail = is_dsh_available()
+        if not ok_dsh:
+            return ""
+        if self._dsh_busy(group_id):
+            logger.info("[%s] 后台已有任务在跑，这句不再派活", group_id)
+            return ""
+
+        recent = pet_engine.get_recent_history(group_id, limit=6)
+        try:
+            decision = brain.judge_tool_need(sender, body, recent)
+        except Exception as exc:
+            logger.warning("[%s] 工具路由判定异常: %s", group_id, exc)
+            return ""
+        if not decision.get("need"):
+            return ""
+
+        task = str(decision.get("task") or "")[:400]
+        ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task)
+        if not ok:
+            logger.warning("[%s] 派活给 DSH 失败: %s", group_id, payload)
+            return ""
+        job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
+        self._dsh_running[group_id] = {
+            "job_id": job_id,
+            "task": task,
+            "sender": sender,
+            "since": time.time(),
+            "deadline": time.time() + settings.DSH_TIMEOUT_SEC + 60,
+        }
+        logger.info("🧰 已派活给执行助手 [%s] job=%s 任务=%s", group_id, job_id, task[:80])
+        return task
+
     def _compose_reply(
         self,
         group_id: str,
@@ -1330,6 +1428,20 @@ class DaFeiYuBotCore:
         被 handle_message（@唤醒/追认/吐槽）和 pop_due_triggers（停顿后判定）共用，
         保证两条入口的统计、表情包、历史落库行为完全一致。
         """
+        # 0. 工具路由：先让轻量判定器看这句是不是在指挥我干活。
+        #    要派活就先回一句模板占位（不进 L3），真正的活在 DSH 后台跑，结果由巡检投递回来。
+        #    吐槽任务和看图不走这条路：吐槽是纯嘴活，看图当场就能办。
+        if not roast_angle and image_path is None:
+            routed_task = self._route_tool_task(group_id, sender, text)
+            if routed_task:
+                ack = random.choice(DISPATCH_ACKS)
+                logger.info(
+                    "[%s] 🧰 已派活，回占位（不写 L3）：%s｜任务=%s", group_id, ack, routed_task[:60]
+                )
+                return BotResponse(
+                    should_reply=True, text=ack, mood="happy", status=pet_engine.get_status()
+                )
+
         # 一旦被正式触发，适当消耗社交电量并重置计数
         self._unanswered_count[group_id] = 0
         heartflow.drain(group_id, amount=25.0)
@@ -1370,6 +1482,8 @@ class DaFeiYuBotCore:
             group_id=group_id,
             image_sender=image_sender,
             roast_hint=roast_angle,
+            # 后台还有活在跑时，告诉她一声，免得重复派活或假装做完了
+            bg_note=self._bg_note(group_id),
         )
 
         # 将识别到的图片内容摘要回写进历史，后续聊天不会失忆

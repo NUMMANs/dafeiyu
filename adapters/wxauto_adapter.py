@@ -575,6 +575,20 @@ class WxAutoAdapter:
                             if not self._safe_send(wx, msg_text, target_group, "DSH 任务投递"):
                                 continue
                             logger.info("🤖 已投递 DSH 任务 #%s 结果到 [%s]", done_job.get("job_id"), target_group)
+                            # 结果投递不经过大脑，得手动补一条 L3：否则大肥鱼下次完全不知道自己干过这件事，
+                            # 群友追问「弄好了吗」她只能装傻。
+                            try:
+                                pet_engine.append_history(
+                                    group_id=target_group,
+                                    sender=settings.BOT_NAME,
+                                    role="assistant",
+                                    content=(
+                                        "[后台任务结果] "
+                                        + str(done_job.get("summary") or msg_text)
+                                    )[:600],
+                                )
+                            except Exception as hist_exc:
+                                logger.warning("DSH 结果写入 L3 失败: %s", hist_exc)
                             if (
                                 attach_path is not None
                                 and attach_path.is_file()

@@ -25,6 +25,7 @@ from agent_tools import (
     write_local_file,
 )
 from config import settings
+from dsh_bridge import is_dsh_available
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
 from memory import estimate_tokens, memory_store
@@ -384,14 +385,17 @@ def _build_turn_context(
     matched_slang: str = "",
     emotion_desc: str = "",
     diary_note: str = "",
+    bg_note: str = "",
 ) -> str:
-    """本轮动态上下文（时间/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
+    """本轮动态上下文（时间/后台任务/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # 【实时状态】块已按需求移除（饱食度/段位/好感度不再注入）。
     # 【本轮真实原声语感参考】（persona_rag 场景召回）也已移除：
     # 它只按场景类别匹配、不看语义，经常给打游戏的对话塞「出门买罪受」这种无关原话，
     # 反而让模型把无关名词带进回复。语料文件保留，随时可以重新接回来。
     extra_blocks = []
+    if bg_note:
+        extra_blocks.append(bg_note)
     if recalled_memory:
         extra_blocks.append(recalled_memory)
     if diary_note:
@@ -635,6 +639,7 @@ class DaFeiYuBrain:
         group_id: str = "",
         image_sender: str = "",
         roast_hint: str = "",
+        bg_note: str = "",
     ) -> BrainReply:
         if not settings.has_valid_api_key:
             if image_path is not None:
@@ -664,6 +669,7 @@ class DaFeiYuBrain:
             matched_slang=matched_slang,
             emotion_desc=emotion_desc,
             diary_note=diary_note,
+            bg_note=bg_note,
         )
         # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效
         messages: list[dict] = [
@@ -807,7 +813,11 @@ class DaFeiYuBrain:
                 t for t in SEARCH_TOOLS if t["function"]["name"] != "web_search"
             ]
             if is_owner(sender) and _needs_agent_tools(text):
-                available_tools.extend(AGENT_TOOL_SCHEMAS)
+                # 开了工具路由时，干活一律交给后台执行助手（DSH），不再把 13 个电脑工具
+                # 挂进大肥鱼：既省 1.4k tk，也避免「挂/不挂」来回切换让 2.6 万 token 的
+                # 前缀缓存整段作废。DSH 不可用时仍走老路，保证主人还能直接指挥本机。
+                if not (settings.ENABLE_TOOL_ROUTER and is_dsh_available()[0]):
+                    available_tools.extend(AGENT_TOOL_SCHEMAS)
             if roast_hint:
                 available_tools = []  # 吐槽是纯嘴活，挂工具只会误触发搜索/改文件
 
@@ -1300,6 +1310,90 @@ class DaFeiYuBrain:
         except Exception as exc:
             logger.warning("L2 追认判定异常: %s", exc)
             return False
+
+    def judge_tool_need(
+        self,
+        sender: str,
+        text: str,
+        recent_history: list[dict] | None = None,
+    ) -> dict:
+        """
+        工具路由判定（轻量，只输出一行 JSON）：这句话要不要让执行助手动手干活。
+
+        它只做「派不派活」这一个判断，不聊天、不调用工具、不带人设。
+        判错代价都可控：
+        - 该派没派 → 退回普通聊天，跟以前一样；
+        - 不该派却派了 → 后台跑一个空任务，群里只多一句占位，不会胡说八道。
+
+        写法上刻意压到极简（不带人设、不带工具 schema、不带长上下文），
+        一次调用约 300 tk 输入、30 tk 输出，属于「每条要回复的消息都跑一次也不心疼」的量级。
+        返回 {"need": bool, "task": str, "reason": str}。
+        """
+        empty = {"need": False, "task": "", "reason": ""}
+        body = (text or "").strip()
+        if not body or not settings.has_valid_api_key:
+            return empty
+
+        ctx_lines: list[str] = []
+        for m in (recent_history or [])[-6:]:
+            content = " ".join((m.get("content") or "").split())
+            if not content:
+                continue
+            who = "我" if m.get("role") == "assistant" else (m.get("sender") or "群友")
+            ctx_lines.append(f"[{who}]: {content[:100]}")
+        ctx = "\n".join(ctx_lines) if ctx_lines else "（群里之前没人说话）"
+        probe = body if len(body) <= 300 else body[:300] + "…"
+
+        prompt = (
+            "你是群聊机器人的「派活判断器」。只判断群友这句话要不要机器人动手去干活，"
+            "不负责真的干活，也不负责聊天。\n\n"
+            f"【最近几句群聊】\n{ctx}\n\n"
+            f"【现在这句】\n[{sender}]: {probe}\n\n"
+            "判断标准（只有两类）：\n"
+            "- need=true（要干活）：明确要求操作电脑/服务器/文件/代码/网页/系统，或要求产出实物结果。"
+            "例如：改代码、跑脚本、看报错、查本机状态、装软件、整理文件、生成表格或文档、"
+            "抓网页内容、排查问题、部署上线。\n"
+            "- need=false（不干活）：闲聊、吐槽、开玩笑、问知识、问观点、问建议、问天气时间、"
+            "约人打游戏、发表情、问机器人自己（“你在干嘛”）、要表情包、让它记住某件事、"
+            "单纯复述或抱怨。\n"
+            "拿不准时一律 need=false —— 宁可漏派，也不要给群里派一堆空任务。\n\n"
+            "need=true 时，把这件事改写成一段可以直接交给执行助手的任务说明：\n"
+            "- 不带人称、不带寒暄、不要写“请帮我”，直接写要做什么；\n"
+            "- 保留原话里的所有细节（文件路径、人名、数字、时间、格式要求）；\n"
+            "- 不超过 120 字，一句话说完；\n"
+            "- 不许编造原话里没出现的路径、参数或账号。\n\n"
+            "只输出一行 JSON，不要 markdown、不要代码块、不要解释：\n"
+            '{"need": true 或 false, "task": "任务说明（need=false 时为空字符串）", "reason": "15 字以内理由"}'
+        )
+
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            raw = strip_think(resp.choices[0].message.content or "")
+        except Exception as exc:
+            logger.warning("工具路由判定调用失败: %s", exc)
+            return {"need": False, "task": "", "reason": "调用失败"}
+
+        matched = re.search(r"\{.*\}", raw, re.S)
+        if not matched:
+            logger.info("工具路由判定输出无法解析: %r", raw[:120])
+            return {"need": False, "task": "", "reason": "解析失败"}
+        try:
+            data = json.loads(matched.group(0))
+        except json.JSONDecodeError:
+            logger.info("工具路由判定输出不是合法 JSON: %r", raw[:120])
+            return {"need": False, "task": "", "reason": "JSON非法"}
+
+        task = " ".join(str(data.get("task") or "").split())[:200]
+        need = bool(data.get("need")) and bool(task)
+        reason = " ".join(str(data.get("reason") or "").split())[:30]
+        if not need:
+            return {"need": False, "task": "", "reason": reason}
+        logger.info("🧰 工具路由判定：需要派活 → %s（理由：%s）", task[:60], reason)
+        return {"need": True, "task": task, "reason": reason}
 
     def judge_topic_roast(
         self,

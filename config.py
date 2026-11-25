@@ -125,6 +125,11 @@ class Settings:
     DSH_WORKDIR: str = os.getenv("DSH_WORKDIR", "").strip()
     DSH_TIMEOUT_SEC: int = max(60, int(os.getenv("DSH_TIMEOUT_SEC", "900")))
 
+    # 工具路由：每条要回复的消息先让小模型判一次「要不要派活给 DSH」
+    ENABLE_TOOL_ROUTER: bool = _parse_bool(os.getenv("ENABLE_TOOL_ROUTER"), True)
+    # 短于这么多字的消息不做判定（「在吗」「哈哈」「+1」不可能是活，省一次调用）
+    TOOL_ROUTER_MIN_CHARS: int = max(2, int(os.getenv("TOOL_ROUTER_MIN_CHARS", "8")))
+
     # 高危操作群内二次确认保险
     ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)
     DANGER_CONFIRM_TTL_SEC: int = max(30, int(os.getenv("DANGER_CONFIRM_TTL_SEC", "180")))
