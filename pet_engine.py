@@ -355,6 +355,15 @@ class PetEngine:
             ).fetchall()
             return [dict(r) for r in reversed(rows)]
 
+    def count_history_between(self, start_ts: float, end_ts: float) -> int:
+        """统计某时间段内的群聊消息条数（含机器人自己说的），供每日统计报告引用。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM chat_history WHERE created_ts >= ? AND created_ts < ?",
+                (start_ts, end_ts),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def update_history_content_by_image(self, group_id: str, image_path: str, caption: str) -> None:
         clean_cap = " ".join((caption or "").split()).strip()[:220]
         clean_path = (image_path or "").strip()

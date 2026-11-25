@@ -20,6 +20,7 @@ from config import settings
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
 from memory import memory_store
+import metrics
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
 from roles.build_card import get_active_persona, get_evolutions, list_personas, set_active_persona
@@ -170,6 +171,7 @@ class DaFeiYuBotCore:
         self._last_hungry_bubble_ts: dict[str, float] = {}
         self._last_evening_bubble_date: dict[str, str] = {}
         self._last_nightly_date: str = ""
+        self._last_metrics_date: str = ""
 
     def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
         """峰哥人设不发表情包（仅保留搜图/截屏/文件等功能性附件），塔菲人设正常发表情包。"""
@@ -317,12 +319,14 @@ class DaFeiYuBotCore:
 
         window = recent[last_asst_idx:]
         # L1 已确认没 @ 我，此时文本里出现 @ 只可能是 @ 了别人
-        return brain.is_talking_to_or_about_me(
+        verdict = brain.is_talking_to_or_about_me(
             sender=sender,
             text=body,
             recent_history=window,
             at_others="@" in body,
         )
+        metrics.record("l2", group_id, verdict)
+        return verdict
 
     @staticmethod
     def _roast_text_ok(text: str) -> bool:
@@ -418,6 +422,7 @@ class DaFeiYuBotCore:
             at_others="@" in body,
             multi_speaker=multi_speaker,
         )
+        metrics.record("l2_5", group_id, bool(angle))
         if not angle:
             return ""
 
@@ -734,7 +739,8 @@ class DaFeiYuBotCore:
                 f"• 发图自动高清识图吐槽，发完图再叫大肥鱼必识别\n"
                 f"• `/投喂` / `/摸鱼` / `/状态` / `/鱼塘榜`：养鱼互动\n"
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
-                f"• `/记忆` / `/日记`：查看四层记忆统计与塔菲日记\n"
+                f"• `/记忆` / `/日记` / `/写日记`：查看四层记忆统计与塔菲日记\n"
+                f"• `/统计`：查看 L2/L2.5 子代理调用次数与回复率（每天 0:00 自动出 txt）\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
                 f"• `/搜图 关键词`（或图片链接）：联网搜图并直接发群里\n"
                 f"• `/切换人设 峰哥` / `/切换人设 塔菲` / `/当前人设`：零重启热切换语言风格\n"
@@ -797,6 +803,25 @@ class DaFeiYuBotCore:
             else:
                 reply_text = "📔 日记没写成，日志里有具体原因（通常是模型返回了空内容）"
             return BotResponse(should_reply=True, text=reply_text, mood="happy" if ok else "sleepy", status=st)
+
+        if cmd in ("/统计", "/日报", "看统计") or cmd.startswith("/统计 "):
+            st = pet_engine.get_status()
+            arg = cmd.split(maxsplit=1)[1].strip() if " " in cmd else ""
+            if arg in ("昨天", "昨日"):
+                day = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif arg:
+                try:
+                    day = datetime.strptime(arg, "%Y-%m-%d").strftime("%Y-%m-%d")
+                except ValueError:
+                    return BotResponse(
+                        should_reply=True,
+                        text="格式：/统计（今天）、/统计 昨天、/统计 2026-11-24",
+                        mood="smug",
+                        status=st,
+                    )
+            else:
+                day = datetime.now().strftime("%Y-%m-%d")
+            return BotResponse(should_reply=True, text=metrics.build_report(day), mood="smug", status=st)
 
         if cmd.startswith("/学黑话"):
             body = cmd[4:].strip()
@@ -1370,6 +1395,27 @@ class DaFeiYuBotCore:
             status=new_status,
         )
 
+    def _maybe_write_daily_metrics(self) -> None:
+        """
+        每天 0:00 之后出一份前一日的 L2/L2.5 子代理调用统计 txt。
+
+        纯代码统计（计数文件 + 历史表），不调用任何模型。
+        0~4 点之间都可以补跑（进程半夜重启也不丢），每份只写一次。
+        """
+        dt = datetime.now()
+        if dt.hour >= 4:
+            return
+        target = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        if self._last_metrics_date == target:
+            return
+        try:
+            path = metrics.write_report(target)
+        except Exception as exc:
+            logger.warning("生成 %s 的调用统计失败: %s", target, exc)
+            return
+        self._last_metrics_date = target
+        logger.info("📊 已生成 %s 的 L2/L2.5 调用统计: %s", target, path)
+
     def _maybe_run_nightly_maintenance(self, group_id: str, status=None) -> None:
         """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个逻辑日只跑一次。"""
         dt = datetime.now()
@@ -1435,6 +1481,9 @@ class DaFeiYuBotCore:
 
         # 0. 每晚 23:45 之后自动执行四层记忆夜间养护（写 L2 日记 + L1 巩固合并淘汰 + 周日周结 + 自动备份）
         self._maybe_run_nightly_maintenance(group_id, status)
+
+        # 0.1 每天 0:00 之后出一份前一日 L2/L2.5 子代理调用统计（纯代码，不调模型）
+        self._maybe_write_daily_metrics()
 
         if not settings.ENABLE_SCHEDULED_BUBBLE or self.is_quiet_hours():
             return None
