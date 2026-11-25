@@ -361,6 +361,7 @@ def _build_system_prompt(
     matched_slang: str = "",
     emotion_desc: str = "",
     style_hints: str = "",
+    diary_note: str = "",
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     card_text = load_card()
@@ -375,6 +376,8 @@ def _build_system_prompt(
     extra_blocks = []
     if recalled_memory:
         extra_blocks.append(recalled_memory)
+    if diary_note:
+        extra_blocks.append(diary_note)
     if matched_slang:
         extra_blocks.append(matched_slang)
     if emotion_desc:
@@ -541,7 +544,12 @@ class DaFeiYuBrain:
         # L1 识海按需召回 + 群黑话命中注入 + 情绪惯性状态机 + 语境语感 RAG
         active_persona = get_active_persona()
         role_name, voice_hint, tail_word = _persona_voice_profile()
-        recalled_memory = memory_store.render_context(f"{sender} {text}", group_id=group_id)
+        # 只用这句话本身去召回：把 sender 也拼进查询会让「这条记忆的 tags 里有这个人」
+        # 变成命中条件，于是这个人以后说的每一句（哪怕只有一个「行」）都会把它召回。
+        recalled_memory = memory_store.render_context(text, group_id=group_id)
+        diary_note = (
+            memory_store.render_diary_context(group_id) if settings.MEMORY_DIARY_INJECT else ""
+        )
         matched_slang = slang_book.render_matched(group_id, text)
         emotion_desc = emotion_sm.describe(group_id)
         style_hints = retrieve_style_hints(
@@ -559,6 +567,7 @@ class DaFeiYuBrain:
             matched_slang=matched_slang,
             emotion_desc=emotion_desc,
             style_hints=style_hints,
+            diary_note=diary_note,
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
@@ -1333,25 +1342,89 @@ class DaFeiYuBrain:
                 used_vision=False,
             )
 
-    def write_daily_diary(self, recent_history: list[dict], status: PetStatus) -> bool:
+    def extract_daily_facts(self, recent_history: list[dict], group_id: str = "", max_items: int = 3) -> list[dict]:
+        """
+        夜间批量提炼 L1：从当天聊天里挑出最多 3 条「以后还用得上」的事实。
+
+        为什么需要这一步：这套四层框架原本假设模型在对话里自己调 remember_fact，
+        但群里每轮都是独立的一问一答，实测 3 天 980 条消息只写进去 3 条节点（0.3%），
+        识海等于空的。夜间用一次轻量调用把当天值得留的东西补录，是最省 token 的补法。
+        写入仍走 memory_store.remember（去重 + 每日 8 条上限 + 隐私过滤）。
+        """
+        if not settings.has_valid_api_key or not recent_history:
+            return []
+        lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-40:] if m.get("content")]
+        if not lines:
+            return []
+        prompt = (
+            "下面是群聊片段。请挑出最多 3 条「以后还会用到」的长期记忆，只挑真正有用的：\n"
+            "- 群友的固定特征/身份/习惯（谁在玩什么游戏、谁做什么工作、谁有什么梗）\n"
+            "- 群里新出现的梗、外号、黑话\n"
+            "- 明确的约定或要求（时间、规则、让机器人怎么做）\n"
+            "不要记：一次性的闲聊和情绪、天气、你（机器人）自己说过的话、密码证件银行卡。\n"
+            "同一个人/同一件事只写一条，把零散信息并进那一句，别重复。\n"
+            "每条一行，格式：内容（≤40字）|标签1,标签2\n"
+            "如果一条都不值得记，就只输出：无\n\n" + "\n".join(lines)
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=400,
+            )
+            raw = strip_think(resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("夜间 L1 提炼失败: %s", exc)
+            return []
+        if not raw or raw.startswith("无"):
+            return []
+        facts: list[dict] = []
+        for line in raw.splitlines():
+            line = line.strip().lstrip("-•* \t")
+            if not line or "|" not in line:
+                continue
+            text, _, tags_raw = line.partition("|")
+            text = text.strip()[:120]
+            if len(text) < 4:
+                continue
+            tags = [t.strip()[:16] for t in re.split(r"[,，、\s]+", tags_raw) if t.strip()][:4]
+            facts.append({"text": text, "tags": tags})
+            if len(facts) >= max_items:
+                break
+        return facts
+
+    def write_daily_diary(self, recent_history: list[dict], status: PetStatus, group_id: str = "") -> bool:
         """L2 日记：每晚以当前人设口吻写一条今天群里的细节与心情（≤200字）"""
         if not settings.has_valid_api_key or not recent_history:
             return False
-        lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-15:] if m.get("content")]
+        lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-40:] if m.get("content")]
         if not lines:
             return False
         role_name, voice_hint, _ = _persona_voice_profile()
+        # 把今天已经写过的日记塞进提示词，否则「/写日记」多按两次就会得到两篇几乎一样的日记
+        today = datetime.now().strftime("%Y-%m-%d")
+        wrote_today = [
+            d.get("内容", "")
+            for d in memory_store.read_recent_diaries(limit=3, group_id=group_id)
+            if d.get("时间", "")[:10] == today
+        ]
+        avoid = (
+            "\n今天已经写过这些，别再重复同样的角度和句子：\n" + "\n".join(f"- {t[:80]}" for t in wrote_today)
+            if wrote_today
+            else ""
+        )
         prompt = (
             f"你是群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}）。请根据今天群里发生的片段，写一条 60~160 字的私人日记，"
-            "记录今天让你印象最深的细节和心情（像真日记，不要汇报，贴合当前人设口吻）。\n"
-            "只输出一行，格式：`心情词|日记正文`。\n\n"
+            "记录今天让你印象最深的细节和心情（像真日记，不要汇报，贴合当前人设口吻）。"
+            "挑一件具体的小事写，别把一天的事都罗列一遍。\n"
+            "只输出一行，格式：`心情词|日记正文`。" + avoid + "\n\n"
             + "\n".join(lines)
         )
         try:
             resp = self._create(
                 [{"role": "user", "content": prompt}],
                 temperature=0.85,
-                max_tokens=220,
+                max_tokens=260,
             )
             raw = (resp.choices[0].message.content or "").strip()
             if not raw:
@@ -1365,7 +1438,7 @@ class DaFeiYuBrain:
                 mood, body = raw.split("|", 1)
             else:
                 mood, body = "摸鱼", raw
-            return memory_store.write_diary(mood.strip()[:8], body.strip())
+            return memory_store.write_diary(mood.strip()[:8], body.strip(), group_id=group_id)
         except Exception as exc:
             logger.warning("生成 L2 每日日记失败: %s", exc)
             return False

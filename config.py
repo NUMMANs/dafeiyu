@@ -84,6 +84,11 @@ class Settings:
     QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))
 
+    # 四层记忆：每轮是否把最近 1~2 条日记当「心情底色」注入（约 +40 tk，嫌贵可关）
+    MEMORY_DIARY_INJECT: bool = _parse_bool(os.getenv("MEMORY_DIARY_INJECT"), True)
+    # 四层记忆：夜间是否用一次轻量调用从当天群里提炼 L1 事实（否则只靠模型自己想起来记）
+    MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
+
     # 常规桌面 Agent 电脑操作权限
     ENABLE_AGENT_TOOLS: bool = _parse_bool(os.getenv("ENABLE_AGENT_TOOLS"), True)
     # 允许操纵电脑的主人昵称（逗号分隔，留空表示专用电脑/虚拟机内不限制；在多人大群里建议填你自己的微信名）

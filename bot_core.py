@@ -172,6 +172,8 @@ class DaFeiYuBotCore:
         self._pending_lock = threading.Lock()
         self._last_hungry_bubble_ts: dict[str, float] = {}
         self._last_evening_bubble_date: dict[str, str] = {}
+        # 夜间养护：日记按群算（每个群每天各写一条），巩固/备份全局每天只跑一次
+        self._last_nightly_group_day: dict[str, str] = {}
         self._last_nightly_date: str = ""
         self._last_metrics_date: str = ""
 
@@ -786,19 +788,19 @@ class DaFeiYuBotCore:
 
         if cmd in ("/记忆", "查记忆"):
             st = pet_engine.get_status()
-            ms = memory_store.stats()
+            ms = memory_store.stats(group_id=group_id)
             lv = ms["levels"]
             reply_text = (
                 f"🧠 【大肥鱼四层记忆状态】\n"
                 f"L1 识海节点：{ms['total_nodes']} 条（core {lv['core']} / important {lv['important']} / normal {lv['normal']}）\n"
                 f"标签联想边：{ms['total_edges']} 条｜今日主动记忆：{ms['today_self_writes']}/{ms['daily_limit']}\n"
-                f"L2 塔菲日记：{ms['diaries']} 篇"
+                f"L2 塔菲日记：{ms['group_diaries']} 篇（含早期无群标记的）"
             )
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
 
         if cmd in ("/日记", "看日记"):
             st = pet_engine.get_status()
-            diaries = memory_store.read_recent_diaries(limit=3)
+            diaries = memory_store.read_recent_diaries(limit=3, group_id=group_id)
             if not diaries:
                 reply_text = "📔 还没写过日记呢喵，每晚 23:45 之后会自动写一篇今天的群聊日记！"
             else:
@@ -810,16 +812,16 @@ class DaFeiYuBotCore:
 
         if cmd in ("/写日记", "写日记"):
             st = pet_engine.get_status()
-            recent = pet_engine.get_recent_history(group_id, limit=15)
+            recent = pet_engine.get_recent_history(group_id, limit=40)
             if not recent:
                 return BotResponse(should_reply=True, text="📔 这个群还没来得及聊啥，没素材写日记喵", mood="sleepy", status=st)
-            ok = brain.write_daily_diary(recent, st)
+            ok = brain.write_daily_diary(recent, st, group_id=group_id)
             if ok:
-                latest = memory_store.read_recent_diaries(limit=1)
+                latest = memory_store.read_recent_diaries(limit=1, group_id=group_id)
                 d = latest[0] if latest else {}
                 reply_text = f"📔 写完啦 [{d.get('心情', '')}] {d.get('内容', '')}"
             else:
-                reply_text = "📔 日记没写成，日志里有具体原因（通常是模型返回了空内容）"
+                reply_text = "📔 日记没写成：今天已经写过差不多的了，或者模型返回了空内容（日志里有具体原因）"
             return BotResponse(should_reply=True, text=reply_text, mood="happy" if ok else "sleepy", status=st)
 
         if cmd in ("/统计", "/日报", "看统计") or cmd.startswith("/统计 "):
@@ -1437,7 +1439,7 @@ class DaFeiYuBotCore:
         return path
 
     def _maybe_run_nightly_maintenance(self, group_id: str, status=None) -> None:
-        """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个逻辑日只跑一次。"""
+        """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个群每个逻辑日各跑一次。"""
         dt = datetime.now()
         if dt.hour < 4:
             logical_day = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1445,13 +1447,13 @@ class DaFeiYuBotCore:
             logical_day = dt.strftime("%Y-%m-%d")
         else:
             return
-        if self._last_nightly_date == logical_day:
+        if self._last_nightly_group_day.get(group_id) == logical_day:
             return
         self.run_nightly_maintenance(group_id, status, logical_day=logical_day)
 
     def run_nightly_maintenance(self, group_id: str, status=None, logical_day: str = "") -> dict:
         """
-        四层记忆夜间养护：L2 日记 → L1 巩固 → 周日周结 → 备份。
+        四层记忆夜间养护：L2 日记（按群）→ L1 巩固 / 周日周结 / 备份（全局各一次）。
 
         以前整段包在 `except Exception: pass` 里，日记写失败一点痕迹都不留；
         现在每一步都落日志，真没写成也能直接看到原因。
@@ -1460,32 +1462,52 @@ class DaFeiYuBotCore:
         dt = datetime.now()
         logical_day = logical_day or dt.strftime("%Y-%m-%d")
         status = status or pet_engine.get_status()
-        recent = pet_engine.get_recent_history(group_id, limit=15)
+        recent = pet_engine.get_recent_history(group_id, limit=40)
         if not recent:
             logger.info("[%s] 夜间养护跳过：该群没有聊天记录，等有内容的群再跑", group_id)
             return {"skipped": "empty_history"}
 
-        self._last_nightly_date = logical_day
+        self._last_nightly_group_day[group_id] = logical_day
         logger.info("[%s] 🌙 开始夜间四层记忆养护（近期消息 %d 条）", group_id, len(recent))
-        result: dict = {"diary": False, "consolidate": None, "weekly": False, "backup": ""}
+        result: dict = {"diary": False, "facts": 0, "consolidate": None, "weekly": False, "backup": ""}
         try:
-            result["diary"] = brain.write_daily_diary(recent, status)
+            result["diary"] = brain.write_daily_diary(recent, status, group_id=group_id)
             logger.info("[%s] L2 日记写入结果: %s", group_id, "成功" if result["diary"] else "未写入（看上一条日志）")
         except Exception as exc:
             logger.warning("[%s] L2 日记写入异常: %s", group_id, exc)
         try:
-            result["consolidate"] = memory_store.consolidate()
+            if settings.MEMORY_NIGHTLY_EXTRACT:
+                facts = brain.extract_daily_facts(recent, group_id=group_id)
+                written = 0
+                for fact in facts:
+                    ok, _msg = memory_store.remember(
+                        text=fact["text"],
+                        level="normal",
+                        tags=fact["tags"],
+                        source="self",
+                        group_id=group_id,
+                    )
+                    written += 1 if ok else 0
+                result["facts"] = written
+                logger.info("[%s] L1 夜间提炼：候选 %d 条，实际写入 %d 条", group_id, len(facts), written)
         except Exception as exc:
-            logger.warning("[%s] L1 夜间巩固异常: %s", group_id, exc)
+            logger.warning("[%s] L1 夜间提炼异常: %s", group_id, exc)
         try:
-            if dt.weekday() == 6:  # 周日自动生成周结
-                result["weekly"] = bool(memory_store.generate_weekly_summary())
+            if dt.weekday() == 6:  # 周日：本群周结
+                result["weekly"] = bool(memory_store.generate_weekly_summary(group_id=group_id))
         except Exception as exc:
             logger.warning("[%s] 周结生成异常: %s", group_id, exc)
-        try:
-            result["backup"] = str(memory_store.backup_memory(keep_last=7) or "")
-        except Exception as exc:
-            logger.warning("[%s] 记忆备份异常: %s", group_id, exc)
+        # 巩固 + 备份跟群无关，全局每天只做一次（否则两个群会重复备份、互相覆盖）
+        if self._last_nightly_date != logical_day:
+            self._last_nightly_date = logical_day
+            try:
+                result["consolidate"] = memory_store.consolidate()
+            except Exception as exc:
+                logger.warning("L1 夜间巩固异常: %s", exc)
+            try:
+                result["backup"] = str(memory_store.backup_memory(keep_last=7) or "")
+            except Exception as exc:
+                logger.warning("记忆备份异常: %s", exc)
         return result
 
     def check_autonomous_heartbeat(self, group_id: str) -> BotResponse | None:

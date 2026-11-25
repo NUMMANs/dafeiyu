@@ -39,6 +39,15 @@ PRUNE_THRESHOLD = 0.06
 MAX_NODES = 5000
 DAILY_SELF_LIMIT = 8
 RECALL_SCORE_THRESHOLD = 0.25
+# 字面闸门：查询词 ≥3 个时必须命中 2 个二元组才算「相关」。
+# 只命中 1 个词（例如「人」「天」这种单字）不足以证明这段记忆和当前这句有关，
+# 否则每条记忆都会在每条消息上被召回一次（实测注入率 66%）。
+MIN_LITERAL_HITS = 2
+# 命中强化只加不减会让老节点变成「永磁铁」（weight 3.0 → 15.8、hits 160），
+# 永远顶到打分因子上限 1.0。按等级封顶在基础权重的 2 倍：normal 最高 2.0、
+# important 6.0、core 20.0，保持「core > important > normal」的等级秩序。
+REINFORCE_CAP_MULT = 2.0
+REINFORCE_STEP = 0.08
 
 # 虚词过滤表（避免“她的/这个/就是”误召回无关记忆）
 STOPWORDS = {
@@ -58,7 +67,14 @@ SENSITIVE_RE = re.compile(
 
 
 def _tokenize(text: str) -> set[str]:
-    """中文 2 字滑窗 + 单字 + 英文单词，并过滤虚词"""
+    """
+    中文 2 字滑窗 + 英文单词，并过滤虚词。
+
+    这里**刻意不再产出单字**：单字是召回噪声的主要来源。
+    「大肥鱼」会被拆成 大/肥/鱼 三个单字，只要记忆里出现任意一个字就算命中，
+    于是「今天有人玩吗」也能把「主人要求：@了别人但没@大肥鱼时不要接话」召回。
+    二元组（大肥/肥鱼）才是一个中文词的最小可辨识单位。
+    """
     t = (text or "").lower()
     tokens: set[str] = set()
 
@@ -67,15 +83,16 @@ def _tokenize(text: str) -> set[str]:
         if w not in STOPWORDS:
             tokens.add(w)
 
-    # 中文连续段：提取 2 字滑窗 + 单字
+    # 中文连续段：2 字滑窗
     for seg in re.findall(r"[\u4e00-\u9fff]+", t):
-        for ch in seg:
-            if ch not in STOPWORDS:
-                tokens.add(ch)
         for i in range(len(seg) - 1):
             bg = seg[i : i + 2]
-            if bg not in STOPWORDS:
-                tokens.add(bg)
+            if bg in STOPWORDS:
+                continue
+            # 两个都是虚词组成的二元组（「了就」「的都」）没有信息量
+            if bg[0] in STOPWORDS and bg[1] in STOPWORDS:
+                continue
+            tokens.add(bg)
     return tokens
 
 
@@ -256,11 +273,13 @@ class FourLayerMemory:
                 return []
 
             denom = min(len(q_tokens), 4)
+            # 查询很短（1~2 个词）时命中 1 个就够，否则要求命中 2 个
+            min_hits = 1 if len(q_tokens) <= 2 else MIN_LITERAL_HITS
             literal_scores: dict[str, float] = {}
             for nid, n in valid_nodes.items():
                 doc_tokens = _tokenize(n["text"] + " " + " ".join(n.get("tags") or []))
                 hits = len(q_tokens & doc_tokens)
-                if hits > 0:
+                if hits >= min_hits:
                     literal_scores[nid] = min(1.0, hits / denom)
 
             if not literal_scores:
@@ -306,7 +325,11 @@ class FourLayerMemory:
             if reinforce and top_items:
                 for _, node in top_items:
                     node["hits"] = int(node.get("hits", 0)) + 1
-                    node["weight"] = round(float(node.get("weight", 1.0)) + 0.08, 3)
+                    lvl = node.get("level", "normal")
+                    base = BASE_WEIGHT.get(lvl, 1.0)
+                    cap = round(base * REINFORCE_CAP_MULT, 3)
+                    cur = float(node.get("weight", base))
+                    node["weight"] = round(min(cur + REINFORCE_STEP, cap), 3)
                     node["updated"] = round(now, 2)
                 self._save_graph_locked()
 
@@ -339,12 +362,26 @@ class FourLayerMemory:
         return "\n".join(lines) if len(lines) > 1 else ""
 
     def consolidate(self) -> dict[str, int]:
-        """夜间养护：同 level 文本相似度 >= 0.78 合并 + 非 core 低于淘汰线清除"""
+        """
+        夜间养护：
+        0. 权重归一（把历史命中强化堆出来的超高权重压回等级上限）
+        1. 同 level 同群文本相似度 >= 0.78 合并
+        2. 非 core 且有效权重 < 0.06 淘汰
+        """
         with self._lock:
             now = time.time()
             nodes = self._graph["nodes"]
             merged_count = 0
             pruned_count = 0
+            clamped_count = 0
+
+            # 0. 权重归一：早期版本命中强化只加不减，普通节点被顶到 core 的量级
+            for n in nodes:
+                lvl = n.get("level", "normal")
+                cap = round(BASE_WEIGHT.get(lvl, 1.0) * REINFORCE_CAP_MULT, 3)
+                if float(n.get("weight", cap)) > cap:
+                    n["weight"] = cap
+                    clamped_count += 1
 
             # 1. 同 level 内相似度 >= 0.78 合并
             kept: list[dict[str, Any]] = []
@@ -373,42 +410,121 @@ class FourLayerMemory:
             self._graph["nodes"] = survivors
             self._graph["edges"] = [e for e in self._graph["edges"] if e[0] in kept_ids and e[1] in kept_ids]
             self._save_graph_locked()
-            logger.info("🌙 L1 夜间巩固完成: 合并 %d 条, 淘汰 %d 条, 剩余 %d 条", merged_count, pruned_count, len(survivors))
-            return {"merged": merged_count, "pruned": pruned_count, "remaining": len(survivors)}
+            logger.info(
+                "🌙 L1 夜间巩固完成: 权重归一 %d 条, 合并 %d 条, 淘汰 %d 条, 剩余 %d 条",
+                clamped_count,
+                merged_count,
+                pruned_count,
+                len(survivors),
+            )
+            return {
+                "clamped": clamped_count,
+                "merged": merged_count,
+                "pruned": pruned_count,
+                "remaining": len(survivors),
+            }
 
     # ========================
     # L2 日记与周结
     # ========================
-    def write_diary(self, mood: str, content: str) -> bool:
+    def write_diary(
+        self,
+        mood: str,
+        content: str,
+        group_id: str = "",
+        max_per_day: int = 3,
+        dedupe_ratio: float = 0.7,
+    ) -> bool:
+        """
+        写一条 L2 日记（≤300 字）。
+
+        两道闸，都是为了别让她把同一天写成两遍：
+        1. 每群每天最多 max_per_day 条；
+        2. 和今天已有日记相似度 ≥ dedupe_ratio 就丢弃（实测两次触发会写出
+           「那坨草稿糊屏幕上」和「最烦的是那破页面全是JS拼的」这种近重复）。
+        """
         clean = (content or "").strip()[:300]
         if not clean:
             return False
-        entry = {
-            "时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "心情": mood or "开心",
-            "内容": clean,
-        }
+        today = datetime.now().strftime("%Y-%m-%d")
         with self._lock:
+            same_day = [
+                d
+                for d in self._read_diaries_locked()
+                if d.get("时间", "")[:10] == today and d.get("群", "") == group_id
+            ]
+            if len(same_day) >= max_per_day:
+                logger.info("📔 L2 日记跳过：今天本群已有 %d 条（上限 %d）", len(same_day), max_per_day)
+                return False
+            for d in same_day:
+                if SequenceMatcher(None, d.get("内容", ""), clean).ratio() >= dedupe_ratio:
+                    logger.info("📔 L2 日记跳过：与今天已有日记高度重复 -> %s", clean[:40])
+                    return False
+            entry = {
+                "时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "心情": mood or "开心",
+                "内容": clean,
+                "群": group_id,
+            }
             with self.diary_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        logger.info("📔 L2 日记已写入: [%s] %s", mood, clean[:60])
+        logger.info("📔 L2 日记已写入[%s]: [%s] %s", group_id or "全局", mood, clean[:60])
         return True
 
-    def read_recent_diaries(self, limit: int = 5) -> list[dict[str, str]]:
+    def _read_diaries_locked(self) -> list[dict[str, str]]:
         if not self.diary_path.is_file():
             return []
-        lines = [l.strip() for l in self.diary_path.read_text(encoding="utf-8").splitlines() if l.strip()]
         out: list[dict[str, str]] = []
-        for line in lines[-limit:]:
+        for line in self.diary_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
         return out
 
-    def generate_weekly_summary(self) -> Path | None:
+    def read_recent_diaries(
+        self,
+        limit: int = 5,
+        group_id: str | None = None,
+        days: int | None = None,
+    ) -> list[dict[str, str]]:
+        """读最近日记。group_id 给定时只返回本群 + 早期无群标记的旧条目；days 限定最近几天。"""
+        with self._lock:
+            items = self._read_diaries_locked()
+        if group_id is not None:
+            items = [d for d in items if not d.get("群") or d.get("群") == group_id]
+        if days is not None:
+            cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            items = [d for d in items if d.get("时间", "")[:10] >= cutoff]
+        return items[-limit:]
+
+    def render_diary_context(self, group_id: str = "", days: int = 3, max_chars: int = 120) -> str:
+        """
+        把最近 1~2 条日记拼成一小块「心情底色」注入系统提示词。
+
+        日记以前只被 /日记 命令读到，写完就躺在磁盘里从不进 prompt，等于白写。
+        这里只取本群最近 3 天、最多 2 条、合计 ≤120 字，并且明确告诉她别复述。
+        （system 段命中缓存，实测这点开销基本为 0；关掉用 MEMORY_DIARY_INJECT=0）
+        """
+        diaries = self.read_recent_diaries(limit=2, group_id=group_id, days=days)
+        if not diaries:
+            return ""
+        lines = ["【你前两天写的日记（只作心情底色，别主动复述细节）】"]
+        total = len(lines[0])
+        for d in diaries:
+            line = f"- {d.get('时间', '')[5:10]} {d.get('心情', '平常')}：{d.get('内容', '')[:52]}"
+            if total + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            total += len(line) + 1
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    def generate_weekly_summary(self, group_id: str = "") -> Path | None:
         """把最近 7 天日记压缩为周结 Markdown，并写入一条 important 记忆进 L1"""
-        diaries = self.read_recent_diaries(limit=30)
+        diaries = self.read_recent_diaries(limit=50, group_id=group_id or None)
         if not diaries:
             return None
         cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -425,14 +541,15 @@ class FourLayerMemory:
             lines.append(f"- {mmdd} · {d.get('心情', '平常')}｜{d.get('内容', '')}")
             brief_parts.append(f"{mmdd}{d.get('内容', '')[:25]}")
 
-        out_path = DIARY_DIR / f"周结_{end_d}.md"
+        suffix = f"_{group_id}" if group_id else ""
+        out_path = DIARY_DIR / f"周结_{end_d}{suffix}.md"
         tmp = out_path.with_suffix(".md.tmp")
         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
         tmp.replace(out_path)
 
         # 同步写一条 important 周结进 L1
         summary_text = f"周结({start_d}~{end_d})：" + "；".join(brief_parts)[:170]
-        self.remember(summary_text, level="important", tags=["周结", "日记"], source="self")
+        self.remember(summary_text, level="important", tags=["周结", "日记"], source="self", group_id=group_id)
         return out_path
 
     def backup_memory(self, keep_last: int = 7) -> Path:
@@ -452,18 +569,25 @@ class FourLayerMemory:
         logger.info("💾 记忆备份完成: %s", zip_path.name)
         return zip_path
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, group_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             nodes = self._graph["nodes"]
             dist = {"core": 0, "important": 0, "normal": 0}
             for n in nodes:
                 lvl = n.get("level", "normal")
                 dist[lvl] = dist.get(lvl, 0) + 1
+            # 注意：这里已经在 self._lock 里，必须用不加锁的内部读法，否则会自锁死
+            diaries = self._read_diaries_locked()
             return {
                 "total_nodes": len(nodes),
                 "total_edges": len(self._graph["edges"]),
                 "levels": dist,
-                "diaries": len(self.read_recent_diaries(limit=999)),
+                "diaries": len(diaries),
+                "group_diaries": len(
+                    [d for d in diaries if not group_id or not d.get("群") or d.get("群") == group_id]
+                )
+                if group_id
+                else len(diaries),
                 "today_self_writes": self._count_today_self_writes_locked(time.time()),
                 "daily_limit": DAILY_SELF_LIMIT,
             }
