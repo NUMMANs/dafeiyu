@@ -512,9 +512,18 @@ class WxAutoAdapter:
                         try:
                             hb = bot_core.check_autonomous_heartbeat(group)
                             if hb and hb.should_reply:
-                                logger.info("[%s] 大肥鱼自主冒泡: %s", group, hb.text[:80])
-                                if not self._safe_send(wx, hb.text, group, "自主冒泡"):
+                                logger.info(
+                                    "[%s] 自主动作: %s",
+                                    group,
+                                    (hb.text or (hb.file_path.name if hb.file_path else ""))[:80],
+                                )
+                                if hb.text and not self._safe_send(wx, hb.text, group, "自主冒泡"):
                                     continue
+                                # 每日统计 txt 之类需要以文件形式发出的附件
+                                if hb.file_path and hb.file_path.is_file():
+                                    time.sleep(0.2)
+                                    logger.info("[%s] 发送文件: %s", group, hb.file_path.name)
+                                    self._safe_send_file(wx, str(hb.file_path.resolve()), group)
                                 if hb.sticker_path and hb.sticker_path.is_file():
                                     time.sleep(0.2)
                                     self._safe_send_file(wx, str(hb.sticker_path.resolve()), group)

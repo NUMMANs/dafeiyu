@@ -82,6 +82,8 @@ class BotResponse:
     bubbles: list[str] = field(default_factory=list)
     sticker_path: Path | None = None
     sticker_url: str | None = None
+    # 需要以「文件」形式发到群里的附件（如每日统计 txt），与 sticker_path 互不影响
+    file_path: Path | None = None
     mood: str = "happy"
     status: PetStatus | None = None
 
@@ -445,17 +447,27 @@ class DaFeiYuBotCore:
 
         会挡掉指令、原始 XML、纯符号这几类 —— 它们并进去只会污染判定，
         但「群还在说话」这件事由 _touch_pending 单独续期，不受影响。
+
+        攒满 TRIGGER_BURST_MAX_ITEMS（默认 5，与 L2 的上下文窗口一致）就把 due
+        拉到当前时刻：这一波已经够长了，不必再等停顿，整批一次性交给判定器。
         """
         body = (text or "").strip()
         if not body or not self._burst_item_ok(body):
             return
         burst = item.setdefault("burst", [])
-        if len(burst) >= settings.TRIGGER_BURST_MAX_ITEMS:
+        cap = max(1, settings.TRIGGER_BURST_MAX_ITEMS)
+        if len(burst) >= cap:
+            item["flushed"] = True
+            item["due"] = 0.0
             return
         who = (sender or "").strip()
         if burst and burst[-1].get("text") == body and (burst[-1].get("sender") or "") == who:
             return
         burst.append({"sender": who, "text": body})
+        if len(burst) >= cap:
+            # 已经攒满判定窗口：立刻送判，不再等停顿
+            item["flushed"] = True
+            item["due"] = 0.0
 
     def _defer_trigger(
         self,
@@ -471,7 +483,13 @@ class DaFeiYuBotCore:
         body = (text or "").strip()
         with self._pending_lock:
             existing = self._pending_trigger.get(group_id)
-            if existing is not None and existing.get("kind") == kind:
+            if existing is not None:
+                if existing.get("flushed"):
+                    # 这一波已经攒满、正在等发车，新来的没赶上，交给下一轮
+                    return
+                # 同一波里既像「接我话」又像「冷场开话题」时，接我话优先级更高（信号更明确）
+                if kind == "l2" and existing.get("kind") != "l2":
+                    existing["kind"] = "l2"
                 # 同一波对话里的后续发言：保留已有 burst，只续期
                 existing["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
                 if quoted_sender:
@@ -501,7 +519,7 @@ class DaFeiYuBotCore:
         body = (text or "").strip()
         with self._pending_lock:
             item = self._pending_trigger.get(group_id)
-            if item is None:
+            if item is None or item.get("flushed"):
                 return
             item["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
             self._append_burst_locked(item, sender, body)
@@ -1395,26 +1413,28 @@ class DaFeiYuBotCore:
             status=new_status,
         )
 
-    def _maybe_write_daily_metrics(self) -> None:
+    def _maybe_write_daily_metrics(self) -> Path | None:
         """
         每天 0:00 之后出一份前一日的 L2/L2.5 子代理调用统计 txt。
 
         纯代码统计（计数文件 + 历史表），不调用任何模型。
         0~4 点之间都可以补跑（进程半夜重启也不丢），每份只写一次。
+        返回刚生成的 txt 路径；没到点或已经生成过则返回 None。
         """
         dt = datetime.now()
         if dt.hour >= 4:
-            return
+            return None
         target = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
         if self._last_metrics_date == target:
-            return
+            return None
         try:
             path = metrics.write_report(target)
         except Exception as exc:
             logger.warning("生成 %s 的调用统计失败: %s", target, exc)
-            return
+            return None
         self._last_metrics_date = target
         logger.info("📊 已生成 %s 的 L2/L2.5 调用统计: %s", target, path)
+        return path
 
     def _maybe_run_nightly_maintenance(self, group_id: str, status=None) -> None:
         """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个逻辑日只跑一次。"""
@@ -1483,7 +1503,17 @@ class DaFeiYuBotCore:
         self._maybe_run_nightly_maintenance(group_id, status)
 
         # 0.1 每天 0:00 之后出一份前一日 L2/L2.5 子代理调用统计（纯代码，不调模型）
-        self._maybe_write_daily_metrics()
+        report_path = self._maybe_write_daily_metrics()
+        if report_path is not None and not self.is_quiet_hours():
+            # 静默期已改成 1:00 起，0 点这段专门留给日报：连 txt 一起发到群里
+            day_label = report_path.stem.rsplit("_", 1)[-1]
+            return BotResponse(
+                should_reply=True,
+                text=f"📊 {day_label} 的 L2/L2.5 子代理调用统计出来了（见附件）",
+                file_path=report_path,
+                mood="smug",
+                status=status,
+            )
 
         if not settings.ENABLE_SCHEDULED_BUBBLE or self.is_quiet_hours():
             return None

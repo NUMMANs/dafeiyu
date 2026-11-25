@@ -60,8 +60,9 @@ class Settings:
     SERPER_API_KEY: str = os.getenv("SERPER_API_KEY", "").strip()
     # L2/L2.5 判定去抖：群里连续发言时先挂起，等这一波说完（停顿）再判定
     ENABLE_TRIGGER_DEBOUNCE: bool = _parse_bool(os.getenv("ENABLE_TRIGGER_DEBOUNCE"), True)
-    # 停顿多少秒算「这一波说完了」，之后才执行判定
-    TRIGGER_DEBOUNCE_SEC: float = float(os.getenv("TRIGGER_DEBOUNCE_SEC", "1.5"))
+    # 停顿多少秒算「这一波说完了」，之后才执行判定。
+    # 必须大于群友两句之间的常见间隔，否则 3 秒一条的连发会被拆成两次判定（各判一次）。
+    TRIGGER_DEBOUNCE_SEC: float = float(os.getenv("TRIGGER_DEBOUNCE_SEC", "4.0"))
     # 群里一直不停顿时的最大等待：从第一句挂起算起超过这个秒数就强制判定，防止永远排不上
     TRIGGER_DEBOUNCE_MAX_WAIT_SEC: float = float(os.getenv("TRIGGER_DEBOUNCE_MAX_WAIT_SEC", "12"))
 
@@ -72,14 +73,15 @@ class Settings:
     TOPIC_GAP_SEC: int = int(os.getenv("TOPIC_GAP_SEC", "600"))
     # 判定器认为「有意思」的最低把握度（0~1）。模型输出 0-10 分，低于该值不接话
     TOPIC_ROAST_MIN_SCORE: float = float(os.getenv("TOPIC_ROAST_MIN_SCORE", "0.7"))
-    # 一波连续发言最多合并几句送给判定器（防止长串刷屏把 prompt 撑爆）
-    TRIGGER_BURST_MAX_ITEMS: int = int(os.getenv("TRIGGER_BURST_MAX_ITEMS", "4"))
+    # 一波连续发言最多合并几句送给判定器（攒满就立刻整批送出，不等停顿）
+    TRIGGER_BURST_MAX_ITEMS: int = int(os.getenv("TRIGGER_BURST_MAX_ITEMS", "5"))
 
     ENABLE_PROACTIVE_CHIME: bool = _parse_bool(os.getenv("ENABLE_PROACTIVE_CHIME"), True)
     PROACTIVE_MSG_THRESHOLD: int = int(os.getenv("PROACTIVE_MSG_THRESHOLD", "6"))
     PROACTIVE_COOLDOWN_SEC: int = int(os.getenv("PROACTIVE_COOLDOWN_SEC", "480"))
     ENABLE_SCHEDULED_BUBBLE: bool = _parse_bool(os.getenv("ENABLE_SCHEDULED_BUBBLE"), True)
-    QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "23"))
+    # 静默期：默认只从凌晨 1 点睡到 8 点，0 点这段留着发每日统计
+    QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))
 
     # 常规桌面 Agent 电脑操作权限
