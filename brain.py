@@ -27,8 +27,7 @@ from agent_tools import (
 from config import settings
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
-from memory import memory_store
-from persona_rag import retrieve_style_hints
+from memory import estimate_tokens, memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
 from roles.build_card import evolve_persona, get_active_persona, load_card
@@ -360,13 +359,38 @@ def _build_system_prompt(
     recalled_memory: str = "",
     matched_slang: str = "",
     emotion_desc: str = "",
-    style_hints: str = "",
     diary_note: str = "",
 ) -> str:
+    """
+    system 里只放人设卡这一块「每轮完全一致」的稳定文本。
+
+    为什么动态内容不在这儿：L3 全量注入后单次 prompt 已经 7.9 万 tk（实测），
+    DeepSeek 的前缀缓存要求从第一个 token 起严格一致。以前 system 第一行是
+    `【当前时间】YYYY-MM-DD HH:MM:SS`，每轮都变 —— 实测同样内容第二次调用本可
+    命中 99.8%，只要改掉开头的时间戳，命中率立刻掉到 0%，等于每轮都按全价计费。
+    所以时间、召回旧事、日记、黑话、情绪这些每轮都变的东西统一挪到最后一条
+    user 消息里（见 _build_turn_context），system 保持静态，把缓存吃满。
+
+    参数保留只是为了兼容旧调用方，函数内不再使用。
+    """
+    return load_card()
+
+
+def _build_turn_context(
+    status: PetStatus,
+    sender: str,
+    user_affinity: dict,
+    recalled_memory: str = "",
+    matched_slang: str = "",
+    emotion_desc: str = "",
+    diary_note: str = "",
+) -> str:
+    """本轮动态上下文（时间/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    card_text = load_card()
-    # 【实时状态】块已按需求移除（饱食度/段位/好感度不再注入 system）。
-    # 这三个参数保留在签名里只是为了让调用方不用改，函数内不再使用。
+    # 【实时状态】块已按需求移除（饱食度/段位/好感度不再注入）。
+    # 【本轮真实原声语感参考】（persona_rag 场景召回）也已移除：
+    # 它只按场景类别匹配、不看语义，经常给打游戏的对话塞「出门买罪受」这种无关原话，
+    # 反而让模型把无关名词带进回复。语料文件保留，随时可以重新接回来。
     extra_blocks = []
     if recalled_memory:
         extra_blocks.append(recalled_memory)
@@ -376,14 +400,101 @@ def _build_system_prompt(
         extra_blocks.append(matched_slang)
     if emotion_desc:
         extra_blocks.append(emotion_desc)
-    if style_hints:
-        extra_blocks.append(style_hints)
-    extra_text = ("\n" + "\n".join(extra_blocks) + "\n") if extra_blocks else ""
-    return (
-        f"【当前时间】{now_str}（Asia/Shanghai）\n"
-        f"{extra_text}"
-        f"{card_text}\n"
-    )
+    extra_text = "\n".join(extra_blocks)
+    parts = [f"【当前时间】{now_str}（Asia/Shanghai）"]
+    if extra_text:
+        parts.append(extra_text)
+    return "\n".join(parts) + "\n"
+
+
+_WXID_PREFIX_RE = re.compile(r"^wxid_[0-9a-zA-Z_\-]{4,}:\s*")
+_XML_HEAD_RE = re.compile(r"<\?xml|&lt;\?xml|<msg>|<appmsg")
+_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S)
+_ESC_TITLE_RE = re.compile(r"&lt;title&gt;(.*?)&lt;/title&gt;", re.S)
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
+_TAG_RE = re.compile(r"<[^>]{1,600}>")
+_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&amp;", "&"))
+
+
+def _clean_l3_content(raw: str, limit: int = 260) -> str:
+    """
+    清洗一条 L3 历史再注入。
+
+    以前只取最近 20 条，脏数据露不出来；改成整层注入后，947 条里有 149 条是
+    「wxid_xxx:\\n<?xml version=1.0?><msg><appmsg>…」这种没解析干净的卡片原文，
+    最长一条上万字符、合计吃掉 4 万多 token，等于每轮都在给模型喂一堆 XML 标签。
+    这里把 wxid 前缀剥掉，XML 卡片只留 <title>（「给你发了一个红包」这类真正有信息量的部分），
+    再压掉连续空白并截断，避免单条长文占满预算。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = _WXID_PREFIX_RE.sub("", s)
+    if _XML_HEAD_RE.search(s):
+        m = _TITLE_RE.search(s) or _ESC_TITLE_RE.search(s)
+        title = ""
+        if m:
+            title = _CDATA_RE.sub(r"\1", m.group(1))
+            title = _TAG_RE.sub("", title)
+            for a, b in _ENTITIES:
+                title = title.replace(a, b)
+            title = " ".join(title.split())[:60]
+        s = f"[卡片] {title}" if title else "[卡片消息]"
+    else:
+        s = _TAG_RE.sub("", s)
+    s = " ".join(s.split())
+    return s[:limit]
+
+
+def _select_l3_history(recent_history: list[dict], sender: str, text: str) -> list[dict]:
+    """
+    决定这一轮把 L3 会话层的哪些消息塞给模型。
+
+    - 默认（L3_INJECT_ALL=1）：整层全部注入，让模型看得到群里从头到尾聊了什么；
+    - 受 L3_INJECT_MAX_TOKENS 约束：从最新往回累加，超预算就停，最旧的那批不注入；
+    - L3_INJECT_ALL=0 时退回老行为：只带最近 L3_HISTORY_LIMIT 条。
+    末尾刚落库的「当前这句」永远剔除，避免同一条重复出现两次。
+    每条都先过 _clean_l3_content（剥 wxid 前缀、精简 XML 卡片、截断超长文本）。
+    """
+    items = list(recent_history or [])
+    if (
+        items
+        and items[-1].get("role") == "user"
+        and items[-1].get("sender") == sender
+        and (items[-1].get("content") or "").strip() == text.strip()
+    ):
+        items = items[:-1]
+
+    if not settings.L3_INJECT_ALL:
+        limit = settings.L3_HISTORY_LIMIT
+        return items[-limit:] if limit else []
+
+    budget = settings.L3_INJECT_MAX_TOKENS
+    picked: list[dict] = []
+    used = 0
+    for item in reversed(items):
+        content = _clean_l3_content(item.get("content") or "")
+        if not content and item.get("image_path"):
+            content = "[发了一张图片]"
+        if not content:
+            continue
+        cost = estimate_tokens(content) + 6
+        if picked and used + cost > budget:
+            break
+        picked.append({**item, "content": content})
+        used += cost
+    picked.reverse()
+    if len(picked) < len(items):
+        logger.warning(
+            "L3 整层注入超预算：共 %d 条，只注入最近 %d 条（约 %d tk / 上限 %d tk）；建议调低 L3_CONTEXT_LIMIT_TOKENS 让压缩早点生效",
+            len(items),
+            len(picked),
+            used,
+            budget,
+        )
+    else:
+        logger.info("L3 整层注入：%d 条，约 %d tk", len(picked), used)
+    return picked
 
 
 def _looks_like_param_rejection(exc: Exception) -> bool:
@@ -534,8 +645,8 @@ class DaFeiYuBrain:
             b = split_human_bubbles(demo)
             return BrainReply(text="\n".join(b), bubbles=b, mood="happy", tokens_used=0, used_vision=False)
 
-        # L1 识海按需召回 + 群黑话命中注入 + 情绪惯性状态机 + 语境语感 RAG
-        active_persona = get_active_persona()
+        # L1 识海按需召回 + 群黑话命中注入 + 情绪惯性状态机
+        # （语境语感 RAG 已按需求下线，persona_rag.py 与语料文件保留未删）
         role_name, voice_hint, tail_word = _persona_voice_profile()
         # 只用这句话本身去召回：把 sender 也拼进查询会让「这条记忆的 tags 里有这个人」
         # 变成命中条件，于是这个人以后说的每一句（哪怕只有一个「行」）都会把它召回。
@@ -545,33 +656,24 @@ class DaFeiYuBrain:
         )
         matched_slang = slang_book.render_matched(group_id, text)
         emotion_desc = emotion_sm.describe(group_id)
-        style_hints = retrieve_style_hints(
-            active_persona,
-            text,
-            recent_history=recent_history,
-            group_id=group_id,
-            top_k=2,
-        )
-        system_prompt = _build_system_prompt(
+        turn_context = _build_turn_context(
             status,
             sender,
             user_affinity,
             recalled_memory=recalled_memory,
             matched_slang=matched_slang,
             emotion_desc=emotion_desc,
-            style_hints=style_hints,
             diary_note=diary_note,
         )
-        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效
+        messages: list[dict] = [
+            {"role": "system", "content": _build_system_prompt(status, sender, user_affinity)}
+        ]
 
-        # L3 会话层：带最近 N 条群聊上下文（默认 20，L3_HISTORY_LIMIT 可调），
-        # 让大肥鱼真正跟得上群里聊的每一句。这一层是四层里唯一可以丢的：
-        # 超过 L3_CONTEXT_LIMIT_TOKENS 时由 bot_core._compress_l3 每天 0 点压缩。
-        l3_limit = settings.L3_HISTORY_LIMIT
-        history_slice = recent_history[-(l3_limit + 1) :] if l3_limit else []
-        if history_slice and history_slice[-1].get("role") == "user" and history_slice[-1].get("sender") == sender and (history_slice[-1].get("content") or "").strip() == text.strip():
-            history_slice = history_slice[:-1]
-        for item in (history_slice[-l3_limit:] if l3_limit else []):
+        # L3 会话层：默认注入整层历史（L3_INJECT_ALL=1），让大肥鱼能看到群里全部的来龙去脉。
+        # 整层太长时按 L3_INJECT_MAX_TOKENS 从最旧的往前砍，绝不会撑爆上下文。
+        # 这一层是四层里唯一可以丢的：超过 L3_CONTEXT_LIMIT_TOKENS 时由 bot_core._compress_l3 每天 0 点压缩。
+        for item in _select_l3_history(recent_history, sender, text):
             role = "assistant" if item["role"] == "assistant" else "user"
             prefix = "" if role == "assistant" else f"[{item['sender']}]: "
             content = item["content"] or ("[发了一张图片]" if item.get("image_path") else "")
@@ -659,6 +761,19 @@ class DaFeiYuBrain:
             client = self._get_chat_client()
             model = settings.DEEPSEEK_CHAT_MODEL
             used_vision = False
+
+        # 把本轮动态块（时间/旧事/日记/黑话/情绪）挂到最后一条 user 消息最前面。
+        # 这样 system + 历史消息构成从头到尾都一致的前缀，DeepSeek 前缀缓存才能命中。
+        if turn_context:
+            for msg in reversed(messages):
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    msg["content"] = [{"type": "text", "text": turn_context}] + content
+                elif isinstance(content, str):
+                    msg["content"] = turn_context + content
+                break
 
         used_search = bool(not used_vision and "pre_searched_block" in locals() and pre_searched_block)
         is_code_or_file_task = (not used_vision) and any(c in text.lower() for c in CODE_OR_FILE_CUES)

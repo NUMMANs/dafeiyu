@@ -89,7 +89,11 @@ class Settings:
     # 四层记忆：夜间是否用一次轻量调用从当天群里提炼 L1 事实（否则只靠模型自己想起来记）
     MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
 
-    # L3 会话层：每次回复带多少条近期对话（原写死 20），0 表示不带
+    # L3 会话层：是否把整层历史全部注入（推荐开，配合 token 安全阀使用）
+    L3_INJECT_ALL: bool = _parse_bool(os.getenv("L3_INJECT_ALL"), True)
+    # L3 全量注入时的 token 安全阀：从最新往回累加，超了就砍最旧的（防撑爆上下文）
+    L3_INJECT_MAX_TOKENS: int = max(2_000, int(os.getenv("L3_INJECT_MAX_TOKENS", "90000")))
+    # L3_INJECT_ALL=0 时才生效：每次回复只带最近 N 条（原写死 20），0 表示一条都不带
     L3_HISTORY_LIMIT: int = max(0, int(os.getenv("L3_HISTORY_LIMIT", "20")))
     # L3 会话层：整层占用超过多少 token 就压缩（每天 0 点后检查一次，按群判断）
     L3_CONTEXT_LIMIT_TOKENS: int = max(10_000, int(os.getenv("L3_CONTEXT_LIMIT_TOKENS", "300000")))

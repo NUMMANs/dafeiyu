@@ -1292,10 +1292,13 @@ class DaFeiYuBotCore:
                 quoted_sender=quoted_sender,
             )
 
-        # 6. 调用 DeepSeek 多模态大脑（L3 会话层：多取 1 条用于排除当前这句，默认共 20 条）
+        # 6. 调用 DeepSeek 多模态大脑（L3 会话层：默认注入整层历史，让参考话语尽可能多）
         status = pet_engine.get_status()
         user_aff = pet_engine.get_user_affinity(group_id, sender)
-        recent = pet_engine.get_recent_history(group_id, limit=settings.L3_HISTORY_LIMIT + 2)
+        if settings.L3_INJECT_ALL:
+            recent = pet_engine.list_history(group_id)
+        else:
+            recent = pet_engine.get_recent_history(group_id, limit=settings.L3_HISTORY_LIMIT + 2)
         # 去抖路径下 text 是「这一波的合并文本」，与历史里已落库的单条重复，
         # 先把这些单条从历史里摘掉，避免模型以为群友把同一句说了两遍
         if history_strip:
