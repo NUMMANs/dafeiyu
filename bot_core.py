@@ -106,6 +106,11 @@ DISPATCH_ACKS = (
     "行，这就去弄，一会儿给你结果",
 )
 
+# 「你刚干完的活」这条轮次提示保留多久（秒）。
+# 太短接不上群友追问，太长每轮都往最后一条 user 里多塞一百来字、还容易让模型自己
+# 反复提这件事。半小时够覆盖一轮追聊。
+DSH_DONE_NOTE_TTL_SEC = 1800
+
 
 def _execute_confirmed_action(group_id: str, sender: str, item: dict) -> tuple[str, Path | None]:
     action_type = str(item.get("action_type") or "")
@@ -194,6 +199,9 @@ class DaFeiYuBotCore:
         self._last_l3_check_day: dict[str, str] = {}
         # 工具路由：正在后台跑 DSH 任务的群（群号 → {job_id, task, sender, since, deadline}）
         self._dsh_running: dict[str, dict] = {}
+        # 刚干完的后台活（群号 → {job_id, task, status, summary, artifacts, at}）。
+        # 用来在后续几轮里给模型一个明确归属：这活是她自己干的，不是群友干的。
+        self._dsh_done: dict[str, dict] = {}
 
     def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
         """峰哥人设不发表情包（仅保留搜图/截屏/文件等功能性附件），塔菲人设正常发表情包。"""
@@ -1352,16 +1360,64 @@ class DaFeiYuBotCore:
         return info
 
     def _bg_note(self, group_id: str) -> str:
-        """大肥鱼回复时告诉她「后台还有活在跑」，避免她重复派活或假装已经做完。"""
+        """给模型补一句「后台这活是谁的」：还在跑就说在跑，刚跑完就说刚跑完。"""
         info = self._dsh_busy(group_id)
-        if not info:
+        if info:
+            task = str(info.get("task") or "")[:60]
+            return (
+                f"【后台工作中】你刚把「{task}」派给执行助手了，现在还在后台跑"
+                f"（已 {int(info.get('elapsed') or 0)} 秒）。\n"
+                "别重复派活，也别说“我这就去做”；有人问进度就照实说还在弄，问别的正常聊。"
+            )
+
+        done = self._recent_done_job(group_id)
+        if not done:
             return ""
-        task = str(info.get("task") or "")[:60]
+        when = time.strftime("%H:%M", time.localtime(float(done.get("at") or 0.0)))
+        note = f"【你自己刚干完的活】{when} 你已经自己把「{done.get('task')}」干完了"
+        status = str(done.get("status") or "done")
+        if status != "done":
+            note += "（没弄成）"
+        summary = str(done.get("summary") or "").strip()
+        if summary:
+            note += f"，结果：{summary}"
+        files = done.get("artifacts") or []
+        if files:
+            note += f"，产出：{'、'.join(files)}"
         return (
-            f"【后台工作中】你刚把「{task}」派给执行助手了，现在还在后台跑"
-            f"（已 {int(info.get('elapsed') or 0)} 秒）。\n"
-            "别重复派活，也别说“我这就去做”；有人问进度就照实说还在弄，问别的正常聊。"
+            note + "。\n"
+            "这活从头到尾是你自己干的，群友只是提了这个需求。有人喊累、抱怨忙的时候，"
+            "别把这件活说成是他干的，也别拿群里的消息量往某个人头上安——你不清楚他在忙什么，"
+            "就顺口关心一句或问一嘴，别替人家编今天干了啥。"
         )
+
+    def note_job_delivered(self, group_id: str, done: dict, spoken: str = "") -> None:
+        """
+        记下「这个群刚干完什么活」，供后面几轮的回复判断归属。
+
+        没这条记录时，模型在 L3 里只看到一条自己说过的「整理今天群里的会话 → 本群 249 条
+        消息…」，会把它当成一段群聊背景；这时群友来一句「累死爹了」，它就把 249 条消息
+        算到人家头上，回出「这活儿确实磨人，一天二百多条消息捋下来」——活明明是它自己干的。
+        """
+        self._dsh_running.pop(group_id, None)
+        self._dsh_done[group_id] = {
+            "job_id": str(done.get("job_id") or ""),
+            "task": str(done.get("task") or "").strip()[:60],
+            "status": str(done.get("status") or "done"),
+            "summary": " ".join(str(done.get("summary") or "").split())[:120],
+            "artifacts": [Path(str(p)).name for p in (done.get("_artifacts") or [])][:3],
+            "spoken": (spoken or "").strip()[:100],
+            "at": time.time(),
+        }
+
+    def _recent_done_job(self, group_id: str) -> dict | None:
+        info = self._dsh_done.get(group_id)
+        if not info:
+            return None
+        if time.time() - float(info.get("at") or 0.0) > DSH_DONE_NOTE_TTL_SEC:
+            self._dsh_done.pop(group_id, None)
+            return None
+        return info
 
     def _route_tool_task(self, group_id: str, sender: str, text: str) -> str:
         """

@@ -628,8 +628,18 @@ class WxAutoAdapter:
                                 time.sleep(0.3)
                                 self._safe_send_file(wx, str(art.resolve()), target_group, "任务产出文件")
 
-                            # 4) 补写 L3：大肥鱼下次得知道自己干过这件事，群友追问才能接上。
+                            # 4) 记一笔「这个群刚干完什么活」：之后半小时内大肥鱼每轮回复都会带上
+                            #    归属提示——活是她自己在后台干的，不是群友干的。缺了这条，模型会把
+                            #    「整理 249 条消息」当成群友当天的经历，别人一喊累就接错人。
+                            try:
+                                bot_core.note_job_delivered(target_group, done_job, spoken)
+                            except Exception as note_exc:
+                                logger.warning("记录 DSH 任务完成状态失败: %s", note_exc)
+
+                            # 5) 补写 L3：大肥鱼下次得知道自己干过这件事，群友追问才能接上。
                             #    记两条——原始结果（事实，含路径数字）和她当时说的话（口吻）。
+                            #    归属标记必须放开头：L3 注入时每条只留 260 字（_clean_l3_content），
+                            #    写在尾巴上的话必然被截掉，等于没写。
                             try:
                                 summary_txt = str(done_job.get("summary") or "").strip()
                                 task_txt = str(done_job.get("task") or "").strip()[:80]
@@ -637,7 +647,9 @@ class WxAutoAdapter:
                                     group_id=target_group,
                                     sender=settings.BOT_NAME,
                                     role="assistant",
-                                    content=(f"[后台任务结果] {task_txt} → {summary_txt}")[:800],
+                                    content=(
+                                        f"[我的后台任务·这活是我自己干的，不是群友干的] {task_txt} → {summary_txt}"
+                                    )[:800],
                                 )
                                 if spoken != mechanical_text:
                                     pet_engine.append_history(
