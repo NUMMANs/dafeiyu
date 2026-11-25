@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -404,6 +405,71 @@ def _read_job_meta(job_dir: Path) -> dict[str, Any]:
     return _read_json(job_dir / "job.json") or {}
 
 
+# ----------------------------------------------------------------------
+# 本次任务花了多少钱
+# ----------------------------------------------------------------------
+# DeepSeek 官方价，单位「元 / 百万 tokens」（2026-09-10 12:00 起执行，deepseek-flash）：
+#             缓存命中   缓存未命中   输出
+#   空闲       0.02       1.0        4.0
+#   高峰       0.04       2.0        8.0     ← 高峰＝工作日的 9:00-12:00、14:00-18:00（北京时间）
+# deepseek-v4-pro 自 2026-09-14 起整体路由到 flash 并按其单价计费，所以统一用这张表算。
+_PRICE_FLASH = {"hit": (0.02, 0.04), "miss": (1.0, 2.0), "out": (4.0, 8.0)}
+_PEAK_WINDOWS = ((9 * 60, 12 * 60), (14 * 60, 18 * 60))
+_CST = timezone(timedelta(hours=8))
+
+
+def _is_peak_hour(ts: float) -> bool:
+    """北京时间工作日 9-12 点、14-18 点为高峰，其余（含周末）算空闲。"""
+    dt = datetime.fromtimestamp(ts or time.time(), _CST)
+    if dt.weekday() >= 5:
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    return any(start <= minutes < end for start, end in _PEAK_WINDOWS)
+
+
+def job_cost(done_data: dict[str, Any]) -> dict[str, Any] | None:
+    """按 done.json 里记的 token 账算这次任务的 API 花费（元）。"""
+    usage = done_data.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    hit_tokens = int(usage.get("cacheReadTokens") or 0)
+    miss_tokens = int(usage.get("uncachedInputTokens") or 0)
+    out_tokens = int(usage.get("outputTokens") or 0)
+
+    peak = _is_peak_hour(float(done_data.get("started_at") or 0.0))
+    idx = 1 if peak else 0
+    hit_cost = hit_tokens * _PRICE_FLASH["hit"][idx] / 1_000_000
+    miss_cost = miss_tokens * _PRICE_FLASH["miss"][idx] / 1_000_000
+    out_cost = out_tokens * _PRICE_FLASH["out"][idx] / 1_000_000
+
+    return {
+        "total": hit_cost + miss_cost + out_cost,
+        "hit_cost": hit_cost,
+        "miss_cost": miss_cost,
+        "out_cost": out_cost,
+        "hit_tokens": hit_tokens,
+        "miss_tokens": miss_tokens,
+        "out_tokens": out_tokens,
+        "peak": peak,
+    }
+
+
+def format_cost_line(done_data: dict[str, Any]) -> str:
+    """一行话把花费和账目说清，放在机械汇报的第一行。"""
+    cost = job_cost(done_data)
+    if cost is None:
+        return "本次花费：未知（没拿到 DSH 的 token 统计，多半是任务没真正跑起来）"
+
+    model = str(done_data.get("model") or "deepseek-flash")
+    tier = "高峰价" if cost["peak"] else "空闲价"
+    return (
+        f"本次花费：¥{cost['total']:.4f}"
+        f"（{model} {tier}｜输入命中 {cost['hit_tokens']:,} / 未命中 {cost['miss_tokens']:,}"
+        f" / 输出 {cost['out_tokens']:,} tokens）"
+    )
+
+
 def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | None = None) -> Path | None:
     """
     把一次 DSH 任务的全部机械信息写成 txt，原样发给群，不经过任何模型。
@@ -439,6 +505,7 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
                 stderr_text = text
 
     lines = [
+        format_cost_line(done_data),
         "=" * 64,
         "大肥鱼 · DSH 后台任务机械汇报（本文件由代码生成，未经模型改写）",
         "=" * 64,

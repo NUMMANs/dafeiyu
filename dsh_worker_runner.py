@@ -95,6 +95,131 @@ def _atomic_write_text(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
+# ======================================================================
+# DSH 会话用量采集：算「这次任务花了多少钱」要拿它自己的 token 账
+# ======================================================================
+# DSH 把每个会话的 token 累计写进投影缓存（纯 JSON，不用解压 zstd 会话文件）：
+#   <home>/storages/session_projcache/sessions/session-<id>.json
+# 结构：record.rows.tokenUsage.val.totals = {uncachedInputTokens, outputTokens,
+#       cacheReadTokens, cacheWriteTokens}；model 在 record.rows.modelSelection.val.lastUsed.model
+# 会话目录按工作目录分桶：<home>/sessions/--C-Users-x-proj--/session-<id>/
+
+_USAGE_KEYS = ("uncachedInputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
+
+
+def _dsh_home() -> Path:
+    raw = (os.environ.get("DSH_HOME") or "").strip()
+    if raw:
+        try:
+            return Path(raw).expanduser()
+        except Exception:
+            pass
+    return Path.home() / ".dsh"
+
+
+def _project_key(cwd: str) -> str:
+    """复刻 DSH 的会话目录命名：分隔符折叠成 '-'，非法字符转 ~XXXX。"""
+    readable = ""
+    separator_run = False
+    for ch in cwd:
+        code = ord(ch)
+        if ch in ("/", "\\", ":"):
+            if not separator_run:
+                readable += "-"
+            separator_run = True
+        elif ch != "~" and re.fullmatch(r"[A-Za-z0-9._-]", ch):
+            readable += ch
+            separator_run = False
+        else:
+            readable += "~" + format(code, "04X")
+            separator_run = False
+    head = readable.lstrip("-") or "root"
+    return f"--{head[:251]}--"
+
+
+def _session_root(launch_cwd: str) -> Path:
+    return _dsh_home() / "sessions" / _project_key(launch_cwd)
+
+
+def _list_sessions(session_root: Path) -> list[Path]:
+    try:
+        return [p for p in session_root.iterdir() if p.is_dir() and p.name.startswith("session-")]
+    except Exception:
+        return []
+
+
+def _read_session_usage(session_name: str) -> dict | None:
+    """读一次会话的 token 累计与模型名；缓存读不到返回 None。"""
+    if not session_name:
+        return None
+    cache = _dsh_home() / "storages" / "session_projcache" / "sessions" / f"{session_name}.json"
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    rows = ((data.get("record") or {}).get("rows") or {})
+    totals = (((rows.get("tokenUsage") or {}).get("val") or {}).get("totals") or {})
+    if not isinstance(totals, dict):
+        totals = {}
+    model = str(
+        ((((rows.get("modelSelection") or {}).get("val") or {}).get("lastUsed") or {}).get("model")) or ""
+    )
+    usage = {key: int(totals.get(key) or 0) for key in _USAGE_KEYS}
+    usage["model"] = model
+    return usage
+
+
+def _read_session_usage_wait(session_name: str, wait_sec: float = 2.0) -> dict | None:
+    """投影缓存可能比进程退出晚一点点落盘，短暂重试。"""
+    deadline = time.time() + max(0.0, wait_sec)
+    while True:
+        usage = _read_session_usage(session_name)
+        if usage is not None:
+            return usage
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def _delta_usage(after: dict, before: dict) -> dict:
+    """续聊会往同一个会话累加，本次花费要减掉进来之前的账。"""
+    delta = {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in _USAGE_KEYS}
+    delta["model"] = after.get("model") or before.get("model") or ""
+    return delta
+
+
+def _session_created_at(session_name: str) -> float:
+    cache = _dsh_home() / "storages" / "session_projcache" / "sessions" / f"{session_name}.json"
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        ms = int((((data.get("record") or {}).get("identity") or {}).get("createdAt")) or 0)
+        return ms / 1000.0
+    except Exception:
+        return 0.0
+
+
+def _pick_new_session(session_root: Path, before: set[str], started_at: float, wait_sec: float = 3.0) -> str:
+    """找出本次任务新开的会话：优先按会话创建时间贴任务启动时间挑（同目录并发也不易串）。"""
+    deadline = time.time() + max(0.0, wait_sec)
+    while True:
+        fresh = [p for p in _list_sessions(session_root) if p.name not in before]
+        if fresh:
+            def _rank(p: Path) -> tuple[float, float]:
+                created = _session_created_at(p.name)
+                gap = abs(created - started_at) if created > 0 else 1e9
+                try:
+                    mtime = p.stat().st_mtime
+                except Exception:
+                    mtime = 0.0
+                return (gap, -mtime)
+
+            fresh.sort(key=_rank)
+            return fresh[0].name
+        if time.time() >= deadline:
+            return ""
+        time.sleep(0.25)
+
+
 def _decode_stream(data: str | bytes | None) -> str:
     if data is None:
         return ""
@@ -169,6 +294,12 @@ def main() -> int:
 
     cmd = _build_dsh_cmd(dsh_bin, session_id, mode, approval_policy, model)
 
+    # 记账基线：新会话靠「执行前后目录对比」找出自己那份；续聊靠「进来前的累计」做差
+    session_root = _session_root(str(launch_cwd))
+    sessions_before = {p.name for p in _list_sessions(session_root)}
+    requested_sid = session_id
+    usage_before = _read_session_usage(requested_sid) if requested_sid else None
+
     run_env = os.environ.copy()
     run_env["PYTHONUTF8"] = "1"
     run_env["PYTHONIOENCODING"] = "utf-8"
@@ -234,6 +365,27 @@ def main() -> int:
             job["session_id"] = session_id
             _atomic_write_text(job_path, json.dumps(job, ensure_ascii=False, indent=2))
 
+    # 本次任务的 token 账（不管成功失败，只要真调过模型就有）
+    # 注意：这里的会话 id 只用来对账，不回写 done.session_id——headless 会话的 cwd 可能
+    # 是临时启动目录，回写会让下一次 `/dsh 续` 真的去 resume 那个临时会话。
+    usage: dict = {}
+    model_used = ""
+    usage_session = ""
+    picked_session = ""
+    if requested_sid:
+        latest = _read_session_usage_wait(requested_sid)
+        if latest is not None:
+            picked_session = requested_sid
+            usage = _delta_usage(latest, usage_before) if usage_before else latest
+    if not picked_session:
+        found = _pick_new_session(session_root, sessions_before, started_at)
+        if found:
+            picked_session = found
+            usage = _read_session_usage_wait(found) or {}
+    if picked_session:
+        usage_session = picked_session
+        model_used = str(usage.pop("model", "") or "")
+
     finished_at = time.time()
     (job_dir / "stdout.txt").write_text(stdout_text, encoding="utf-8")
     (job_dir / "stderr.txt").write_text(stderr_text, encoding="utf-8")
@@ -251,6 +403,9 @@ def main() -> int:
         "finished_at": finished_at,
         "duration_sec": round(finished_at - started_at, 2),
         "summary": summary,
+        "usage": usage,
+        "model": model_used,
+        "usage_session": usage_session,
         "delivered": False,
     }
     _atomic_write_text(done_path, json.dumps(done_payload, ensure_ascii=False, indent=2))
