@@ -882,7 +882,7 @@ class DaFeiYuBrain:
                             if ok_dsh and isinstance(dsh_res, dict):
                                 tool_out = (
                                     f"已成功将任务异步派发到独立 DSH 后台进程（重启也不中断，不阻塞当前群聊）："
-                                    f"job_id={dsh_res['job_id']}, session_id={dsh_res['session_id']}。"
+                                    f"job_id={dsh_res['job_id']}, session_id={dsh_res['session_id'] or 'new'}。"
                                     "请直接用大肥鱼自然口吻先回复主人“收到，已派给后台 DSH 干活去了，干完会自动发回群里”。"
                                 )
                             else:

@@ -77,18 +77,53 @@ def _iter_job_dirs() -> list[Path]:
     return dirs
 
 
+def _is_valid_persisted_session_id(sid: str) -> bool:
+    clean = (sid or "").strip()
+    if not clean:
+        return False
+    # 兼容清理早期版本本地伪造的 dfy-xxxxxxxx 会话 ID（DSH 不接受未创建的自定义 session_id）
+    if clean.startswith("dfy-"):
+        return False
+    return True
+
+
 def get_last_session_id(group_id: str = "") -> str:
-    """获取指定群最近一次 DSH 任务的 session_id。"""
+    """获取指定群最近一次 DSH 任务真实落盘的 session_id。"""
     for jdir in _iter_job_dirs():
         job = _read_json(jdir / "job.json")
         if not job:
             continue
         if group_id and job.get("group_id") != group_id:
             continue
-        sid = str(job.get("session_id") or "").strip()
-        if sid:
-            return sid
+        done = _read_json(jdir / "done.json")
+        for candidate in (
+            (done or {}).get("session_id"),
+            job.get("session_id"),
+        ):
+            sid = str(candidate or "").strip()
+            if _is_valid_persisted_session_id(sid):
+                return sid
     return ""
+
+
+def get_last_job_context(group_id: str = "") -> dict[str, Any] | None:
+    """获取指定群最近一次已完成的 DSH 任务摘要（用于无持久化 session_id 时的续聊兜底）。"""
+    for jdir in _iter_job_dirs():
+        job = _read_json(jdir / "job.json")
+        if not job:
+            continue
+        if group_id and job.get("group_id") != group_id:
+            continue
+        done = _read_json(jdir / "done.json")
+        if not done or done.get("status") != "done":
+            continue
+        return {
+            "job_id": str(done.get("job_id") or job.get("job_id") or jdir.name),
+            "task": str(job.get("task") or ""),
+            "summary": str(done.get("summary") or ""),
+            "session_id": str(done.get("session_id") or job.get("session_id") or "").strip(),
+        }
+    return None
 
 
 def _resolve_workdir(workdir: str = "") -> Path:
@@ -145,12 +180,25 @@ def submit_dsh_job(
         return False, "未找到 DSH CLI，请确认已全局安装 @deepseek-ai/dsh 或检查 DSH_BIN 配置"
 
     req_sid = (session_id or "").strip()
+    prompt_text = clean_task
     if req_sid.lower() == "last":
-        resolved_sid = get_last_session_id(group_id) or f"dfy-{uuid.uuid4().hex[:8]}"
-    elif req_sid:
+        resolved_sid = get_last_session_id(group_id)
+        if not resolved_sid:
+            prev = get_last_job_context(group_id)
+            if prev:
+                prev_task = prev["task"][:300]
+                prev_summary = prev["summary"][:900]
+                prompt_text = (
+                    f"[续接上一轮任务上下文（#{prev['job_id']}）]\n"
+                    f"上一轮任务：{prev_task}\n"
+                    f"上一轮结果摘要：\n{prev_summary}\n\n"
+                    f"[本轮追问/追加要求]\n{clean_task}"
+                )
+    elif _is_valid_persisted_session_id(req_sid):
         resolved_sid = req_sid
     else:
-        resolved_sid = f"dfy-{uuid.uuid4().hex[:8]}"
+        # 新建会话必须省略 --session-id，由 DSH 自行创建会话
+        resolved_sid = ""
 
     resolved_workdir = _resolve_workdir(workdir)
     resolved_mode = (mode or settings.DSH_MODE or "danger-full-access").strip()
@@ -175,7 +223,7 @@ def submit_dsh_job(
 
     with _IO_LOCK:
         _atomic_write_text(job_dir / "job.json", json.dumps(job_payload, ensure_ascii=False, indent=2))
-        _atomic_write_text(job_dir / "prompt.txt", clean_task)
+        _atomic_write_text(job_dir / "prompt.txt", prompt_text)
 
     runner_script = BASE_DIR / "dsh_worker_runner.py"
     popen_kwargs: dict[str, Any] = {
@@ -241,7 +289,7 @@ def list_dsh_jobs(group_id: str = "", limit: int = 8) -> list[dict[str, Any]]:
         results.append(
             {
                 "job_id": job.get("job_id", jdir.name),
-                "session_id": job.get("session_id", ""),
+                "session_id": (done or {}).get("session_id") or job.get("session_id", ""),
                 "group_id": job.get("group_id", ""),
                 "sender": job.get("sender", ""),
                 "task": str(job.get("task") or ""),
@@ -306,6 +354,8 @@ def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
     lines = [header, f"📝 任务：{task_preview}"]
     if session_id:
         lines.append(f"🔗 会话：{session_id}（发 `/dsh 续 补充要求` 可继续追问）")
+    elif status == "done":
+        lines.append("💡 发 `/dsh 续 补充要求` 可基于本轮结果继续追问")
     if body_text:
         lines.append(f"\n{body_text}")
     if attach_path is not None:

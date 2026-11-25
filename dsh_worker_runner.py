@@ -45,6 +45,50 @@ def _has_conflicting_dotenv(target_dir: Path) -> bool:
     return False
 
 
+_SESSION_ID_RE = re.compile(
+    r"(?:session[_\-\s]?id|sessionId)\s*[:=]\s*[\"']?([A-Za-z0-9][A-Za-z0-9_\-]{5,})[\"']?",
+    re.IGNORECASE,
+)
+
+
+def _is_missing_session_error(stderr_text: str) -> bool:
+    low = (stderr_text or "").lower()
+    return "omit --session-id" in low or ("session" in low and "does not exist" in low)
+
+
+def _extract_session_id(stderr_text: str) -> str:
+    match = _SESSION_ID_RE.search(stderr_text or "")
+    if match:
+        cand = match.group(1).strip()
+        if cand and not cand.startswith("dfy-"):
+            return cand
+    return ""
+
+
+def _build_dsh_cmd(
+    dsh_bin: str,
+    session_id: str,
+    mode: str,
+    approval_policy: str,
+    model: str,
+) -> list[str]:
+    if os.name == "nt" and dsh_bin.lower().endswith((".cmd", ".bat")):
+        cmd = ["cmd.exe", "/c", dsh_bin]
+    else:
+        cmd = [dsh_bin]
+
+    cmd.extend(["--profile", "headless"])
+    if session_id and not session_id.startswith("dfy-"):
+        cmd.extend(["--session-id", session_id])
+    if mode:
+        cmd.extend(["--permission-mode", mode])
+    if approval_policy:
+        cmd.extend(["--approval-policy", approval_policy])
+    if model:
+        cmd.extend(["--model", model])
+    return cmd
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -103,6 +147,8 @@ def main() -> int:
 
     dsh_bin = str(job.get("dsh_bin") or "dsh")
     session_id = str(job.get("session_id") or "").strip()
+    if session_id.startswith("dfy-"):
+        session_id = ""
     mode = str(job.get("mode") or "danger-full-access").strip()
     approval_policy = str(job.get("approval_policy") or "never").strip()
     model = str(job.get("model") or "").strip()
@@ -121,20 +167,7 @@ def main() -> int:
             f"{prompt_text}"
         )
 
-    if os.name == "nt" and dsh_bin.lower().endswith((".cmd", ".bat")):
-        cmd = ["cmd.exe", "/c", dsh_bin]
-    else:
-        cmd = [dsh_bin]
-
-    cmd.extend(["--profile", "headless"])
-    if session_id:
-        cmd.extend(["--session-id", session_id])
-    if mode:
-        cmd.extend(["--permission-mode", mode])
-    if approval_policy:
-        cmd.extend(["--approval-policy", approval_policy])
-    if model:
-        cmd.extend(["--model", model])
+    cmd = _build_dsh_cmd(dsh_bin, session_id, mode, approval_policy, model)
 
     run_env = os.environ.copy()
     run_env["PYTHONUTF8"] = "1"
@@ -163,6 +196,24 @@ def main() -> int:
         exit_code = int(proc.returncode)
         stdout_text = proc.stdout or ""
         stderr_text = proc.stderr or ""
+        if exit_code != 0 and session_id and _is_missing_session_error(stderr_text):
+            # 若传入的旧 session_id 已失效，自动去掉 --session-id 重试一次以开启新会话
+            session_id = ""
+            retry_cmd = _build_dsh_cmd(dsh_bin, "", mode, approval_policy, model)
+            proc = subprocess.run(
+                retry_cmd,
+                cwd=launch_cwd,
+                input=prompt_text,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                env=run_env,
+            )
+            exit_code = int(proc.returncode)
+            stdout_text = proc.stdout or ""
+            stderr_text = proc.stderr or ""
         if exit_code != 0:
             status = "failed"
     except subprocess.TimeoutExpired as exc:
@@ -175,6 +226,13 @@ def main() -> int:
         status = "failed"
         exit_code = -2
         error_msg = f"启动 DSH 失败: {exc}"
+
+    if not session_id and status == "done":
+        discovered_sid = _extract_session_id(stderr_text)
+        if discovered_sid:
+            session_id = discovered_sid
+            job["session_id"] = session_id
+            _atomic_write_text(job_path, json.dumps(job, ensure_ascii=False, indent=2))
 
     finished_at = time.time()
     (job_dir / "stdout.txt").write_text(stdout_text, encoding="utf-8")

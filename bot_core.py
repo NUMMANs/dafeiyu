@@ -96,10 +96,11 @@ def _execute_confirmed_action(group_id: str, sender: str, item: dict) -> tuple[s
             workdir=str(params.get("workdir") or ""),
         )
         if ok and isinstance(payload, dict):
+            sid_label = payload.get("session_id") or "新建会话（DSH 自动分配）"
             return (
                 f"✅ 二次确认通过（`{code}`），已交给独立 DSH 后台开工！\n"
                 f"• 任务号：`{payload['job_id']}`\n"
-                f"• 会话ID：`{payload['session_id']}`\n"
+                f"• 会话ID：`{sid_label}`\n"
                 f"做完会自动发回群里。",
                 None,
             )
@@ -520,10 +521,11 @@ class DaFeiYuBotCore:
                 return BotResponse(should_reply=True, text=confirm_card, mood="shocked", status=st)
             ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task_text, session_id=sid)
             if ok and isinstance(payload, dict):
+                sid_label = payload.get("session_id") or "新建会话（DSH 自动分配）"
                 reply_text = (
                     f"🚀 已交给独立 DSH 后台开工（不卡群聊，重启也不中断）！\n"
                     f"• 任务号：`{payload['job_id']}`\n"
-                    f"• 会话ID：`{payload['session_id']}`\n"
+                    f"• 会话ID：`{sid_label}`\n"
                     f"做完会自动发回群里，中途发 `/dsh状态` 可看进度。"
                 )
                 return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
