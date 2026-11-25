@@ -1410,6 +1410,85 @@ class DaFeiYuBotCore:
         logger.info("🧰 已派活给执行助手 [%s] job=%s 任务=%s", group_id, job_id, task[:80])
         return task
 
+    def report_job_result(self, group_id: str, done: dict) -> BotResponse | None:
+        """
+        后台 DSH 任务跑完后，让大肥鱼用自己的口吻在群里说一句。
+
+        以前这里是直接把 `format_job_delivery()` 拼的机械文本发群——markdown 星号反引号
+        原样露出、Windows 路径大段摆在正文里，失败时还是 `dsh: session "dfy-xxx" does
+        not exist` 这种英文报错。现在机械信息全落到 txt 附件（不经过模型），聊天部分
+        交给大肥鱼：她看得到结果摘要，也看得到产出文件清单，用平时说话的方式交代一句。
+
+        返回 None 表示播报生成失败（没 key / 模型返空 / 异常），调用方退回发机械汇报。
+        """
+        sender = str(done.get("sender") or "").strip() or settings.BOT_NAME
+        task = str(done.get("task") or "").strip()
+        summary = str(done.get("summary") or "").strip()
+        status = str(done.get("status") or "done")
+        duration = done.get("duration_sec", 0)
+        artifacts = done.get("_artifacts") or []
+        report_path = str(done.get("_report_path") or "")
+
+        label = {"done": "完成", "timeout": "超时"}.get(status, "执行异常")
+        task_line = (task[:120] + "…") if len(task) > 120 else task
+        lines = [
+            "【后台任务结果】你之前派给执行助手的活已经跑完了，现在要跟群里说一声。",
+            f"派活的人：{sender}",
+            f"任务：{task_line}",
+            f"状态：{label}（耗时 {duration} 秒）",
+            f"结果摘要：\n{summary[:1200] if summary else '(执行助手没给摘要)'}",
+        ]
+        if artifacts:
+            names = "、".join(Path(str(p)).name for p in artifacts[:5])
+            lines.append(f"产出文件：{names}（这些我会连同任务报告一起自动发到群里，你不用再发，也别念文件路径）")
+        elif report_path:
+            lines.append("产出文件：无（任务报告 txt 会自动发到群里，你不用再发）")
+
+        if status == "done":
+            lines.append(
+                "怎么说：用你自己的口吻说 1~2 句，交代清做成了什么、结果在哪里；"
+                "顺着摘要说，别编摘要里没有的东西，别提“执行助手”“后台任务”这种词，"
+                "别用 Markdown、别贴代码块、别列长清单，就当普通群聊回一句。"
+            )
+        else:
+            lines.append(
+                "怎么说：用你自己的口吻说 1~2 句，老实说没弄成、卡在哪一步（把英文报错翻译成人话），"
+                "别道歉超过一次，别找借口，别用 Markdown。"
+            )
+
+        job_report = "\n".join(lines)
+        try:
+            brain_reply = brain.reply(
+                sender="系统",
+                text="后台任务已经跑完，请按下面这块要求，用你自己的口吻在群里说 1~2 句。",
+                status=pet_engine.get_status(),
+                user_affinity=pet_engine.get_user_affinity(group_id, sender),
+                recent_history=pet_engine.list_history(group_id),
+                group_id=group_id,
+                job_report=job_report,
+            )
+        except Exception as exc:
+            logger.warning("[%s] 生成后台任务播报失败: %s", group_id, exc)
+            return None
+        text = (brain_reply.text or "").strip()
+        # reply() 在模型返空时会塞一句「网卡了一下 刚才说啥来着」的闲聊兜底，
+        # 拿来当任务播报会把群友看懵，这种一律退回发机械汇报。
+        if not text or "网卡了一下" in text or "工具跑完一轮了" in text:
+            logger.warning("[%s] 后台任务播报无效（空内容或兜底文案），退回发机械汇报", group_id)
+            return None
+        # 播报不是回复某个人：模型偶尔会带「@某某：」前缀或 markdown 记号，清掉再发
+        text = re.sub(r"^@[\s:：]{0,3}\S{0,12}[：:]\s*", "", text).strip()
+        text = text.replace("**", "").replace("`", "").strip()
+        if not text:
+            return None
+        logger.info("[%s] 🗣️ 后台任务播报: %s", group_id, text[:100])
+        return BotResponse(
+            should_reply=True,
+            text=text,
+            mood="happy" if status == "done" else "sleepy",
+            status=pet_engine.get_status(),
+        )
+
     def _compose_reply(
         self,
         group_id: str,

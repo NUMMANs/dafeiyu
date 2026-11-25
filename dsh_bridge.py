@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -362,3 +363,254 @@ def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
         lines.append("\n📎 完整输出较长，已随附结果文本文件。")
 
     return "\n".join(lines), attach_path
+
+
+# ======================================================================
+# 机械汇报 txt + DSH 产出文件回传
+# ======================================================================
+
+_STATUS_LABEL = {"done": "完成", "timeout": "超时", "failed": "执行异常", "error": "执行异常"}
+
+# 值得往群里回传的产出文件类型（图片/文档/表格/代码/压缩包）
+_ARTIFACT_EXTS = {
+    ".md", ".txt", ".csv", ".json", ".xlsx", ".xls", ".docx", ".doc",
+    ".pdf", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".zip", ".py",
+    ".html", ".htm", ".yaml", ".yml", ".log", ".sql", ".drawio", ".svg",
+}
+
+# 目录扫描时跳过的路径片段：缓存、依赖、数据库和本模块自己的任务目录
+_SKIP_PATH_PARTS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vscode",
+    "dsh_jobs", "wechatauto_logs", "archive", "site-packages",
+}
+
+# 浅扫描额外要躲开的目录：这里放的是机器人自己的运行数据，不是任务产出
+_SCAN_SKIP_PARTS = _SKIP_PATH_PARTS | {"data", "state", "logs", "models", "media"}
+
+_SKIP_NAME_SUFFIXES = (".db", ".db-wal", ".db-shm", ".bak", ".pyc", ".tmp", ".log.old", ".jsonl")
+
+# DSH 输出里常见的两种路径写法：反引号包裹的路径、裸盘符路径
+_BACKTICK_RE = re.compile(r"`([^`\n]{4,300})`")
+_ABS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'`<>|*?\n\r]{2,300}")
+
+
+def _job_dir_of(done_data: dict[str, Any]) -> Path:
+    job_dir_str = str(done_data.get("_job_dir") or "").strip()
+    job_id = str(done_data.get("job_id") or "unknown")
+    return Path(job_dir_str) if job_dir_str else (DSH_JOBS_DIR / job_id)
+
+
+def _read_job_meta(job_dir: Path) -> dict[str, Any]:
+    return _read_json(job_dir / "job.json") or {}
+
+
+def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | None = None) -> Path | None:
+    """
+    把一次 DSH 任务的全部机械信息写成 txt，原样发给群，不经过任何模型。
+
+    以前这些内容被拼成一条几百字的微信群消息，markdown 星号反引号原样露出、
+    Windows 路径整条摆在正文里，失败时更糟——`dsh: session "dfy-xxx" does not exist`
+    这种英文报错直接甩群里。现在聊天部分交给大肥鱼用自己的话说，这些原始信息
+    一律落到附件里，想看细节的人自己点开。
+    """
+    job_dir = _job_dir_of(done_data)
+    job_id = str(done_data.get("job_id") or job_dir.name)
+    job_meta = _read_job_meta(job_dir)
+    status = str(done_data.get("status") or "done")
+    label = _STATUS_LABEL.get(status, status)
+
+    started_at = float(done_data.get("started_at") or job_meta.get("created_at") or 0.0)
+    finished_at = float(done_data.get("finished_at") or 0.0)
+
+    def _fmt_ts(ts: float) -> str:
+        if ts <= 0:
+            return "-"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+    stdout_text = ""
+    stderr_text = ""
+    for name, holder in (("stdout.txt", "out"), ("stderr.txt", "err")):
+        path = job_dir / name
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if holder == "out":
+                stdout_text = text
+            else:
+                stderr_text = text
+
+    lines = [
+        "=" * 64,
+        "大肥鱼 · DSH 后台任务机械汇报（本文件由代码生成，未经模型改写）",
+        "=" * 64,
+        "",
+        f"任务编号：{job_id}",
+        f"执行状态：{label}（status={status}）",
+        f"退出码：{done_data.get('exit_code')}",
+        f"派单人：{done_data.get('sender') or job_meta.get('sender') or '-'}",
+        f"会话 ID：{done_data.get('session_id') or '-'}",
+        f"开始时间：{_fmt_ts(started_at)}",
+        f"结束时间：{_fmt_ts(finished_at)}",
+        f"耗时：{done_data.get('duration_sec', 0)} 秒",
+        f"工作目录：{job_meta.get('workdir') or '-'}",
+        f"权限模式：{job_meta.get('mode') or '-'}",
+        "",
+        "-" * 64,
+        "【任务原文】",
+        "-" * 64,
+        str(done_data.get("task") or job_meta.get("task") or "").strip() or "(空)",
+        "",
+        "-" * 64,
+        "【结果摘要】",
+        "-" * 64,
+        str(done_data.get("summary") or "").strip() or "(无)",
+        "",
+    ]
+
+    if artifacts:
+        lines.extend(
+            ["-" * 64, "【本次回传的产出文件】", "-" * 64]
+            + [f"- {p}" for p in artifacts]
+            + [""]
+        )
+
+    lines.extend(
+        [
+            "-" * 64,
+            f"【完整标准输出】共 {len(stdout_text)} 字符",
+            "-" * 64,
+            stdout_text.strip() or "(空)",
+            "",
+        ]
+    )
+    if stderr_text.strip():
+        lines.extend(["-" * 64, "【标准错误输出】", "-" * 64, stderr_text.strip(), ""])
+    lines.append("=" * 64)
+
+    report_path = job_dir / f"报告_{job_id}.txt"
+    try:
+        _atomic_write_text(report_path, "\n".join(lines))
+        return report_path
+    except Exception as exc:
+        logger.warning("生成 DSH 机械汇报 txt 失败: %s", exc)
+        return None
+
+
+def _looks_like_artifact(path: Path, earliest_mtime: float, latest_mtime: float, max_bytes: int) -> bool:
+    try:
+        if not path.is_file():
+            return False
+        name_low = path.name.lower()
+        if name_low.endswith(_SKIP_NAME_SUFFIXES):
+            return False
+        if path.suffix.lower() not in _ARTIFACT_EXTS:
+            return False
+        st = path.stat()
+        if st.st_size <= 0 or st.st_size > max_bytes:
+            return False
+        # 只认「任务执行期间落盘」的文件：下界卡在任务开始前 30 秒（够容时钟误差，
+        # 又不会把任务开始前就存在的老文件算进来），上界卡在结束后 3 分钟——否则事后
+        # 被改动的其他文件（比如我自己在改的代码）也会被当成这次任务的产出发进群。
+        if st.st_mtime < earliest_mtime - 30:
+            return False
+        if latest_mtime > 0 and st.st_mtime > latest_mtime + 180:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def collect_artifacts(
+    done_data: dict[str, Any],
+    limit: int = 5,
+    max_mb: int = 20,
+    allow_scan: bool = True,
+) -> list[Path]:
+    """
+    找出这次任务真正产出的文件，供群里回传。
+
+    两条路，优先第一条（准）：
+    1. 从 DSH 自己的输出里抠路径——它的收尾语通常就是「文档已写入：`C:\\...\\x.md`」；
+    2. 抠不到就把工作目录浅扫一遍，只认「任务开始到结束后 3 分钟内落盘」的白名单类型文件
+       （跳过 .git / data / state / node_modules / 日志目录，避免把数据库、识海和运行日志
+       当成果发出去）。
+
+    上限 limit 个，按修改时间倒序取最新的。
+    """
+    if limit <= 0:
+        return []
+    job_dir = _job_dir_of(done_data)
+    job_meta = _read_job_meta(job_dir)
+    earliest = float(done_data.get("started_at") or job_meta.get("created_at") or 0.0)
+    latest = float(done_data.get("finished_at") or 0.0)
+    max_bytes = max(1, max_mb) * 1024 * 1024
+    skip_text = str(done_data.get("summary") or "")
+    for name in ("stdout.txt", "stderr.txt"):
+        f = job_dir / name
+        if f.is_file():
+            try:
+                skip_text += "\n" + f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def _try(raw: str, strict: bool = False) -> None:
+        if len(found) >= limit:
+            return
+        cand = raw.strip().strip("\"'`.,;:，。；：）)")
+        if not cand or len(cand) < 4:
+            return
+        skip_parts = _SCAN_SKIP_PARTS if strict else _SKIP_PATH_PARTS
+        try:
+            path = Path(cand).expanduser()
+            if not path.is_absolute():
+                return
+            key = str(path.resolve()).lower()
+        except Exception:
+            return
+        if key in seen:
+            return
+        if any(part.lower() in skip_parts for part in path.parts):
+            return
+        report_prefix = f"报告_{job_dir.name}"
+        if path.name.startswith(report_prefix) or path.name.startswith("dsh_result_"):
+            return
+        if _looks_like_artifact(path, earliest, latest, max_bytes):
+            seen.add(key)
+            found.append(path)
+
+    for match in _BACKTICK_RE.finditer(skip_text):
+        _try(match.group(1))
+    for match in _ABS_PATH_RE.finditer(skip_text):
+        _try(match.group(0))
+
+    # 只要 DSH 自己的话里点到了产物路径，就以它为准，不再去扫目录——
+    # 扫描是兜底手段，多扫一次反而容易把同期被改的源码、配置当成产出发出去。
+    if allow_scan and not found and len(found) < limit:
+        workdir_raw = str(job_meta.get("workdir") or "").strip()
+        root = Path(workdir_raw) if workdir_raw else BASE_DIR
+        if root.is_dir():
+            scanned = 0
+            for cur_dir, dir_names, file_names in os.walk(root):
+                cur = Path(cur_dir)
+                dir_names[:] = [
+                    d for d in dir_names
+                    if d.lower() not in _SCAN_SKIP_PARTS and not d.startswith(".")
+                ]
+                try:
+                    depth = len(cur.relative_to(root).parts)
+                except ValueError:
+                    depth = 0
+                if depth >= 3:
+                    dir_names[:] = []
+                for fname in file_names:
+                    scanned += 1
+                    if scanned > 4000:
+                        break
+                    _try(str(cur / fname), strict=True)
+                if scanned > 4000 or len(found) >= limit:
+                    break
+
+    found.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+    return found[:limit]

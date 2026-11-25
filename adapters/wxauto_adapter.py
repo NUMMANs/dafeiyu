@@ -8,7 +8,12 @@ from pathlib import Path
 
 from bot_core import bot_core
 from config import UPLOADS_DIR, settings
-from dsh_bridge import format_job_delivery, pop_finished_jobs
+from dsh_bridge import (
+    build_job_report_file,
+    collect_artifacts,
+    format_job_delivery,
+    pop_finished_jobs,
+)
 from pet_engine import pet_engine
 from scheduler import scheduler
 from self_ops import check_remote_update, consume_restart_notice, git_pull_and_check, request_restart
@@ -571,31 +576,78 @@ class WxAutoAdapter:
                             )
                             if not target_group:
                                 continue
-                            msg_text, attach_path = format_job_delivery(done_job)
-                            if not self._safe_send(wx, msg_text, target_group, "DSH 任务投递"):
-                                continue
-                            logger.info("🤖 已投递 DSH 任务 #%s 结果到 [%s]", done_job.get("job_id"), target_group)
-                            # 结果投递不经过大脑，得手动补一条 L3：否则大肥鱼下次完全不知道自己干过这件事，
-                            # 群友追问「弄好了吗」她只能装傻。
+
+                            # 1) 先把「机械信息」准备好：产出文件清单 + 完整报告 txt（都不经过模型）
+                            artifacts: list[Path] = []
                             try:
+                                artifacts = collect_artifacts(
+                                    done_job,
+                                    limit=settings.DSH_ARTIFACT_MAX,
+                                    max_mb=settings.DSH_ARTIFACT_MAX_MB,
+                                )
+                            except Exception as art_exc:
+                                logger.warning("收集 DSH 产出文件失败: %s", art_exc)
+                            report_path: Path | None = None
+                            try:
+                                report_path = build_job_report_file(done_job, artifacts)
+                            except Exception as rep_exc:
+                                logger.warning("生成 DSH 机械汇报失败: %s", rep_exc)
+                            done_job["_artifacts"] = [str(p) for p in artifacts]
+                            done_job["_report_path"] = str(report_path) if report_path else ""
+
+                            # 2) 聊天部分：让大肥鱼用自己的口吻播报；失败就退回机械汇报文本
+                            spoken = ""
+                            if settings.DSH_REPORT_BY_BOT:
+                                try:
+                                    resp = bot_core.report_job_result(target_group, done_job)
+                                    spoken = (resp.text or "").strip() if resp else ""
+                                except Exception as report_exc:
+                                    logger.warning("DSH 结果播报异常: %s", report_exc)
+                            mechanical_text, _legacy_attach = format_job_delivery(done_job)
+                            if not spoken:
+                                spoken = mechanical_text
+                            if not self._safe_send(wx, spoken, target_group, "DSH 任务投递"):
+                                continue
+                            logger.info(
+                                "🤖 已投递 DSH 任务 #%s 结果到 [%s]（播报 %d 字｜产出文件 %d 个｜报告 %s）",
+                                done_job.get("job_id"),
+                                target_group,
+                                len(spoken),
+                                len(artifacts),
+                                report_path.name if report_path else "无",
+                            )
+
+                            # 3) 附件：机械汇报 txt 优先，然后是 DSH 真正产出的文件。
+                            #    这些都是原样上传，不经过 LLM，避免模型把路径/数字说错。
+                            if report_path is not None and report_path.is_file() and report_path.stat().st_size > 0:
+                                time.sleep(0.3)
+                                self._safe_send_file(wx, str(report_path.resolve()), target_group, "任务报告")
+                            for art in artifacts:
+                                if not art.is_file() or art.stat().st_size <= 0:
+                                    continue
+                                time.sleep(0.3)
+                                self._safe_send_file(wx, str(art.resolve()), target_group, "任务产出文件")
+
+                            # 4) 补写 L3：大肥鱼下次得知道自己干过这件事，群友追问才能接上。
+                            #    记两条——原始结果（事实，含路径数字）和她当时说的话（口吻）。
+                            try:
+                                summary_txt = str(done_job.get("summary") or "").strip()
+                                task_txt = str(done_job.get("task") or "").strip()[:80]
                                 pet_engine.append_history(
                                     group_id=target_group,
                                     sender=settings.BOT_NAME,
                                     role="assistant",
-                                    content=(
-                                        "[后台任务结果] "
-                                        + str(done_job.get("summary") or msg_text)
-                                    )[:600],
+                                    content=(f"[后台任务结果] {task_txt} → {summary_txt}")[:800],
                                 )
+                                if spoken != mechanical_text:
+                                    pet_engine.append_history(
+                                        group_id=target_group,
+                                        sender=settings.BOT_NAME,
+                                        role="assistant",
+                                        content=spoken[:600],
+                                    )
                             except Exception as hist_exc:
                                 logger.warning("DSH 结果写入 L3 失败: %s", hist_exc)
-                            if (
-                                attach_path is not None
-                                and attach_path.is_file()
-                                and attach_path.stat().st_size > 0
-                            ):
-                                time.sleep(0.2)
-                                self._safe_send_file(wx, str(attach_path.resolve()), target_group)
                     except Exception as exc:
                         logger.warning("检查并投递 DSH 后台任务异常: %s", exc)
 

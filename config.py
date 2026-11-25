@@ -129,6 +129,15 @@ class Settings:
     ENABLE_TOOL_ROUTER: bool = _parse_bool(os.getenv("ENABLE_TOOL_ROUTER"), True)
     # 短于这么多字的消息不做判定（「在吗」「哈哈」「+1」不可能是活，省一次调用）
     TOOL_ROUTER_MIN_CHARS: int = max(2, int(os.getenv("TOOL_ROUTER_MIN_CHARS", "8")))
+    # 工具全部交给 DSH：True 时大肥鱼不再挂 13 个电脑工具（DSH 不可用也不挂），
+    # 干活一律走后台执行助手。False 时退回旧行为（DSH 不可用才挂电脑工具兜底）。
+    TOOLS_ALL_TO_DSH: bool = _parse_bool(os.getenv("TOOLS_ALL_TO_DSH"), True)
+    # DSH 任务跑完是否由大肥鱼用自己的口吻播报（False = 直接发机械汇报文本）
+    DSH_REPORT_BY_BOT: bool = _parse_bool(os.getenv("DSH_REPORT_BY_BOT"), True)
+    # 每个任务最多回传几个产出文件（0 = 不回传，只发机械汇报 txt）
+    DSH_ARTIFACT_MAX: int = max(0, int(os.getenv("DSH_ARTIFACT_MAX", "5")))
+    # 单个产出文件大小上限（MB），超过只发报告不发文件
+    DSH_ARTIFACT_MAX_MB: int = max(1, int(os.getenv("DSH_ARTIFACT_MAX_MB", "20")))
 
     # 高危操作群内二次确认保险
     ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)

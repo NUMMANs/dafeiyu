@@ -386,6 +386,7 @@ def _build_turn_context(
     emotion_desc: str = "",
     diary_note: str = "",
     bg_note: str = "",
+    job_report: str = "",
 ) -> str:
     """本轮动态上下文（时间/后台任务/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -394,6 +395,8 @@ def _build_turn_context(
     # 它只按场景类别匹配、不看语义，经常给打游戏的对话塞「出门买罪受」这种无关原话，
     # 反而让模型把无关名词带进回复。语料文件保留，随时可以重新接回来。
     extra_blocks = []
+    if job_report:
+        extra_blocks.append(job_report)
     if bg_note:
         extra_blocks.append(bg_note)
     if recalled_memory:
@@ -640,6 +643,7 @@ class DaFeiYuBrain:
         image_sender: str = "",
         roast_hint: str = "",
         bg_note: str = "",
+        job_report: str = "",
     ) -> BrainReply:
         if not settings.has_valid_api_key:
             if image_path is not None:
@@ -670,6 +674,7 @@ class DaFeiYuBrain:
             emotion_desc=emotion_desc,
             diary_note=diary_note,
             bg_note=bg_note,
+            job_report=job_report,
         )
         # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效
         messages: list[dict] = [
@@ -763,7 +768,12 @@ class DaFeiYuBrain:
                         }
                     )
                 else:
-                    messages.append({"role": "user", "content": f"[{sender}]: {text}"})
+                    if job_report:
+                        # 任务播报是系统指令，不是群友发言。加 [系统]: 前缀的话模型会
+                        # 跟着模仿群聊格式，实测回了一句「@：^）」这种莫名其妙的 @ 开头。
+                        messages.append({"role": "user", "content": text})
+                    else:
+                        messages.append({"role": "user", "content": f"[{sender}]: {text}"})
             client = self._get_chat_client()
             model = settings.DEEPSEEK_CHAT_MODEL
             used_vision = False
@@ -790,14 +800,22 @@ class DaFeiYuBrain:
                 temp = 0.45
                 freq_pen = 0.0
                 pres_pen = 0.0
+            elif job_report:
+                # 后台任务播报：要照实交代结果（路径、数字不能编），但措辞仍是个群友在说话
+                temp = 0.7
+                freq_pen = 0.3
+                pres_pen = 0.2
             else:
                 temp = 0.45 if used_search else (0.65 if used_vision else 1.0)
                 freq_pen = 0.1 if (used_search or used_vision) else 0.45
                 pres_pen = 0.0 if (used_search or used_vision) else 0.4
             # 开启桌面工具时给足 4096 max_tokens，防止 deepseek-flash 思考 + .html/.py 参数 JSON 被截断
             # 吐槽任务只发 1~2 句，160 足够，避免 owner 拿到 4096 后开始长篇大论
+            # 任务播报要交代清楚做了什么/结果在哪，但也不许写论文，700 封顶
             if roast_hint:
                 max_tokens = 160
+            elif job_report:
+                max_tokens = 700
             else:
                 max_tokens = 4096 if (not used_vision and is_owner(sender)) else (800 if used_vision else 260)
             kwargs: dict = {
@@ -812,14 +830,16 @@ class DaFeiYuBrain:
             available_tools = list(SEARCH_TOOLS) if (settings.ENABLE_WEB_SEARCH and not used_search) else [
                 t for t in SEARCH_TOOLS if t["function"]["name"] != "web_search"
             ]
-            if is_owner(sender) and _needs_agent_tools(text):
-                # 开了工具路由时，干活一律交给后台执行助手（DSH），不再把 13 个电脑工具
-                # 挂进大肥鱼：既省 1.4k tk，也避免「挂/不挂」来回切换让 2.6 万 token 的
-                # 前缀缓存整段作废。DSH 不可用时仍走老路，保证主人还能直接指挥本机。
+            if is_owner(sender) and _needs_agent_tools(text) and not settings.TOOLS_ALL_TO_DSH:
+                # TOOLS_ALL_TO_DSH=true（默认）：13 个电脑工具一律不挂，干活全交给后台执行助手。
+                # 除了省 1.4k tk，更关键是 tools 字段排在 messages 前面——「挂/不挂」来回切换
+                # 会让 2.6 万 token 的前缀缓存整段作废（实测命中从 25600 掉到 2304）。
+                # 只有显式关掉开关时才退回旧行为（DSH 不可用时挂电脑工具兜底）。
                 if not (settings.ENABLE_TOOL_ROUTER and is_dsh_available()[0]):
                     available_tools.extend(AGENT_TOOL_SCHEMAS)
-            if roast_hint:
-                available_tools = []  # 吐槽是纯嘴活，挂工具只会误触发搜索/改文件
+            if roast_hint or job_report:
+                # 吐槽是纯嘴活；任务播报只需要张嘴说结果，再挂工具只会又派一次活
+                available_tools = []
 
             if not used_vision and available_tools:
                 kwargs["tools"] = available_tools
