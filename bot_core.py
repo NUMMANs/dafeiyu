@@ -299,6 +299,14 @@ class DaFeiYuBotCore:
         if turns_after >= max_turns:
             return False, False  # 超出 5 条窗口，交回潜水逻辑
 
+        # 追认必须有时间上的连贯性：我二十多分钟前随口一句，现在这句不可能是「接我话」。
+        # 不加这条限制时，只要我发过一次言、后面又没攒满 5 条，L2 就会长期霸占判定机会，
+        # 冷场后重新起的话题（本该走 L2.5 吐槽雷达）永远轮不到 —— 2026-11-25 实测：
+        # 20:52 大肥鱼发言，21:16:59 群友隔 23 分钟开话题，L2 抢走判定返回 NO，L2.5 一次没跑。
+        asst_ts = float(recent[last_asst_idx].get("created_ts") or 0.0)
+        if asst_ts and (time.time() - asst_ts) > settings.FOLLOWUP_WINDOW_SEC:
+            return False, False
+
         return True, False
 
     def _followup_judge(self, group_id: str, sender: str, text: str, max_turns: int = 5) -> bool:
@@ -483,6 +491,7 @@ class DaFeiYuBotCore:
         quoted_sender: str,
         gap_desc: str,
         now: float,
+        gap_sec: float = 0.0,
     ) -> None:
         """把一次待判定登记进队列，due 时间由「最后一条消息」决定（新的覆盖旧的）。"""
         body = (text or "").strip()
@@ -509,6 +518,8 @@ class DaFeiYuBotCore:
                 "burst": [{"sender": (sender or "").strip(), "text": body}],
                 "quoted": quoted_sender,
                 "gap_desc": gap_desc,
+                # 记下这一波开口时的冷场间隔：L2 判 NO 后要靠它决定能不能兜底走 L2.5
+                "gap_sec": float(gap_sec or 0.0),
                 "due": now + settings.TRIGGER_DEBOUNCE_SEC,
                 "start": now,
             }
@@ -584,7 +595,32 @@ class DaFeiYuBotCore:
         last = burst[-1] if burst else {"sender": fallback, "text": ""}
         text = (last.get("text") or "").strip()
         who = (last.get("sender") or "").strip() or fallback
-        return self._followup_judge(group_id, who, text), "", text, who
+        if self._followup_judge(group_id, who, text):
+            return True, "", text, who
+
+        # L2 判 NO：如果这一波原本就是「冷场后重开的话题」，交还 L2.5 兜底。
+        # 只在冷场间隔真的达标、且不在静默期时才多花这一次判定。
+        gap = float(item.get("gap_sec") or 0.0)
+        if (
+            gap >= settings.TOPIC_GAP_SEC
+            and settings.ENABLE_TOPIC_ROAST
+            and not self.is_quiet_hours()
+        ):
+            probe2, who2, multi2 = self._compose_burst(burst, primary="first")
+            if self._roast_text_ok(probe2):
+                gap_desc = (
+                    f"约 {int(gap // 3600)} 小时" if gap >= 3600 else f"约 {int(gap // 60)} 分钟"
+                )
+                angle = self._roast_judge(
+                    group_id,
+                    who2 or fallback,
+                    probe2,
+                    gap_desc,
+                    multi_speaker=multi2,
+                )
+                if angle:
+                    return True, angle, probe2, who2 or fallback
+        return False, "", text, who
 
     def pop_due_triggers(self, now: float | None = None) -> list[tuple[str, BotResponse]]:
         """
@@ -1233,7 +1269,16 @@ class DaFeiYuBotCore:
 
                 if kind and settings.ENABLE_TRIGGER_DEBOUNCE:
                     # 连发场景：先登记，等这一波说完（停顿）再由适配器触发判定
-                    self._defer_trigger(group_id, kind, sender, clean_text, quoted_sender, gap_desc, now)
+                    self._defer_trigger(
+                        group_id,
+                        kind,
+                        sender,
+                        clean_text,
+                        quoted_sender,
+                        gap_desc,
+                        now,
+                        gap_sec=now - prev_activity_ts,
+                    )
                     return BotResponse(should_reply=False)
 
                 if kind == "roast":
@@ -1241,6 +1286,15 @@ class DaFeiYuBotCore:
                     triggered = bool(roast_angle)
                 elif kind == "l2":
                     triggered = self._followup_judge(group_id, sender, clean_text)
+                    if not triggered and clean_text:
+                        # L2 说「不是在接我话」之后，再把机会还给 L2.5：
+                        # 冷场后重新开的话题本来就该由吐槽雷达接手，不能被 L2 的 NO 直接吞掉
+                        roast_ok, gap_desc = self._roast_gate(
+                            group_id, clean_text, now, prev_activity_ts
+                        )
+                        if roast_ok:
+                            roast_angle = self._roast_judge(group_id, sender, clean_text, gap_desc)
+                            triggered = bool(roast_angle)
 
         if image_path is None and not triggered:
             return self._maybe_proactive_chime_in(group_id, sender, clean_text, now)

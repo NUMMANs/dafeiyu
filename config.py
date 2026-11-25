@@ -89,6 +89,9 @@ class Settings:
     # 四层记忆：夜间是否用一次轻量调用从当天群里提炼 L1 事实（否则只靠模型自己想起来记）
     MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
 
+    # L2 追认窗口：我在群里说完话后，多少秒内的群友发言才算「可能是在接我的话」。
+    # 超过这个时间窗口，L2 让位给 L2.5 冷场吐槽雷达（否则 L2 会长期霸占判定机会）
+    FOLLOWUP_WINDOW_SEC: int = max(30, int(os.getenv("FOLLOWUP_WINDOW_SEC", "300")))
     # L3 会话层：是否把整层历史全部注入（推荐开，配合 token 安全阀使用）
     L3_INJECT_ALL: bool = _parse_bool(os.getenv("L3_INJECT_ALL"), True)
     # L3 全量注入时的 token 安全阀：从最新往回累加，超了就砍最旧的（防撑爆上下文）
