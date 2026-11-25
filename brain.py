@@ -401,10 +401,20 @@ def _build_system_prompt(
     )
 
 
+def _looks_like_param_rejection(exc: Exception) -> bool:
+    """网关/模型不认识 thinking 参数时通常返回 400/422 并在报文里点名该参数"""
+    if getattr(exc, "status_code", None) not in (400, 422):
+        return False
+    msg = str(exc).lower()
+    return any(k in msg for k in ("thinking", "unknown", "unrecognized", "unsupported", "invalid", "extra_body"))
+
+
 class DaFeiYuBrain:
     def __init__(self) -> None:
         self._chat_client: OpenAI | None = None
         self._vision_client: OpenAI | None = None
+        # 当前网关是否支持 thinking={"type":"disabled"}（首次被拒后置 False，全程走降级路径）
+        self._thinking_off_supported = True
 
     def _get_chat_client(self) -> OpenAI:
         if self._chat_client is None:
@@ -421,6 +431,48 @@ class DaFeiYuBrain:
                 base_url=settings.effective_vision_base_url,
             )
         return self._vision_client
+
+    def _create(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int,
+        temperature: float,
+        thinking: bool = False,
+        **kwargs,
+    ):
+        """
+        轻量任务（L2 判定 / L2.5 吐槽雷达 / 日记 / 冒泡）必须显式关掉思考链。
+
+        deepseek-flash 是带思考的模型，reasoning token 和正文共用 max_tokens。
+        实测写日记时 max_tokens=220 的请求：220 个 token 全被 reasoning 吃掉，
+        finish_reason=length、content 为空串，日记因此永远写不出来。
+        关掉思考后同样内容只要 6 个 token：又便宜又不会空。
+
+        网关不认识该参数时自动降级为「加大 max_tokens 给思考留空间」。
+        """
+        client = self._get_chat_client()
+        params: dict = {
+            "model": settings.DEEPSEEK_CHAT_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
+        }
+        if thinking:
+            return client.chat.completions.create(**params)
+        if self._thinking_off_supported:
+            try:
+                return client.chat.completions.create(
+                    **params, extra_body={"thinking": {"type": "disabled"}}
+                )
+            except Exception as exc:
+                if not _looks_like_param_rejection(exc):
+                    raise
+                self._thinking_off_supported = False
+                logger.warning("该网关不支持关闭思考，已降级为加大 max_tokens：%s", exc)
+        params["max_tokens"] = max(max_tokens, 1024)
+        return client.chat.completions.create(**params)
 
     def _parse_mood(self, raw_text: str, default_mood: str) -> tuple[str, str, str]:
         match = MOOD_TAG_PATTERN.search(raw_text)
@@ -484,6 +536,7 @@ class DaFeiYuBrain:
         image_path: Path | None = None,
         group_id: str = "",
         image_sender: str = "",
+        roast_hint: str = "",
     ) -> BrainReply:
         if not settings.has_valid_api_key:
             if image_path is not None:
@@ -571,7 +624,7 @@ class DaFeiYuBrain:
         else:
             # 命中实时/查询类问题时，直接前置秒搜并拼进单轮对话，省掉一次 DeepSeek 来回！
             pre_searched_block = ""
-            if settings.ENABLE_WEB_SEARCH and any(cue in text for cue in PRE_SEARCH_CUES):
+            if settings.ENABLE_WEB_SEARCH and not roast_hint and any(cue in text for cue in PRE_SEARCH_CUES):
                 logger.info("⚡ 前置高速联网搜索: %s", text[:40])
                 pre_searched_block = web_search(text, max_results=4)
 
@@ -587,7 +640,26 @@ class DaFeiYuBrain:
                     }
                 )
             else:
-                messages.append({"role": "user", "content": f"[{sender}]: {text}"})
+                if roast_hint:
+                    # L2.5 冷场吐槽任务：明确告知这是「吐槽需求」，而不是有人在问我
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[{sender}]: {text}\n\n"
+                                f"【任务：吐槽】群里刚冷场了一阵，是 {sender} 重新开了这个话题，"
+                                f"没人叫你，也不是在问你问题。\n"
+                                f"现在请你以群友身份，就这个话题接一句吐槽/损一句/接个梗：\n"
+                                f"- 可下嘴的点：{roast_hint}\n"
+                                f"- 只发 1~2 句，短、准、有包袱，像真人随口接话，别铺垫别解释。\n"
+                                f"- 不要问好、不要说“这个问题很好”、不要分析、不要总结、不要用 Markdown、"
+                                f"不要自称 AI 或助手。\n"
+                                f"- 吐槽对事不对人：可以损这事离谱，别攻击长相、家人、地域、职业，别碰政治和疾病。"
+                            ),
+                        }
+                    )
+                else:
+                    messages.append({"role": "user", "content": f"[{sender}]: {text}"})
             client = self._get_chat_client()
             model = settings.DEEPSEEK_CHAT_MODEL
             used_vision = False
@@ -606,13 +678,18 @@ class DaFeiYuBrain:
                 freq_pen = 0.1 if (used_search or used_vision) else 0.45
                 pres_pen = 0.0 if (used_search or used_vision) else 0.4
             # 开启桌面工具时给足 4096 max_tokens，防止 deepseek-flash 思考 + .html/.py 参数 JSON 被截断
+            # 吐槽任务只发 1~2 句，160 足够，避免 owner 拿到 4096 后开始长篇大论
+            if roast_hint:
+                max_tokens = 160
+            else:
+                max_tokens = 4096 if (not used_vision and is_owner(sender)) else (800 if used_vision else 260)
             kwargs: dict = {
                 "model": model,
                 "messages": messages,
                 "temperature": temp,
                 "frequency_penalty": freq_pen,
                 "presence_penalty": pres_pen,
-                "max_tokens": 4096 if (not used_vision and is_owner(sender)) else (800 if used_vision else 260),
+                "max_tokens": max_tokens,
             }
             # 挂载工具列表（普通工具 + 主人权限下的桌面 Agent 电脑操纵工具）
             available_tools = list(SEARCH_TOOLS) if (settings.ENABLE_WEB_SEARCH and not used_search) else [
@@ -620,17 +697,35 @@ class DaFeiYuBrain:
             ]
             if is_owner(sender):
                 available_tools.extend(AGENT_TOOL_SCHEMAS)
+            if roast_hint:
+                available_tools = []  # 吐槽是纯嘴活，挂工具只会误触发搜索/改文件
 
             if not used_vision and available_tools:
                 kwargs["tools"] = available_tools
                 kwargs["tool_choice"] = "auto"
+
+            # 只有写代码/改文件这类任务才值得让模型先想；闲聊/吐槽/看图关掉思考链，
+            # 既避免 260 上限被 reasoning 吃光导致回复变空，也省掉大量 token。
+            if not is_code_or_file_task and self._thinking_off_supported:
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
             attachment_path: Path | None = None
             raw_content = ""
 
             # 最多支持 4 轮多步 Agent 工具链（如：列目录 -> 读文件 -> 执行脚本 -> 回复）
             for _step in range(4):
-                resp = client.chat.completions.create(**kwargs)
+                try:
+                    resp = client.chat.completions.create(**kwargs)
+                except Exception as call_exc:
+                    # 网关不认 thinking 参数：摘掉它并给思考留足空间，再试一次
+                    if kwargs.get("extra_body") and _looks_like_param_rejection(call_exc):
+                        kwargs.pop("extra_body", None)
+                        self._thinking_off_supported = False
+                        kwargs["max_tokens"] = max(int(kwargs.get("max_tokens") or 0), 1024)
+                        logger.warning("该网关不支持关闭思考，已降级为加大 max_tokens：%s", call_exc)
+                        resp = client.chat.completions.create(**kwargs)
+                    else:
+                        raise
                 total_tokens += getattr(resp.usage, "total_tokens", 0) or 0
                 choice = resp.choices[0]
                 finish_reason = getattr(choice, "finish_reason", None)
@@ -969,9 +1064,8 @@ class DaFeiYuBrain:
 - 只要有哪怕一点乐子或槽点，就果断以{voice_hint}冒泡补刀 **1~2 句**（简短自然、不要用 Markdown），并在末尾附带情绪标签 `[MOOD:happy]` / `[MOOD:smug]` / `[MOOD:shocked]` / `[MOOD:angry]` / `[MOOD:sleepy]` / `[MOOD:gaming]` / `[MOOD:love]` / `[MOOD:hungry]`。"""
 
         try:
-            resp = self._get_chat_client().chat.completions.create(
-                model=settings.DEEPSEEK_CHAT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
                 temperature=0.8,
                 max_tokens=160,
             )
@@ -995,40 +1089,168 @@ class DaFeiYuBrain:
             logger.warning("自主插嘴判断异常: %s", exc)
             return None
 
-    def is_talking_to_or_about_me(self, sender: str, text: str, recent_history: list[dict]) -> bool:
+    def is_talking_to_or_about_me(
+        self,
+        sender: str,
+        text: str,
+        recent_history: list[dict],
+        at_others: bool = False,
+    ) -> bool:
         """
-        极轻量上下文指代判断（仅输出 YES / NO，~0.6秒）：
-        当群友没点名“大肥鱼”，但大肥鱼刚在群里说过话、或消息里提到了“你/他/它/头像/小号”等时，
-        结合最近几条上下文判断这句话是不是在跟大肥鱼继续聊或在议论大肥鱼。
+        L2 上下文追认（只输出 YES / NO，单次约 300~500 tokens）：
+        在我刚说完话之后的几条消息里，判断这句是不是冲着「我」来的。
+
+        刻意不注入人格设定：
+        判定只需要「谁是我 / 我上一句说了什么 / 现在这句是什么」三件事。
+        喂完整人设（人格.md 约 936 tokens）会让模型转去扮演角色、吐不出 YES/NO，
+        同时把单次输入抬到 1500 tokens 量级，实测等于把所有优化吃掉。
         """
         if not settings.has_valid_api_key or not text.strip():
             return False
-        ctx_lines = [
-            f"[{m['sender']}]: {m['content']}"
-            for m in recent_history[-6:]
-            if m.get("content")
-        ]
-        ctx = "\n".join(ctx_lines)
+
+        ctx_lines: list[str] = []
+        for m in recent_history:
+            content = " ".join((m.get("content") or "").split())
+            if not content:
+                continue
+            if m.get("role") == "assistant":
+                # 显式标出哪句是我说的，避免模型把「大肥鱼」当成第三个人
+                ctx_lines.append(f"[我]: {content[:200]}")
+            else:
+                ctx_lines.append(f"[{m.get('sender') or '群友'}]: {content[:200]}")
+        ctx = "\n".join(ctx_lines) if ctx_lines else "（空）"
+
+        probe = text.strip()
+        if len(probe) > 300:
+            probe = probe[:300] + "…"
+
         prompt = (
-            f"你是群里的「{settings.BOT_NAME}」（群友也叫你峰哥、老峰、塔菲、鱼、机器人、小号）。\n"
-            f"刚才群里的聊天记录：\n{ctx}\n\n"
-            f"现在 [{sender}] 发了一句新消息：「{text}」\n"
-            f"请判断这句话是不是在继续跟你说话、接你的话茬、或者在议论你（比如评价你的头像、反应、智商、功能）？\n"
-            f"只输出 YES 或 NO，不要输出任何其他字。"
+            f"你在判断一条群聊消息是不是冲着机器人「{settings.BOT_NAME}」说的。"
+            f"下文里的「我」都指这个机器人。\n\n"
+            f"我刚说完话之后的群聊：\n{ctx}\n\n"
+            f"待判断的新消息 [{sender}]：{probe}\n"
+            f"这条新消息同时 @ 了群里其他人：{'是' if at_others else '否'}\n\n"
+            f"满足以下任一才输出 YES：\n"
+            f"1) 在回应、追问或点评我刚才说的内容；\n"
+            f"2) 上下文中只有我刚说过话，这句明显是接着我的话往下说。\n\n"
+            f"其余一律输出 NO，例如：跟其他群友互相聊天、明显在 @ 别人、开新话题、"
+            f"自言自语、单纯发感叹或表情、在议论第三个人。\n\n"
+            f"只输出 YES 或 NO，不要解释。"
         )
         try:
-            resp = self._get_chat_client().chat.completions.create(
-                model=settings.DEEPSEEK_CHAT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=256,
+                max_tokens=24,
             )
-            ans = (resp.choices[0].message.content or "").strip().upper()
-            logger.info("🧭 上下文指代判定 [%s]: %s -> %s", sender, text[:30], ans)
-            return "YES" in ans
+            raw = (resp.choices[0].message.content or "").strip().upper().lstrip("\"'*` ")
+            logger.info(
+                "🧭 L2 追认判定 [%s] @他人=%s: %s -> %s",
+                sender,
+                at_others,
+                text[:30],
+                raw[:8],
+            )
+            return raw.startswith("YES")
         except Exception as exc:
-            logger.warning("上下文指代判定异常: %s", exc)
+            logger.warning("L2 追认判定异常: %s", exc)
             return False
+
+    def judge_topic_roast(
+        self,
+        sender: str,
+        text: str,
+        recent_history: list[dict],
+        gap_desc: str = "",
+        at_others: bool = False,
+        multi_speaker: bool = False,
+    ) -> str:
+        """
+        L2.5 冷场重启话题的「吐槽雷达」（轻量判定，只输出一行结论）。
+
+        场景：群里安静了很久，某人重新开口。此时既不是在叫我，也算不上接话茬，
+        但如果他抛的话题够抽象/够有槽点，接一句会很有节目效果。
+
+        输入刻意保持极简：不带人格、不带工具、只给「冷场多久 + 最近几句 + 这句」。
+        输出格式 `SCORE|可吐槽的点`，SCORE 为 0~10 整数，由调用方按阈值决定是否接话。
+
+        multi_speaker=True 表示 text 是这一波多人接话的合并探针（每行 `[昵称]: 内容`），
+        此时不能沿用「[sender] 重新开口说」的说法，否则会把几个人的话当成一个人说的。
+
+        返回：可吐槽的点（非空字符串）表示值得吐槽；空字符串表示不接话。
+        """
+        if not settings.has_valid_api_key:
+            return ""
+        body = (text or "").strip()
+        if len(body) < 4:
+            return ""
+
+        ctx_lines: list[str] = []
+        for m in recent_history:
+            content = " ".join((m.get("content") or "").split())
+            if not content:
+                continue
+            who = "我" if m.get("role") == "assistant" else (m.get("sender") or "群友")
+            ctx_lines.append(f"[{who}]: {content[:120]}")
+        ctx = "\n".join(ctx_lines[-6:]) if ctx_lines else "（群里之前没有人说话）"
+
+        probe = body if len(body) <= 300 else body[:300] + "…"
+
+        if multi_speaker:
+            opening = (
+                f"这个群{('已经安静了' + gap_desc) if gap_desc else '刚刚冷场'}，"
+                f"然后这几个人陆续开口（每行是谁说的都标在前面）：\n{probe}\n"
+            )
+        else:
+            opening = (
+                f"这个群{('已经安静了' + gap_desc) if gap_desc else '刚刚冷场'}，"
+                f"现在 [{sender}] 重新开口说：{probe}\n"
+            )
+
+        prompt = (
+            "你是群聊里的「吐槽雷达」，只负责判断一段群聊值不值得接梗吐槽，不负责真的吐槽。\n\n"
+            + opening
+            + (
+                "（这条消息 @ 的是群里的其他人，不是叫你。"
+                "@ 别人不算扣分，照常只看他抛的话题本身有没有槽点。）\n"
+                if at_others
+                else ""
+            )
+            + f"\n更早的几句（可能为空）：\n{ctx}\n\n"
+            "评分标准（0~10 分）：\n"
+            "- 8~10：有明显的槽点、反差、离谱、抽象、可接梗的具体事（吹牛、翻车、奇葩经历、逆天观点、被生活暴打）。\n"
+            "- 4~7：有点意思但不好接，或者需要很多背景才懂。\n"
+            "- 0~3：打招呼、问在不在、单纯陈述事实、发牢骚没内容、纯表情、广告、正事通知、涉政涉黄涉暴。\n\n"
+            "另外，出现以下任一情况直接给 0 分：\n"
+            "在问正经求助问题、在讨论别人的隐私或外貌、内容涉及政治/疾病/丧事、纯粹约时间见面的私事。\n"
+            "如果这几句其实是几个人在聊各自不相干的事、或者已经变成一对一私聊，也给 0 分。\n\n"
+            "输出格式（只输出一行，不要解释）：\n"
+            "分数|可以吐槽的那个点（15 字以内，没槽点就写「无」）\n"
+            "例如：9|他居然把鱼缸当显示器"
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=40,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            line = raw.splitlines()[0] if raw else ""
+            score_part, _, angle = line.partition("|")
+            m_score = re.search(r"\d+(?:\.\d+)?", score_part)
+            score = float(m_score.group()) if m_score else 0.0
+            angle = angle.strip().strip("\"'「」 ")
+            threshold = settings.TOPIC_ROAST_MIN_SCORE * 10
+            logger.info(
+                "🔥 吐槽判定 [%s] %.1f/10 (阈值 %.0f) 槽点=%s | %s",
+                sender, score, threshold, angle[:20] or "无", probe[:30],
+            )
+            if score < threshold or not angle or angle == "无":
+                return ""
+            return angle[:30]
+        except Exception as exc:
+            logger.warning("吐槽判定异常: %s", exc)
+            return ""
 
     def generate_autonomous_bubble(self, kind: str, status: PetStatus) -> BrainReply:
         """生成定时作息 / 饿扁催饭的主动冒泡发言"""
@@ -1054,9 +1276,8 @@ class DaFeiYuBrain:
             )
 
         try:
-            resp = self._get_chat_client().chat.completions.create(
-                model=settings.DEEPSEEK_CHAT_MODEL,
-                messages=[{"role": "user", "content": instruction}],
+            resp = self._create(
+                [{"role": "user", "content": instruction}],
                 temperature=0.9,
                 max_tokens=140,
             )
@@ -1102,13 +1323,19 @@ class DaFeiYuBrain:
             + "\n".join(lines)
         )
         try:
-            resp = self._get_chat_client().chat.completions.create(
-                model=settings.DEEPSEEK_CHAT_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
                 temperature=0.85,
                 max_tokens=220,
             )
             raw = (resp.choices[0].message.content or "").strip()
+            if not raw:
+                logger.warning(
+                    "L2 日记生成返回空内容（finish_reason=%s, 完成 token=%s），本篇跳过",
+                    resp.choices[0].finish_reason,
+                    getattr(resp.usage, "completion_tokens", "?"),
+                )
+                return False
             if "|" in raw:
                 mood, body = raw.split("|", 1)
             else:

@@ -1,9 +1,10 @@
+import logging
 import random
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from agent_tools import (
@@ -33,7 +34,12 @@ from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
 from sticker_manager import sticker_manager
 
+logger = logging.getLogger(__name__)
 
+
+# ⚠️ 2026-11-25 起 L1 硬触发只认 @ 唤名，以下三张词表已不参与唤醒判定。
+# 保留是为了随时可恢复（在 _is_triggered 里加回对应判定即可），不是死配置。
+# 英雄联盟 / 游戏话题词表
 LOL_KEYWORDS = (
     "lol", "英雄联盟", "联盟", "排位", "大乱斗", "海斗", "海克斯", "极地大乱斗",
     "云顶", "金铲铲", "峡谷", "召唤师峡谷", "上单", "打野", "中单", "下路", "辅助",
@@ -60,7 +66,9 @@ PRIVATE_LOGISTICS_CUES = (
 )
 
 
-# 即使没叫名字，也可能是在议论大肥鱼或延续对话的指代词
+# 【已停用】原用于"没叫名字但含你/他/她/它 就去做上下文判定"。
+# 2026-11-25 起 L2 只看"我发言后 5 条内"，不再用代词作为进入判定条件。
+# 保留词表是为了需要时能快速恢复；"谁在跟谁说话"现在交给判定提示词自己读上下文。
 ABOUT_ME_CUES = (
     "你", "他", "它", "她", "这鱼", "那鱼", "机器人", "ai", "小号", "头像", "换了", "塔菲",
 )
@@ -155,6 +163,10 @@ class DaFeiYuBotCore:
         self._last_assistant_ts: dict[str, float] = {}
         self._last_bot_reply_ts: dict[str, float] = {}
         self._last_group_activity_ts: dict[str, float] = {}
+        # L2.5 冷场重启话题吐槽：只靠 TOPIC_GAP_SEC 控频，不再有同群冷却/日上限
+        # L2/L2.5 去抖队列：群里连续发言时先挂起，等停顿够久再判定（适配器每秒 pop 一次）
+        self._pending_trigger: dict[str, dict] = {}
+        self._pending_lock = threading.Lock()
         self._last_hungry_bubble_ts: dict[str, float] = {}
         self._last_evening_bubble_date: dict[str, str] = {}
         self._last_nightly_date: str = ""
@@ -175,13 +187,13 @@ class DaFeiYuBotCore:
         return start <= hour < end
 
     def _is_lol_related(self, text: str) -> bool:
+        """【已停用】原先用于"游戏话题 100% 必回"，现 L1 只认 @唤名，保留待恢复。"""
         low = text.lower()
         return any(kw in low for kw in LOL_KEYWORDS)
 
     def _is_answerable_question(self, group_id: str, text: str) -> bool:
         """
-        识别群友提出的「可解答疑问」（游戏评价、软件/报错、知识科普、选购推荐等），
-        同时过滤掉纯“？”或熟人约时间/买票等私人行程，像贴心群助理一样只答该答的。
+        【已停用】原先用于"群友有疑问就主动当助理回答"，现 L1 只认 @唤名，保留待恢复。
         """
         t = text.strip()
         if len(t) < 4:
@@ -194,26 +206,418 @@ class DaFeiYuBotCore:
         )
         return is_q
 
+    def _name_prefixes(self) -> list[str]:
+        """「以名字开头」判定用：机器人名 + 去掉 @ 的唤醒词。"""
+        prefixes = [settings.BOT_NAME] + [k.lstrip("@") for k in settings.TRIGGER_KEYWORDS]
+        return [p for p in prefixes if p]
+
     def _is_triggered(self, group_id: str, text: str, force_trigger: bool = False) -> bool:
+        """
+        群聊唤醒判定（L1 硬触发）：
+        1. 文本里出现唤醒词（默认 `@大肥鱼`）；
+        2. 文本以机器人名字开头（如「大肥鱼，BLG夺冠了」）——2026-11-25 新增，没 @ 也算叫我。
+
+        2026-11-25 收紧说明：
+        - 原先还会因「英雄联盟关键词」「任意答疑词（怎么/为什么/推荐…）」自动接话，
+          这两个条件已下线，对应常量 LOL_KEYWORDS / QUESTION_CUES 保留但不再参与判定。
+        - 群内快捷指令（/状态 /投喂 /搜图 …）在 handle_message 第 3 步就由
+          _handle_command 处理并直接返回，不依赖本函数的 "/" 前缀判定。
+        """
         if force_trigger or not settings.GROUP_AT_ONLY:
             return True
-        lower = text.strip()
-        if lower.startswith("/") or lower in ("查鱼", "喂白饭", "摸摸鱼", "鱼塘榜", "帮助"):
+        probe = text.strip()
+        if not probe:
+            return False
+        low = probe.lower()
+        if any(kw.lower() in low for kw in settings.TRIGGER_KEYWORDS):
             return True
-        # 英雄联盟相关提问/话题 100% 必回复
-        if self._is_lol_related(lower):
-            return True
-        # 叫到大肥鱼名字触发
-        if any(kw in lower for kw in settings.TRIGGER_KEYWORDS):
-            return True
-        # 群友有可解答疑问时，像助理一样主动回答
-        return self._is_answerable_question(group_id, lower)
+        # 以名字开头：微信里很多人习惯直接「大肥鱼，xxx」不带 @
+        return any(probe.startswith(p) for p in self._name_prefixes())
 
     def _strip_trigger(self, text: str) -> str:
+        """去掉唤醒词本体、开头的名字称呼，以及微信 @ 之后紧跟的窄空格 U+2005 / 全角空格。"""
         cleaned = text
         for kw in settings.TRIGGER_KEYWORDS:
             cleaned = cleaned.replace(kw, "")
-        return cleaned.strip(" ,，:：!！@")
+        cleaned = cleaned.lstrip()
+        # 没 @ 但以名字开头时同样剥掉，避免 prompt 里重复一句「大肥鱼」
+        for prefix in sorted(self._name_prefixes(), key=len, reverse=True):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                break
+        return cleaned.strip(" \u2005\u3000\t\r\n,，:：!！@")
+
+    def _followup_gate(
+        self,
+        group_id: str,
+        text: str,
+        quoted_sender: str = "",
+        max_turns: int = 5,
+    ) -> tuple[bool, bool]:
+        """
+        L2 轻量闸门（不调模型，纯本地判断），供去抖入队时使用。
+
+        返回 (是否值得进入追认判定, 是否命中「引用我」零成本快路)。
+        设计要点：
+        - 取消原 120 秒时间窗，改为"按条数"推进：我发言后最多再看 5 条，第 6 条起不再判定。
+          好处是成本有上界——每次我开口最多换来 5 次判定，不会无限膨胀。
+        - 引用我的消息是强信号，直接唤醒，不需要模型也不需要去抖。
+        """
+        body = (text or "").strip()
+        if len(body) < 2:
+            return False, False
+
+        # 快路 1：引用的是我的消息，必是在跟我说话（群昵称常带后缀，用包含匹配）
+        quoted = (quoted_sender or "").strip()
+        if quoted and settings.BOT_NAME and settings.BOT_NAME in quoted:
+            return True, True
+
+        recent = pet_engine.get_recent_history(group_id, limit=max_turns + 8)
+        # 第 1 步就已把当前这条写进历史，这里剔除，避免拿自己当上下文
+        if recent and (recent[-1].get("content") or "").strip() == body:
+            recent = recent[:-1]
+
+        last_asst_idx = -1
+        for idx in range(len(recent) - 1, -1, -1):
+            if recent[idx].get("role") == "assistant":
+                last_asst_idx = idx
+                break
+        if last_asst_idx < 0:
+            return False, False  # 我从没在这个群说过话，无从"追认"
+
+        window = recent[last_asst_idx:]
+        turns_after = sum(1 for m in window[1:] if m.get("role") != "assistant")
+        if turns_after >= max_turns:
+            return False, False  # 超出 5 条窗口，交回潜水逻辑
+
+        return True, False
+
+    def _followup_judge(self, group_id: str, sender: str, text: str, max_turns: int = 5) -> bool:
+        """
+        L2 正式判定：用「此刻」的历史重建窗口再调模型。
+
+        停顿后执行的好处：连续发言的几句都已经落库，模型看到的是完整的一波对话，
+        而不是第一条刚说完就急着判断。
+        """
+        body = (text or "").strip()
+        if not body:
+            return False
+
+        recent = pet_engine.get_recent_history(group_id, limit=max_turns + 12)
+        if recent and (recent[-1].get("content") or "").strip() == body:
+            recent = recent[:-1]
+
+        last_asst_idx = -1
+        for idx in range(len(recent) - 1, -1, -1):
+            if recent[idx].get("role") == "assistant":
+                last_asst_idx = idx
+                break
+        if last_asst_idx < 0:
+            return False
+
+        window = recent[last_asst_idx:]
+        # L1 已确认没 @ 我，此时文本里出现 @ 只可能是 @ 了别人
+        return brain.is_talking_to_or_about_me(
+            sender=sender,
+            text=body,
+            recent_history=window,
+            at_others="@" in body,
+        )
+
+    @staticmethod
+    def _roast_text_ok(text: str) -> bool:
+        """一句话够不够格当「话题锚点」：非指令、非原始 XML、有基本话题量。"""
+        body = (text or "").strip()
+        if len(body) < 6:
+            return False  # 「在吗」「哈哈哈」这种没有话题量
+        if body.startswith("/"):
+            return False  # 未识别的指令，不是话题
+        if body.startswith("<"):
+            return False  # 适配器偶尔漏出的原始 XML 消息体
+        # 至少要有两个汉字，过滤 wxid、纯表情、纯数字
+        return sum(1 for ch in body if "\u4e00" <= ch <= "\u9fff") >= 2
+
+    @staticmethod
+    def _burst_item_ok(text: str) -> bool:
+        """一句话能不能并进「这一波的合并探针」（比话题锚点宽松，只挡明显无意义的）。"""
+        body = (text or "").strip()
+        if not body or body.startswith("/") or body.startswith("<"):
+            return False
+        return sum(1 for ch in body if "\u4e00" <= ch <= "\u9fff") >= 1
+
+    def _roast_gate(
+        self,
+        group_id: str,
+        text: str,
+        now: float,
+        prev_activity_ts: float,
+    ) -> tuple[bool, str]:
+        """
+        L2.5 规则闸门（不调模型）：判断这条消息是不是「冷场后重新开启的话题」。
+
+        2026-11-25 调整：
+        - 取消「含 @ 就不判」：@ 别人也照常送判定（用户要求），交给判定器看话题本身；
+        - 取消「以名字开头就不判」：L1 已把「以名字开头」改成强制唤醒，走不到这里；
+        - 取消同群冷却与每日上限：连发去抖已经能约束频率，用户要求只保留 TOPIC_GAP_SEC。
+
+        返回 (是否值得送判定, 冷场时长的人类可读描述)。
+        """
+        if not settings.ENABLE_TOPIC_ROAST or self.is_quiet_hours():
+            return False, ""
+
+        if not self._roast_text_ok(text):
+            return False, ""
+        # 进程刚启动时不知道这个群冷场了多久，宁可不吐槽，避免重启后乱接一句话
+        if prev_activity_ts <= 0:
+            return False, ""
+
+        gap = now - prev_activity_ts
+        if gap < settings.TOPIC_GAP_SEC:
+            return False, ""
+
+        gap_desc = f"约 {int(gap // 3600)} 小时" if gap >= 3600 else f"约 {int(gap // 60)} 分钟"
+        return True, gap_desc
+
+    def _roast_judge(
+        self,
+        group_id: str,
+        sender: str,
+        text: str,
+        gap_desc: str,
+        multi_speaker: bool = False,
+    ) -> str:
+        """
+        L2.5 正式判定：调轻量判定器，通过就返回可吐槽的点，否则返回空串。
+
+        text 可能是这一波连续发言的合并探针：同一人连发时按行拼接，
+        多人接话时每行带 `[说话人]:` 前缀（multi_speaker=True），
+        这样判定器不会把几个人的话误读成一个人说的。
+        """
+        body = (text or "").strip()
+        if not body:
+            return ""
+
+        # 上下文取最近几条，剔除已经并入探针的那部分（避免同一句出现两次）。
+        # 多人探针带 `[昵称]: ` 前缀，历史里存的是原文，所以要剥掉前缀再比对。
+        recent = pet_engine.get_recent_history(group_id, limit=8)
+        merged_lines: set[str] = set()
+        for ln in body.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            merged_lines.add(re.sub(r"^\[[^\]]{1,40}\]:\s*", "", s))
+        # 已并入探针的句子要从上下文里整体移除，否则同一句会同时出现在「探针」和「更早的几句」里
+        if merged_lines:
+            recent = [m for m in recent if (m.get("content") or "").strip() not in merged_lines]
+
+        angle = brain.judge_topic_roast(
+            sender=sender,
+            text=body,
+            recent_history=recent,
+            gap_desc=gap_desc,
+            at_others="@" in body,
+            multi_speaker=multi_speaker,
+        )
+        if not angle:
+            return ""
+
+        logger.info(
+            "🔥 L2.5 冷场吐槽放行：%s 隔 %s 开话题「%s」，槽点=%s",
+            sender,
+            gap_desc,
+            body[:40].replace("\n", " / "),
+            angle,
+        )
+        return angle
+
+    # ------------------------------------------------------------------
+    # L2 / L2.5 去抖：群里连发时先挂起，等「发言停顿」再判定
+    # ------------------------------------------------------------------
+
+    def _append_burst_locked(self, item: dict, sender: str, text: str) -> None:
+        """
+        把一条发言并进这一波的合并探针（调用方必须已持有 _pending_lock）。
+
+        会挡掉指令、原始 XML、纯符号这几类 —— 它们并进去只会污染判定，
+        但「群还在说话」这件事由 _touch_pending 单独续期，不受影响。
+        """
+        body = (text or "").strip()
+        if not body or not self._burst_item_ok(body):
+            return
+        burst = item.setdefault("burst", [])
+        if len(burst) >= settings.TRIGGER_BURST_MAX_ITEMS:
+            return
+        who = (sender or "").strip()
+        if burst and burst[-1].get("text") == body and (burst[-1].get("sender") or "") == who:
+            return
+        burst.append({"sender": who, "text": body})
+
+    def _defer_trigger(
+        self,
+        group_id: str,
+        kind: str,
+        sender: str,
+        text: str,
+        quoted_sender: str,
+        gap_desc: str,
+        now: float,
+    ) -> None:
+        """把一次待判定登记进队列，due 时间由「最后一条消息」决定（新的覆盖旧的）。"""
+        body = (text or "").strip()
+        with self._pending_lock:
+            existing = self._pending_trigger.get(group_id)
+            if existing is not None and existing.get("kind") == kind:
+                # 同一波对话里的后续发言：保留已有 burst，只续期
+                existing["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
+                if quoted_sender:
+                    existing["quoted"] = quoted_sender
+                self._append_burst_locked(existing, sender, body)
+                return
+            self._pending_trigger[group_id] = {
+                "group_id": group_id,
+                "kind": kind,  # "l2" | "roast"
+                "sender": sender,
+                # 每项记说话人：多人接话时探针要带 [昵称] 前缀，不能让判定器以为是一人连发
+                "burst": [{"sender": (sender or "").strip(), "text": body}],
+                "quoted": quoted_sender,
+                "gap_desc": gap_desc,
+                "due": now + settings.TRIGGER_DEBOUNCE_SEC,
+                "start": now,
+            }
+        logger.debug("⏳ 去抖挂起 [%s/%s] due=+%.1fs: %s", group_id, kind, settings.TRIGGER_DEBOUNCE_SEC, body[:30])
+
+    def _touch_pending(self, group_id: str, now: float, text: str = "", sender: str = "") -> None:
+        """
+        群里每来一条消息就把停顿时钟往后推：只要还在连着说话，就不判定。
+
+        同时把这条也并进 burst —— 连发时包袱经常在最后一句（「…」「现在又好了草」），
+        只拿第一条去判定会漏掉关键信息。条数上限见 TRIGGER_BURST_MAX_ITEMS。
+        """
+        body = (text or "").strip()
+        with self._pending_lock:
+            item = self._pending_trigger.get(group_id)
+            if item is None:
+                return
+            item["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
+            self._append_burst_locked(item, sender, body)
+
+    def _cancel_pending(self, group_id: str) -> None:
+        """已经用别的方式回复了（@唤醒、指令、图片），作废本群挂起的判定，避免二次回复。"""
+        with self._pending_lock:
+            self._pending_trigger.pop(group_id, None)
+
+    @staticmethod
+    def _compose_burst(burst: list[dict], primary: str = "last") -> tuple[str, str, bool]:
+        """
+        把一波发言拼成判定探针，返回 (探针文本, 主说话人, 是否多人)。
+
+        - 同一人连发：按行拼接，保持「一个人一口气说完」的语义；
+        - 多人接话：每行加 `[昵称]:` 前缀，判定器才能分清谁说了什么（否则会张冠李戴）；
+        - 主说话人：L2 取最后一条（要判的是「现在这句」），L2.5 取第一条（冷场开话题的人）。
+        """
+        items = [b for b in (burst or []) if (b.get("text") or "").strip()]
+        if not items:
+            return "", "", False
+        senders: list[str] = []
+        for b in items:
+            who = (b.get("sender") or "").strip()
+            if who and who not in senders:
+                senders.append(who)
+        multi = len(senders) > 1
+        if multi:
+            probe = "\n".join(f"[{(b.get('sender') or '群友').strip()}]: {b['text'].strip()}" for b in items)
+        else:
+            probe = "\n".join(b["text"].strip() for b in items)
+        target = items[0] if primary == "first" else items[-1]
+        return probe, (target.get("sender") or "").strip(), multi
+
+    def _judge_pending(self, item: dict) -> tuple[bool, str, str, str]:
+        """
+        执行一次挂起的判定，返回 (是否要回复, roast 槽点, 探针文本, 主说话人)。
+
+        - L2.5：判定对象是这一波的**全部**发言（合并探针），因为是评价整段话题；
+        - L2：判定对象只取**最后一句**（「现在这句是不是在接我话」），
+              前面的几句已经落库成历史上下文，再拼进探针只会重复。
+        """
+        group_id = item["group_id"]
+        fallback = (item.get("sender") or "").strip()
+        if item.get("kind") == "roast":
+            probe, who, multi = self._compose_burst(item.get("burst") or [], primary="first")
+            angle = self._roast_judge(
+                group_id,
+                who or fallback,
+                probe,
+                item.get("gap_desc", ""),
+                multi_speaker=multi,
+            )
+            return bool(angle), angle, probe, who or fallback
+
+        burst = [b for b in (item.get("burst") or []) if (b.get("text") or "").strip()]
+        last = burst[-1] if burst else {"sender": fallback, "text": ""}
+        text = (last.get("text") or "").strip()
+        who = (last.get("sender") or "").strip() or fallback
+        return self._followup_judge(group_id, who, text), "", text, who
+
+    def pop_due_triggers(self, now: float | None = None) -> list[tuple[str, BotResponse]]:
+        """
+        把「停顿够久」的挂起判定执行掉，返回待发送的 (group_id, 回复)。
+
+        由适配器每秒轮询调用（微信通道在 wxauto_adapter 的巡检循环里）。
+        返回空列表表示没有需要发送的内容。
+        """
+        now = time.time() if now is None else now
+        max_wait = settings.TRIGGER_DEBOUNCE_MAX_WAIT_SEC
+
+        def _is_due(item: dict) -> bool:
+            due = item.get("due", 0.0)
+            start = item.get("start", due)
+            # 正常情况下等停顿；但群里一直不停顿时，最多等 max_wait 就强制判定，避免永远排不上
+            return now >= due or (max_wait > 0 and (now - start) >= max_wait)
+
+        with self._pending_lock:
+            due_groups = [gid for gid, item in self._pending_trigger.items() if _is_due(item)]
+            items = [(gid, self._pending_trigger.pop(gid)) for gid in due_groups]
+        if not items:
+            return []
+
+        results: list[tuple[str, BotResponse]] = []
+        for gid, item in items:
+            try:
+                should_reply, angle, probe, who = self._judge_pending(item)
+            except Exception as exc:
+                logger.warning("去抖判定异常 [%s]: %s", gid, exc)
+                continue
+            if not should_reply:
+                continue
+            logger.info(
+                "⏱ 停顿后判定通过 [%s/%s]: %s",
+                gid,
+                item.get("kind"),
+                probe[:40].replace("\n", " / "),
+            )
+            # 合并探针里的原始单条，回复前从历史尾部摘掉，避免模型以为群友说了两遍
+            if item.get("kind") == "roast":
+                strip_texts = [
+                    b["text"].strip() for b in (item.get("burst") or []) if (b.get("text") or "").strip()
+                ]
+            else:
+                strip_texts = [probe] if probe else []
+            try:
+                resp = self._compose_reply(
+                    group_id=gid,
+                    sender=who,
+                    text=probe,
+                    quoted_sender=item.get("quoted", ""),
+                    now=now,
+                    roast_angle=angle,
+                    allow_image_lookup=(item.get("kind") != "roast"),
+                    history_strip=strip_texts,
+                )
+            except Exception as exc:
+                logger.warning("去抖回复生成异常 [%s]: %s", gid, exc)
+                continue
+            results.append((gid, resp))
+        return results
 
     def _handle_command(self, group_id: str, sender: str, text: str) -> BotResponse | None:
         cmd = text.strip()
@@ -326,7 +730,7 @@ class DaFeiYuBotCore:
             st = pet_engine.get_status()
             reply_text = (
                 f"🐋 【{settings.BOT_NAME}使用指南】\n"
-                f"• 群里直接叫 `大肥鱼`、问英雄联盟或提疑问都会自动回复\n"
+                f"• 群里只有 `@{settings.BOT_NAME}` 才会回复（不 @ 一律潜水）\n"
                 f"• 发图自动高清识图吐槽，发完图再叫大肥鱼必识别\n"
                 f"• `/投喂` / `/摸鱼` / `/状态` / `/鱼塘榜`：养鱼互动\n"
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
@@ -372,13 +776,27 @@ class DaFeiYuBotCore:
             st = pet_engine.get_status()
             diaries = memory_store.read_recent_diaries(limit=3)
             if not diaries:
-                reply_text = "📔 还没写过日记呢喵，每晚 23:50 会自动写一篇今天的群聊日记！"
+                reply_text = "📔 还没写过日记呢喵，每晚 23:45 之后会自动写一篇今天的群聊日记！"
             else:
                 lines = ["📔 【大肥鱼最近日记】"]
                 for d in diaries:
                     lines.append(f"• {d.get('时间', '')} [{d.get('心情', '')}] {d.get('内容', '')}")
                 reply_text = "\n".join(lines)
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
+
+        if cmd in ("/写日记", "写日记"):
+            st = pet_engine.get_status()
+            recent = pet_engine.get_recent_history(group_id, limit=15)
+            if not recent:
+                return BotResponse(should_reply=True, text="📔 这个群还没来得及聊啥，没素材写日记喵", mood="sleepy", status=st)
+            ok = brain.write_daily_diary(recent, st)
+            if ok:
+                latest = memory_store.read_recent_diaries(limit=1)
+                d = latest[0] if latest else {}
+                reply_text = f"📔 写完啦 [{d.get('心情', '')}] {d.get('内容', '')}"
+            else:
+                reply_text = "📔 日记没写成，日志里有具体原因（通常是模型返回了空内容）"
+            return BotResponse(should_reply=True, text=reply_text, mood="happy" if ok else "sleepy", status=st)
 
         if cmd.startswith("/学黑话"):
             body = cmd[4:].strip()
@@ -704,6 +1122,8 @@ class DaFeiYuBotCore:
         clean_text = (text or "").strip()
 
         # 1. 记录群友发来的消息 + 更新情绪惯性状态机
+        # 先取旧值：下面的赋值会覆盖它，而 L2.5 吐槽判定需要「距上一条消息隔了多久」
+        prev_activity_ts = self._last_group_activity_ts.get(group_id, 0.0)
         self._last_group_activity_ts[group_id] = now
         if clean_text:
             emotion_sm.on_user_message(group_id, clean_text)
@@ -727,10 +1147,14 @@ class DaFeiYuBotCore:
                     self._caption_image_async(group_id, image_path)
                     return BotResponse(should_reply=False)
 
+        # 只要本群有挂起的判定，就把停顿时钟往后推：群里还在连着说话就不判
+        self._touch_pending(group_id, now, clean_text, sender)
+
         # 3. 优先处理快捷养成指令
         if clean_text:
             cmd_resp = self._handle_command(group_id, sender, clean_text)
             if cmd_resp is not None:
+                self._cancel_pending(group_id)
                 pet_engine.append_history(
                     group_id=group_id,
                     sender=settings.BOT_NAME,
@@ -740,20 +1164,70 @@ class DaFeiYuBotCore:
                 )
                 return cmd_resp
 
-        # 4. 判断文本消息是否触发大肥鱼；
-        # 若未直接命中关键词，先检查「对话粘性窗口(120秒内刚聊过)」或「群友在议论他」
+        # 4. 判断文本消息是否触发大肥鱼（L1：@唤名 或 以名字开头）
         triggered = self._is_triggered(group_id, clean_text, force_trigger=force_trigger)
+        roast_angle = ""
+
         if image_path is None and not triggered:
-            in_active_window = (now - self._last_bot_reply_ts.get(group_id, 0.0)) <= 120
-            mentions_pronoun = any(c in clean_text.lower() for c in ABOUT_ME_CUES)
-            if (in_active_window and len(clean_text) >= 2) or (mentions_pronoun and len(clean_text) >= 4):
-                recent_ctx = pet_engine.get_recent_history(group_id, limit=6)
-                if brain.is_talking_to_or_about_me(sender, clean_text, recent_ctx):
-                    triggered = True
+            followup_ok, is_quoted = self._followup_gate(group_id, clean_text, quoted_sender)
+            if is_quoted:
+                # 引用我的消息是零成本强信号，不参与去抖，立刻醒
+                logger.info("🎯 L2 零成本唤醒：引用了 %s 的消息", (quoted_sender or "").strip())
+                triggered = True
+            else:
+                kind, gap_desc = "", ""
+                if followup_ok:
+                    kind = "l2"
+                elif clean_text:
+                    roast_ok, gap_desc = self._roast_gate(group_id, clean_text, now, prev_activity_ts)
+                    if roast_ok:
+                        kind = "roast"
+
+                if kind and settings.ENABLE_TRIGGER_DEBOUNCE:
+                    # 连发场景：先登记，等这一波说完（停顿）再由适配器触发判定
+                    self._defer_trigger(group_id, kind, sender, clean_text, quoted_sender, gap_desc, now)
+                    return BotResponse(should_reply=False)
+
+                if kind == "roast":
+                    roast_angle = self._roast_judge(group_id, sender, clean_text, gap_desc)
+                    triggered = bool(roast_angle)
+                elif kind == "l2":
+                    triggered = self._followup_judge(group_id, sender, clean_text)
 
         if image_path is None and not triggered:
             return self._maybe_proactive_chime_in(group_id, sender, clean_text, now)
 
+        # 已经决定正式回复，作废本群可能还挂着的判定，避免二次发言
+        self._cancel_pending(group_id)
+
+        return self._compose_reply(
+            group_id=group_id,
+            sender=sender,
+            text=clean_text,
+            quoted_sender=quoted_sender,
+            now=now,
+            roast_angle=roast_angle,
+            image_path=image_path,
+        )
+
+    def _compose_reply(
+        self,
+        group_id: str,
+        sender: str,
+        text: str,
+        quoted_sender: str,
+        now: float,
+        roast_angle: str = "",
+        image_path: Path | None = None,
+        allow_image_lookup: bool = True,
+        history_strip: list[str] | None = None,
+    ) -> BotResponse:
+        """
+        「已决定回复」之后的统一流程：关联图片 → 调大脑 → 养成记账 → 挑表情包 → 写历史。
+
+        被 handle_message（@唤醒/追认/吐槽）和 pop_due_triggers（停顿后判定）共用，
+        保证两条入口的统计、表情包、历史落库行为完全一致。
+        """
         # 一旦被正式触发，适当消耗社交电量并重置计数
         self._unanswered_count[group_id] = 0
         heartflow.drain(group_id, amount=25.0)
@@ -761,11 +1235,11 @@ class DaFeiYuBotCore:
         # 5. 如果这条是纯文本触发，从本群 SQLite 近期历史图片中智能关联（支持跨人问图、序号问图、引用图片、连续追问）
         effective_image = image_path
         image_sender = sender if effective_image is not None else ""
-        if effective_image is None:
+        if effective_image is None and allow_image_lookup and not roast_angle:
             effective_image, image_sender = self._pick_referenced_image(
                 group_id=group_id,
                 sender=sender,
-                text=clean_text,
+                text=text,
                 now=now,
                 quoted_sender=quoted_sender,
             )
@@ -774,7 +1248,12 @@ class DaFeiYuBotCore:
         status = pet_engine.get_status()
         user_aff = pet_engine.get_user_affinity(group_id, sender)
         recent = pet_engine.get_recent_history(group_id, limit=22)
-        prompt_text = self._strip_trigger(clean_text)
+        # 去抖路径下 text 是「这一波的合并文本」，与历史里已落库的单条重复，
+        # 先把这些单条从历史里摘掉，避免模型以为群友把同一句说了两遍
+        if history_strip:
+            strip_set = {s.strip() for s in history_strip if s and s.strip()}
+            recent = [m for m in recent if (m.get("content") or "").strip() not in strip_set]
+        prompt_text = self._strip_trigger(text)
 
         brain_reply = brain.reply(
             sender=sender,
@@ -785,6 +1264,7 @@ class DaFeiYuBotCore:
             image_path=effective_image,
             group_id=group_id,
             image_sender=image_sender,
+            roast_hint=roast_angle,
         )
 
         # 将识别到的图片内容摘要回写进历史，后续聊天不会失忆
@@ -890,6 +1370,58 @@ class DaFeiYuBotCore:
             status=new_status,
         )
 
+    def _maybe_run_nightly_maintenance(self, group_id: str, status=None) -> None:
+        """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个逻辑日只跑一次。"""
+        dt = datetime.now()
+        if dt.hour < 4:
+            logical_day = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif dt.hour == 23 and dt.minute >= 45:
+            logical_day = dt.strftime("%Y-%m-%d")
+        else:
+            return
+        if self._last_nightly_date == logical_day:
+            return
+        self.run_nightly_maintenance(group_id, status, logical_day=logical_day)
+
+    def run_nightly_maintenance(self, group_id: str, status=None, logical_day: str = "") -> dict:
+        """
+        四层记忆夜间养护：L2 日记 → L1 巩固 → 周日周结 → 备份。
+
+        以前整段包在 `except Exception: pass` 里，日记写失败一点痕迹都不留；
+        现在每一步都落日志，真没写成也能直接看到原因。
+        某群当天没有聊天记录时不占当天名额，留给下一个有内容的群。
+        """
+        dt = datetime.now()
+        logical_day = logical_day or dt.strftime("%Y-%m-%d")
+        status = status or pet_engine.get_status()
+        recent = pet_engine.get_recent_history(group_id, limit=15)
+        if not recent:
+            logger.info("[%s] 夜间养护跳过：该群没有聊天记录，等有内容的群再跑", group_id)
+            return {"skipped": "empty_history"}
+
+        self._last_nightly_date = logical_day
+        logger.info("[%s] 🌙 开始夜间四层记忆养护（近期消息 %d 条）", group_id, len(recent))
+        result: dict = {"diary": False, "consolidate": None, "weekly": False, "backup": ""}
+        try:
+            result["diary"] = brain.write_daily_diary(recent, status)
+            logger.info("[%s] L2 日记写入结果: %s", group_id, "成功" if result["diary"] else "未写入（看上一条日志）")
+        except Exception as exc:
+            logger.warning("[%s] L2 日记写入异常: %s", group_id, exc)
+        try:
+            result["consolidate"] = memory_store.consolidate()
+        except Exception as exc:
+            logger.warning("[%s] L1 夜间巩固异常: %s", group_id, exc)
+        try:
+            if dt.weekday() == 6:  # 周日自动生成周结
+                result["weekly"] = bool(memory_store.generate_weekly_summary())
+        except Exception as exc:
+            logger.warning("[%s] 周结生成异常: %s", group_id, exc)
+        try:
+            result["backup"] = str(memory_store.backup_memory(keep_last=7) or "")
+        except Exception as exc:
+            logger.warning("[%s] 记忆备份异常: %s", group_id, exc)
+        return result
+
     def check_autonomous_heartbeat(self, group_id: str) -> BotResponse | None:
         """
         后台定时巡检（建议每 5 分钟调用一次）：
@@ -899,21 +1431,10 @@ class DaFeiYuBotCore:
         """
         now = time.time()
         dt = datetime.now()
-        today = dt.strftime("%Y-%m-%d")
         status = pet_engine.get_status()
 
-        # 0. 每晚 23:50 自动执行四层记忆夜间养护（写 L2 日记 + L1 巩固合并淘汰 + 周日周结 + 自动备份）
-        if dt.hour == 23 and dt.minute >= 45 and self._last_nightly_date != today:
-            self._last_nightly_date = today
-            try:
-                recent = pet_engine.get_recent_history(group_id, limit=15)
-                brain.write_daily_diary(recent, status)
-                memory_store.consolidate()
-                if dt.weekday() == 6:  # 周日自动生成周结
-                    memory_store.generate_weekly_summary()
-                memory_store.backup_memory(keep_last=7)
-            except Exception:
-                pass
+        # 0. 每晚 23:45 之后自动执行四层记忆夜间养护（写 L2 日记 + L1 巩固合并淘汰 + 周日周结 + 自动备份）
+        self._maybe_run_nightly_maintenance(group_id, status)
 
         if not settings.ENABLE_SCHEDULED_BUBBLE or self.is_quiet_hours():
             return None

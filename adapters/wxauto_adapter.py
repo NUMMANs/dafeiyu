@@ -36,6 +36,76 @@ class WxAutoAdapter:
         self._start_ts: float = time.time()
         self._media_downloader = None
         self._prestart_img_count: dict[str, int] = {}
+        # 已经告警过的群名，避免每个巡检周期刷同一条日志
+        self._warned_groups: set[str] = set()
+        # 启动后真的收到过消息的群。用于判断群名是否正确：
+        # 从没收到过消息的群，SendMsg 很可能因为「找不到会话」而漂移到当前打开的聊天窗口。
+        self._seen_groups: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # 群白名单：所有「主动发消息」都必须先过这一关
+    # ------------------------------------------------------------------
+
+    def _is_allowed_group(self, name: str) -> bool:
+        """
+        群名是否在配置白名单内（精确匹配）。
+
+        为什么要这么严：wxauto 的 SendMsg(who=群名) 在某些版本里找不到目标会话时，
+        会退化成「发到当前打开的聊天窗口」。白名单里只要有一个拼错/改名/乱码的群名，
+        定时冒泡、自主问候、去抖接话就可能落到用户当时正在看的任意群或私聊。
+        """
+        n = (name or "").strip()
+        if not n:
+            return False
+        return n in {(g or "").strip() for g in self.groups if (g or "").strip()}
+
+    def _is_live_group(self, name: str) -> bool:
+        """
+        这个群启动后是否真的收到过消息。
+
+        白名单只能保证「配置里有」，保证不了「微信里真的有」。
+        群名写错/被改名时 AddListenChat 可能静默不报错，此后每次 SendMsg 都在赌版本行为。
+        所以主动冒泡额外要求「这个群确实有过真实收发」，宁可少说一句，也不发错地方。
+        """
+        return (name or "").strip() in self._seen_groups
+
+    def _reject_group(self, name: str, action: str) -> None:
+        n = (name or "").strip() or "<空群名>"
+        if n not in self._warned_groups:
+            self._warned_groups.add(n)
+            logger.warning(
+                "⛔ 已忽略非白名单会话 [%s]（动作=%s）。当前白名单：%s；"
+                "若这确实是目标群，请核对 WX_GROUP_WHITELIST 里的群名是否与微信里完全一致",
+                n,
+                action,
+                self.groups,
+            )
+
+    def _safe_send(self, wx, text: str, who: str, action: str = "发送") -> bool:
+        """带白名单校验的文本发送。返回是否真的发出去了。"""
+        target = (who or "").strip()
+        if not self._is_allowed_group(target):
+            self._reject_group(target, action)
+            return False
+        try:
+            wx.SendMsg(text, who=target)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] %s失败: %s", target, action, exc)
+            return False
+
+    def _safe_send_file(self, wx, path: str, who: str, action: str = "发送附件") -> bool:
+        """带白名单校验的文件/图片发送。"""
+        target = (who or "").strip()
+        if not self._is_allowed_group(target):
+            self._reject_group(target, action)
+            return False
+        try:
+            wx.SendFiles(path, who=target)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] %s失败: %s", target, action, exc)
+            return False
 
     def _clean_group_text(self, raw: str) -> str:
         text = (raw or "").strip()
@@ -182,6 +252,13 @@ class WxAutoAdapter:
         return None
 
     def _dispatch_message(self, group_name: str, msg, chat, wx=None) -> None:
+        # 白名单硬校验：不在配置里的会话一律不处理（不回复、不记历史、不冒泡）
+        if not self._is_allowed_group(group_name):
+            self._reject_group(group_name, "接收消息")
+            return
+        # 收到过消息 = 这个群名在微信里确实存在，可以放心主动发言
+        self._seen_groups.add(group_name.strip())
+
         # 启动前就已存在的历史消息：不触发回复，但静默写入短期记忆，让大肥鱼刚启动就懂群里刚才在聊啥！
         create_time = getattr(msg, "create_time", None)
         if isinstance(create_time, (int, float)) and create_time > 0:
@@ -325,12 +402,26 @@ class WxAutoAdapter:
                         logger.warning("[%s] 处理消息异常: %s", gname, exc)
                 return _cb
 
+            # 只保留「真的监听成功」的群：配置里拼错/已改名/乱码的群名会在这里被剔除，
+            # 否则每 5 分钟的自主冒泡会一直拿它调 SendMsg，被 wxauto 退化发到当前打开的会话。
+            listening: list[str] = []
             for group in self.groups:
                 try:
                     res = wx.AddListenChat(nickname=group, callback=_make_callback(group))
+                    if res is False:
+                        raise RuntimeError("AddListenChat 返回 False（通常是找不到该群）")
+                    listening.append(group)
                     logger.info("已添加微信群监听 [%s]: %s（历史消息已自动过滤，仅响应此刻之后的新消息）", group, res)
                 except Exception as exc:
-                    logger.error("添加微信群监听 [%s] 失败: %s", group, exc)
+                    logger.error("添加微信群监听 [%s] 失败，已从冒泡名单剔除（请检查群名是否写错/被改名）: %s", group, exc)
+
+            if listening:
+                self.groups = listening
+            else:
+                # 一个都没监听成功：清空发言名单，宁可全程静默也不能让 SendMsg 落到别处
+                self.groups = []
+                logger.error("⚠️ 没有任何群监听成功，已禁止一切主动发言！请检查 WX_GROUP_WHITELIST 里的群名是否与微信里完全一致")
+            logger.info("主动发言白名单已收窄为: %s", self.groups)
 
             if hasattr(wx, "StartListening"):
                 wx.StartListening()
@@ -341,11 +432,8 @@ class WxAutoAdapter:
                 target_group = (notice.get("group_id") or "").strip()
                 notify_targets = [target_group] if target_group else (list(self.groups[:1]) if self.groups else [])
                 for tg in notify_targets:
-                    try:
-                        wx.SendMsg(notice["msg"], who=tg)
+                    if self._safe_send(wx, notice["msg"], tg, "发送重启通知"):
                         logger.info("📢 已向 [%s] 发送重启回归通知: %s", tg, notice["msg"][:80])
-                    except Exception as exc:
-                        logger.warning("发送重启通知到 [%s] 失败: %s", tg, exc)
 
             # 后台巡检循环：DSH完工投递(5s)、定时任务(15s)、Git远程更新(AUTO_GIT_POLL_SEC)、自主冒泡与夜间养护(300s)
             last_heartbeat = time.time()
@@ -356,6 +444,26 @@ class WxAutoAdapter:
                 time.sleep(1.0)
                 now_loop = time.time()
 
+                # 0. 去抖队列：群里停顿够久就把挂起的 L2/L2.5 判定执行掉并发言（每秒一次）
+                try:
+                    for target_group, d_resp in bot_core.pop_due_triggers(now_loop):
+                        if not d_resp.should_reply:
+                            continue
+                        if not self._is_allowed_group(target_group):
+                            self._reject_group(target_group, "停顿后接话")
+                            continue
+                        logger.info("[%s] 停顿后接话: %s", target_group, (d_resp.text or "")[:80])
+                        bubbles = d_resp.get_bubbles()
+                        for idx, b in enumerate(bubbles):
+                            self._safe_send(wx, b, target_group, "停顿后接话")
+                            if idx < len(bubbles) - 1:
+                                time.sleep(0.15)
+                        if d_resp.sticker_path and d_resp.sticker_path.is_file() and d_resp.sticker_path.stat().st_size > 0:
+                            time.sleep(0.15)
+                            self._safe_send_file(wx, str(d_resp.sticker_path.resolve()), target_group)
+                except Exception as exc:
+                    logger.warning("去抖判定发送异常: %s", exc)
+
                 # 1. 每 15 秒检查到点的用户定时任务
                 if (now_loop - last_schedule_check) >= 15:
                     last_schedule_check = now_loop
@@ -363,13 +471,18 @@ class WxAutoAdapter:
                         target_group = task.get("group_id")
                         if not target_group:
                             continue
+                        if not self._is_allowed_group(target_group):
+                            # 任务可能是旧群名/改名前的群，宁可丢弃也不能发到别的会话
+                            self._reject_group(target_group, f"定时任务 #{task.get('id')}")
+                            continue
                         try:
                             logger.info("⏰ 触发定时任务 #%s -> [%s]: %s", task.get("id"), target_group, task.get("content"))
                             t_resp = bot_core.execute_scheduled_task(task)
                             if t_resp and t_resp.should_reply:
-                                for idx, b in enumerate(t_resp.get_bubbles()):
-                                    wx.SendMsg(b, who=target_group)
-                                    if idx < len(t_resp.get_bubbles()) - 1:
+                                bubbles = t_resp.get_bubbles()
+                                for idx, b in enumerate(bubbles):
+                                    self._safe_send(wx, b, target_group, "定时任务")
+                                    if idx < len(bubbles) - 1:
                                         time.sleep(0.15)
                                 if (
                                     t_resp.sticker_path
@@ -377,8 +490,8 @@ class WxAutoAdapter:
                                     and t_resp.sticker_path.stat().st_size > 0
                                 ):
                                     time.sleep(0.15)
-                                    send_res = wx.SendFiles(str(t_resp.sticker_path.resolve()), who=target_group)
-                                    logger.info("⏰ 定时任务发送附件 [%s] 结果: %s", t_resp.sticker_path.name, send_res)
+                                    ok = self._safe_send_file(wx, str(t_resp.sticker_path.resolve()), target_group)
+                                    logger.info("⏰ 定时任务发送附件 [%s] 结果: %s", t_resp.sticker_path.name, ok)
                         except Exception as exc:
                             logger.warning("执行定时任务 #%s 异常: %s", task.get("id"), exc)
 
@@ -386,14 +499,25 @@ class WxAutoAdapter:
                 if (now_loop - last_heartbeat) >= 300:
                     last_heartbeat = now_loop
                     for group in self.groups:
+                        # 群名配错/被改名时 wxauto 可能不报错，但 SendMsg 会漂移到当前窗口。
+                        # 启动后从没收到过这个群的消息，就不主动开口。
+                        if not self._is_live_group(group):
+                            if group not in self._warned_groups:
+                                self._warned_groups.add(group)
+                                logger.warning(
+                                    "[%s] 启动后从未收到该群消息，暂不主动冒泡（请确认群名与微信里完全一致）",
+                                    group,
+                                )
+                            continue
                         try:
                             hb = bot_core.check_autonomous_heartbeat(group)
                             if hb and hb.should_reply:
                                 logger.info("[%s] 大肥鱼自主冒泡: %s", group, hb.text[:80])
-                                wx.SendMsg(hb.text, who=group)
+                                if not self._safe_send(wx, hb.text, group, "自主冒泡"):
+                                    continue
                                 if hb.sticker_path and hb.sticker_path.is_file():
                                     time.sleep(0.2)
-                                    wx.SendFiles(str(hb.sticker_path.resolve()), who=group)
+                                    self._safe_send_file(wx, str(hb.sticker_path.resolve()), group)
                         except Exception as exc:
                             logger.warning("[%s] 自主冒泡发送异常: %s", group, exc)
 
@@ -409,10 +533,7 @@ class WxAutoAdapter:
                             if ok_pull:
                                 pre_notice = f"🛰️ 检测到 Git 新提交（{update_info}），代码校验通过，即将重启更新..."
                                 if first_group:
-                                    try:
-                                        wx.SendMsg(pre_notice, who=first_group)
-                                    except Exception as exc:
-                                        logger.warning("发送更新预告到 [%s] 失败: %s", first_group, exc)
+                                    self._safe_send(wx, pre_notice, first_group, "发送更新预告")
                                 request_restart(
                                     reason=f"GitHub 自动更新 ({update_info})",
                                     notify_group=first_group,
@@ -422,10 +543,12 @@ class WxAutoAdapter:
                             else:
                                 logger.warning("自动拉取未通过检查: %s", pull_detail)
                                 if first_group and "语法错误" in pull_detail:
-                                    try:
-                                        wx.SendMsg(f"⚠️ 检测到 Git 新提交（{update_info}），但 {pull_detail}", who=first_group)
-                                    except Exception as exc:
-                                        logger.warning("发送回滚告警到 [%s] 失败: %s", first_group, exc)
+                                    self._safe_send(
+                                        wx,
+                                        f"⚠️ 检测到 Git 新提交（{update_info}），但 {pull_detail}",
+                                        first_group,
+                                        "发送回滚告警",
+                                    )
                     except Exception as exc:
                         logger.warning("自动检测 Git 更新异常: %s", exc)
 
@@ -440,7 +563,8 @@ class WxAutoAdapter:
                             if not target_group:
                                 continue
                             msg_text, attach_path = format_job_delivery(done_job)
-                            wx.SendMsg(msg_text, who=target_group)
+                            if not self._safe_send(wx, msg_text, target_group, "DSH 任务投递"):
+                                continue
                             logger.info("🤖 已投递 DSH 任务 #%s 结果到 [%s]", done_job.get("job_id"), target_group)
                             if (
                                 attach_path is not None
@@ -448,7 +572,7 @@ class WxAutoAdapter:
                                 and attach_path.stat().st_size > 0
                             ):
                                 time.sleep(0.2)
-                                wx.SendFiles(str(attach_path.resolve()), who=target_group)
+                                self._safe_send_file(wx, str(attach_path.resolve()), target_group)
                     except Exception as exc:
                         logger.warning("检查并投递 DSH 后台任务异常: %s", exc)
 
@@ -458,12 +582,41 @@ class WxAutoAdapter:
             return
 
         # 兼容旧版 wxauto 3.9 轮询模式
+        listening: list[str] = []
         for group in self.groups:
-            wx.AddListenChat(who=group, savepic=True)
-            logger.info("已添加微信群监听(3.9): [%s]", group)
+            try:
+                wx.AddListenChat(who=group, savepic=True)
+                listening.append(group)
+                logger.info("已添加微信群监听(3.9): [%s]", group)
+            except Exception as exc:
+                logger.error("添加微信群监听(3.9) [%s] 失败，已从冒泡名单剔除: %s", group, exc)
+        if listening:
+            self.groups = listening
+        else:
+            self.groups = []
+            logger.error("⚠️ 没有任何群监听成功，已禁止一切主动发言！请检查 WX_GROUP_WHITELIST 里的群名是否与微信里完全一致")
+        logger.info("主动发言白名单已收窄为: %s", self.groups)
 
         while not self._stop_event.is_set():
             try:
+                # 去抖队列：停顿够久就把挂起的 L2/L2.5 判定执行掉并发言
+                now_poll = time.time()
+                for target_group, d_resp in bot_core.pop_due_triggers(now_poll):
+                    if not d_resp.should_reply:
+                        continue
+                    if not self._is_allowed_group(target_group):
+                        self._reject_group(target_group, "停顿后接话")
+                        continue
+                    logger.info("[%s] 停顿后接话: %s", target_group, (d_resp.text or "")[:80])
+                    bubbles = d_resp.get_bubbles()
+                    for idx, b in enumerate(bubbles):
+                        self._safe_send(wx, b, target_group, "停顿后接话")
+                        if idx < len(bubbles) - 1:
+                            time.sleep(0.15)
+                    if d_resp.sticker_path and d_resp.sticker_path.is_file() and d_resp.sticker_path.stat().st_size > 0:
+                        time.sleep(0.15)
+                        self._safe_send_file(wx, str(d_resp.sticker_path.resolve()), target_group)
+
                 listen_msgs = wx.GetListenMessage()
                 for chat, msgs in listen_msgs.items():
                     group_name = getattr(chat, "who", "未知群聊")
