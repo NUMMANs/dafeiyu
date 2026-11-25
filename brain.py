@@ -58,23 +58,38 @@ CODE_OR_FILE_CUES = (
     "发个文件", "发文件", "保存成", "生成文件",
 )
 
+# 命中这些迹象才把「主人专用电脑工具」挂上来。平时群聊根本用不到，
+# 而 13 个 schema 的 JSON 每轮固定要吃掉约 1.3k tokens（占输入四成），
+# 关掉思考省下来的钱不该在这里漏掉。宁可放宽一点，别让正经干活时找不到工具。
+AGENT_TOOL_CUES = (
+    "文件", "目录", "文件夹", "路径", "保存", "读取", "写入", "新建",
+    "代码", "脚本", "运行", "执行", "命令", "终端", "powershell", "cmd",
+    "python", "java", "node", "sql", "数据库", "装一下", "安装", "依赖",
+    "报错", "bug", "调试", "编译",
+    ".py", ".js", ".html", ".json", ".csv", ".md", ".txt", ".bat", ".ps1", ".exe",
+    "进程", "内存", "cpu", "盘", "磁盘", "硬盘", "截图", "截屏", "桌面",
+    "电脑", "本机", "系统", "配置", "日志",
+    "重启", "更新", "拉取", "git", "部署", "上线", "改自己",
+    "dsh", "后台任务", "派给",
+    "抓取", "网页", "链接", "http",
+)
+
+
+def _needs_agent_tools(text: str) -> bool:
+    """这句是不是在指挥我操作电脑/改自己。不是就只挂聊天用的轻量工具。"""
+    low = (text or "").lower()
+    return any(c in low for c in AGENT_TOOL_CUES)
+
+
 SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": (
-                "联网搜索最新信息。当群友问到最新新闻、实时天气、新游戏/版本攻略、近期热梗、"
-                "具体报错解决方案或你不确定的实时事实时调用此工具。"
-            ),
+            "description": "联网搜最新信息（新闻/天气/版本攻略/报错/不确定的实时事实）。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "简洁精准的中文搜索关键词",
-                    }
-                },
+                "properties": {"query": {"type": "string", "description": "搜索关键词"}},
                 "required": ["query"],
             },
         },
@@ -83,23 +98,20 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "remember_fact",
-            "description": (
-                "把一条值得长期记住的群友特征、约定、黑历史或群梗写入 L1 识海记忆库。"
-                "只有真正值得记住的事才调用（不要记录普通闲聊，严禁记录密码/身份证/银行卡）。"
-            ),
+            "description": "记进长期记忆（群友特征/约定/黑历史/群梗）。只记值得记的，禁记密码证件银行卡。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {"type": "string", "description": "简短清晰的事实描述（≤120字）"},
+                    "text": {"type": "string", "description": "事实描述，≤120字"},
                     "level": {
                         "type": "string",
                         "enum": ["normal", "important"],
-                        "description": "普通梗选 normal（7天半衰期），重要约定/人物特征选 important（30天半衰期）",
+                        "description": "普通梗 normal；重要约定/人物特征 important",
                     },
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "2~4 个关键词标签（如群友昵称、游戏名、话题名）用于图扩散联想",
+                        "description": "2~4 个标签（昵称/游戏/话题）",
                     },
                 },
                 "required": ["text", "tags"],
@@ -110,15 +122,12 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "learn_slang",
-            "description": (
-                "记录群聊专属黑话、外号或内部梗（比如某个地名/游戏道具/群友外号的含义），"
-                "以后群里再提到这个词时你能秒懂。"
-            ),
+            "description": "记群内黑话/外号/内部梗，以后提到就懂。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "term": {"type": "string", "description": "黑话词或外号（如：致竞、皮箱、海斗）"},
-                    "meaning": {"type": "string", "description": "这个词在群里的真实含义"},
+                    "term": {"type": "string", "description": "黑话词或外号"},
+                    "meaning": {"type": "string", "description": "群里的真实含义"},
                 },
                 "required": ["term", "meaning"],
             },
@@ -128,18 +137,10 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "evolve_persona",
-            "description": (
-                "自我升级/微调自己的人设性格！当你和群友相处久了，觉得自己长出了新习惯、新喜好、"
-                "新口癖或新态度（或者群友建议你改某个风格且你觉得有意思）时调用，会永久写进你的人格卡。"
-            ),
+            "description": "永久改自己的人设（长出新的习惯/口癖/态度，或群友建议且你觉得有意思）。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "note": {
-                        "type": "string",
-                        "description": "第一人称写一句简短的自我进化记录（如：我发现我越来越爱看群友排位破防了，以后遇到连跪要多调侃两句）",
-                    }
-                },
+                "properties": {"note": {"type": "string", "description": "第一人称一句自我进化记录"}},
                 "required": ["note"],
             },
         },
@@ -147,44 +148,30 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "add_schedule",
-            "description": (
-                "创建一个定时任务（持久化保存，重启不丢）。支持：一次性提醒（如10分钟后、今天22:00）、"
-                "每日定时（如每天08:30）、固定间隔循环（每N分钟）。"
-                "如果只是普通喊话/提醒用 mode='remind'；如果到点需要你去联网查天气/查比赛/截屏/执行命令，用 mode='ai_task'！"
-            ),
+            "name": "schedule",
+            "description": "定时任务。action=add 新建 / list 查看本群任务 / delete 删除。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_type": {"type": "string", "enum": ["once", "daily", "interval"]},
-                    "mode": {"type": "string", "enum": ["remind", "ai_task"], "description": "remind=到点直接发提醒文字；ai_task=到点触发AI自动执行任务"},
-                    "content": {"type": "string", "description": "提醒内容或要AI执行的指令（如：查一下今天北京天气并播报）"},
-                    "delay_minutes": {"type": "integer", "description": "task_type=once 时：多少分钟后执行（如 10）"},
-                    "run_at": {"type": "string", "description": "task_type=once 时：具体时间 YYYY-MM-DD HH:MM 或 HH:MM"},
-                    "daily_time": {"type": "string", "description": "task_type=daily 时：每日执行时间 HH:MM（如 08:30）"},
-                    "interval_minutes": {"type": "integer", "description": "task_type=interval 时：间隔分钟数（>=5）"},
+                    "action": {"type": "string", "enum": ["add", "list", "delete"]},
+                    "content": {"type": "string", "description": "add：提醒内容或要AI执行的指令"},
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["once", "daily", "interval"],
+                        "description": "add：一次性/每日/固定间隔",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["remind", "ai_task"],
+                        "description": "remind=到点发文字；ai_task=到点让AI干活",
+                    },
+                    "run_at": {"type": "string", "description": "once：HH:MM 或 YYYY-MM-DD HH:MM"},
+                    "delay_minutes": {"type": "integer", "description": "once：多少分钟后"},
+                    "daily_time": {"type": "string", "description": "daily：HH:MM"},
+                    "interval_minutes": {"type": "integer", "description": "interval：间隔分钟（≥5）"},
+                    "task_id": {"type": "string", "description": "delete：任务ID"},
                 },
-                "required": ["task_type", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_schedules",
-            "description": "查看当前群里已经设置的所有定时任务和任务 ID",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_schedule",
-            "description": "根据任务 ID 取消/删除某个定时任务",
-            "parameters": {
-                "type": "object",
-                "properties": {"task_id": {"type": "string", "description": "定时任务 6 位 ID"}},
-                "required": ["task_id"],
+                "required": ["action"],
             },
         },
     },
@@ -192,21 +179,12 @@ SEARCH_TOOLS = [
         "type": "function",
         "function": {
             "name": "inspect_group_image",
-            "description": (
-                "重新查看本群历史聊天记录里的某张图片细节。当群友问「上面那张图」「刚才截图」「第二张图」"
-                "「之前发的战绩图」「帮我看看群里那张照片」等需要看具体画面或文字时调用。"
-            ),
+            "description": "重看本群历史里的某张图（「上面那张」「刚才截图」「第二张战绩图」）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "index": {
-                        "type": "integer",
-                        "description": "倒数第几张图（1=最新一张，2=倒数第二张，范围 1~8，默认 1）",
-                    },
-                    "question": {
-                        "type": "string",
-                        "description": "重点识别或确认的图片问题/细节（可选）",
-                    },
+                    "index": {"type": "integer", "description": "倒数第几张，1=最新，范围1~8，默认1"},
+                    "question": {"type": "string", "description": "重点看什么（可选）"},
                 },
             },
         },
@@ -214,37 +192,14 @@ SEARCH_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_and_send_image",
-            "description": (
-                "按关键词联网搜索并下载一张清晰图片，直接作为图片发到当前群里。"
-                "只要群友让你找图、搜图、下载某角色/人物/风景/猫猫/壁纸/梗图发群里（不限游戏或题材），必须直接调用此工具，不要拒绝。"
-            ),
+            "name": "send_image",
+            "description": "找图发到群里：给 query 按关键词搜图；给 url 下直链图。别拒绝找图请求。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "精确简洁的搜图关键词（例如：'原神 刻晴 高清壁纸'、'银渐层猫 表情包'）",
-                    }
+                    "query": {"type": "string", "description": "搜图关键词，如「原神 刻晴 壁纸」"},
+                    "url": {"type": "string", "description": "图片 http/https 直链"},
                 },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "download_image_from_url",
-            "description": "下载指定 http/https 图片直链并直接作为图片发送到当前微信群。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "以 http:// 或 https:// 开头的图片直链地址",
-                    }
-                },
-                "required": ["url"],
             },
         },
     },
@@ -300,6 +255,32 @@ def _encode_image_data_url(image_path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.I | re.S)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.I)
+_THINK_ANY_RE = re.compile(r"</?(?:think|answer)\b[^>]*>", re.I)
+
+
+def strip_think(text: str) -> str:
+    """
+    剥掉模型的思考草稿，只留最终正文。
+
+    三种情况都要能处理（第二种原来会整段漏进正文）：
+    1. 正常闭合 `<think>草稿</think>正式内容` → 删掉整块，留「正式内容」
+    2. **未闭合** `<think>草稿……`（被 max_tokens 截断）→ 标签之后全是草稿，整段丢弃
+    3. 孤立 `</think>`（缺开头）→ 只保留最后一个闭合标签之后的内容
+    """
+    if not text:
+        return ""
+    s = _THINK_BLOCK_RE.sub("", text)
+    parts = _THINK_OPEN_RE.split(s)
+    if len(parts) > 1:
+        s = parts[0]
+    if re.search(r"</think\s*>", s, flags=re.I):
+        s = re.split(r"</think\s*>", s, flags=re.I)[-1]
+    s = _THINK_ANY_RE.sub("", s)
+    return s.strip()
+
+
 def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | None:
     """
     使用智谱永久免费深度思考视觉模型 `glm-4.1v-thinking-flash` 做高精度看图：
@@ -341,13 +322,21 @@ def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | Non
         )
         with urllib.request.urlopen(req, timeout=18.0) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-        # 剥离 <think>...</think> 思考块，提取最终清晰结论
-        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
-        cleaned = re.sub(r"<answer>|</answer>", "", cleaned, flags=re.I).strip()
-        if cleaned:
-            logger.info("👁️ 智谱 glm-4.1v-thinking-flash 高精识图成功 (%d字)", len(cleaned))
-            return cleaned[:1000]
+        choice = (data.get("choices") or [{}])[0]
+        raw = (choice.get("message") or {}).get("content") or ""
+        finish = str(choice.get("finish_reason") or "")
+        # 剥离思考块；未闭合时（被 max_tokens 截断）strip_think 会整段丢弃
+        cleaned = " ".join(strip_think(raw).split()).strip()
+        # 剥完什么都不剩 = 这一轮全是思考草稿，宁可回退去用原生视觉，也不能把草稿当摘要
+        if not cleaned or len(cleaned) < 6 or _THINK_ANY_RE.search(cleaned):
+            logger.warning(
+                "智谱识图没给出正文（finish_reason=%s，原始 %d 字全是思考），回退 DeepSeek 原生看图",
+                finish,
+                len(raw),
+            )
+            return None
+        logger.info("👁️ 智谱 glm-4.1v-thinking-flash 高精识图成功 (%d字)", len(cleaned))
+        return cleaned[:1000]
     except Exception as exc:
         logger.warning("智谱高精识图失败，将回退 DeepSeek 原生看图: %s", exc)
     return None
@@ -522,7 +511,9 @@ class DaFeiYuBrain:
                 ],
                 max_tokens=600,
             )
-            return ((resp.choices[0].message.content or "").strip()) or "未能识别出图片内容"
+            body = strip_think(resp.choices[0].message.content or "")
+            body = " ".join(body.split()).strip()
+            return body[:1200] or "未能识别出图片内容"
         except Exception as exc:
             return f"查看历史图片失败: {exc}"
 
@@ -695,7 +686,7 @@ class DaFeiYuBrain:
             available_tools = list(SEARCH_TOOLS) if (settings.ENABLE_WEB_SEARCH and not used_search) else [
                 t for t in SEARCH_TOOLS if t["function"]["name"] != "web_search"
             ]
-            if is_owner(sender):
+            if is_owner(sender) and _needs_agent_tools(text):
                 available_tools.extend(AGENT_TOOL_SCHEMAS)
             if roast_hint:
                 available_tools = []  # 吐槽是纯嘴活，挂工具只会误触发搜索/改文件
@@ -789,28 +780,40 @@ class DaFeiYuBrain:
                         note = str(args.get("note") or "").strip()
                         _, tool_out = evolve_persona(note)
                         logger.info("✨ 大肥鱼自我进化人格: %s -> %s", note, tool_out)
-                    elif fn_name == "add_schedule":
-                        _, tool_out = scheduler.add_task(
-                            group_id=group_id,
-                            creator=sender,
-                            task_type=str(args.get("task_type") or "once"),
-                            content=str(args.get("content") or ""),
-                            mode=str(args.get("mode") or "remind"),
-                            delay_minutes=args.get("delay_minutes"),
-                            run_at=args.get("run_at"),
-                            daily_time=args.get("daily_time"),
-                            interval_minutes=args.get("interval_minutes"),
-                        )
-                    elif fn_name == "list_schedules":
-                        tasks = scheduler.list_tasks(group_id=group_id)
-                        if not tasks:
-                            tool_out = "当前群里没有任何定时任务"
-                        else:
-                            tool_out = "\n".join(
-                                f"#{t['id']} [{t['desc']}|{t['mode']}] {t['content']}" for t in tasks
+                    elif fn_name in ("schedule", "add_schedule", "list_schedules", "delete_schedule"):
+                        # 统一入口 schedule(action=...)；旧名字保留兼容模型的历史习惯
+                        act = str(args.get("action") or "").strip().lower()
+                        if fn_name == "add_schedule":
+                            act = "add"
+                        elif fn_name == "list_schedules":
+                            act = "list"
+                        elif fn_name == "delete_schedule":
+                            act = "delete"
+                        if act == "list":
+                            tasks = scheduler.list_tasks(group_id=group_id)
+                            if not tasks:
+                                tool_out = "当前群里没有任何定时任务"
+                            else:
+                                tool_out = "\n".join(
+                                    f"#{t['id']} [{t['desc']}|{t['mode']}] {t['content']}" for t in tasks
+                                )
+                        elif act == "delete":
+                            tid = str(args.get("task_id") or "").strip()
+                            _, tool_out = (
+                                scheduler.delete_task(tid) if tid else (False, "缺少 task_id，删不掉")
                             )
-                    elif fn_name == "delete_schedule":
-                        _, tool_out = scheduler.delete_task(str(args.get("task_id") or ""))
+                        else:
+                            _, tool_out = scheduler.add_task(
+                                group_id=group_id,
+                                creator=sender,
+                                task_type=str(args.get("task_type") or "once"),
+                                content=str(args.get("content") or ""),
+                                mode=str(args.get("mode") or "remind"),
+                                delay_minutes=args.get("delay_minutes"),
+                                run_at=args.get("run_at"),
+                                daily_time=args.get("daily_time"),
+                                interval_minutes=args.get("interval_minutes"),
+                            )
                     elif fn_name == "inspect_group_image":
                         recent_imgs = pet_engine.get_recent_images(group_id, limit=8)
                         try:
@@ -831,20 +834,21 @@ class DaFeiYuBrain:
                                 re.sub(r"\s+", " ", detail).strip()[:180],
                             )
                             tool_out = f"第 {idx} 张图（由 {target_img['sender']} 发送）：\n{detail}"
-                    elif fn_name == "search_and_send_image":
-                        q = str(args.get("query") or "").strip()
-                        logger.info("🖼️ 联网搜图并发送: %s", q)
-                        fpath, tool_out = search_and_download_image(q)
-                        if fpath and fpath.is_file() and fpath.stat().st_size > 0:
-                            attachment_path = fpath
-                            tool_out = f"{tool_out}。图片已加入待发送附件，请用一两句{voice_hint}告诉群友图给他们找来啦。"
-                    elif fn_name == "download_image_from_url":
+                    elif fn_name in ("send_image", "search_and_send_image", "download_image_from_url"):
                         u = str(args.get("url") or "").strip()
-                        logger.info("🌐 下载直链图片并发送: %s", u[:80])
-                        fpath, tool_out = download_image_url(u, label="urlimg")
-                        if fpath and fpath.is_file() and fpath.stat().st_size > 0:
-                            attachment_path = fpath
-                            tool_out = f"{tool_out}。图片已加入待发送附件，请直接简短告知群友。"
+                        q = str(args.get("query") or "").strip()
+                        if fn_name == "download_image_from_url" or (u and not q):
+                            logger.info("🌐 下载直链图片并发送: %s", u[:80])
+                            fpath, tool_out = download_image_url(u, label="urlimg")
+                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
+                                attachment_path = fpath
+                                tool_out = f"{tool_out}。图片已加入待发送附件，请直接简短告知群友。"
+                        else:
+                            logger.info("🖼️ 联网搜图并发送: %s", q)
+                            fpath, tool_out = search_and_download_image(q)
+                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
+                                attachment_path = fpath
+                                tool_out = f"{tool_out}。图片已加入待发送附件，请用一两句{voice_hint}告诉群友图给他们找来啦。"
                     elif fn_name in (
                         "run_shell",
                         "read_local_file",
@@ -854,8 +858,10 @@ class DaFeiYuBrain:
                         "take_screenshot",
                         "get_system_info",
                         "fetch_webpage",
+                        "send_file",
                         "create_and_send_file",
                         "send_existing_file",
+                        "self_ops",
                         "self_pull_and_restart",
                         "self_edit_code",
                         "self_restart",
@@ -864,7 +870,23 @@ class DaFeiYuBrain:
                     ):
                         is_danger = False
                         danger_reasons: list[str] = []
-                        if is_owner(sender) and fn_name in (
+                        # 合并后的新工具名要还原成安全策略认识的动作类型，
+                        # 否则确认码卡片和路径风险检查都会认不出来
+                        if fn_name == "send_file":
+                            act_type = (
+                                "create_and_send_file"
+                                if (args.get("filename") and not args.get("path"))
+                                else "send_existing_file"
+                            )
+                        elif fn_name == "self_ops":
+                            act_type = (
+                                "self_pull_and_restart"
+                                if str(args.get("action") or "").strip().lower() == "update"
+                                else "self_restart"
+                            )
+                        else:
+                            act_type = fn_name
+                        if is_owner(sender) and act_type in (
                             "run_shell",
                             "read_local_file",
                             "write_local_file",
@@ -874,7 +896,7 @@ class DaFeiYuBrain:
                             "delegate_to_dsh",
                         ):
                             is_danger, danger_reasons = assess_danger(
-                                fn_name,
+                                act_type,
                                 args if isinstance(args, dict) else {},
                                 user_text=text,
                             )
@@ -886,7 +908,7 @@ class DaFeiYuBrain:
                             _, confirm_card = stage_pending_action(
                                 group_id=group_id,
                                 sender=sender,
-                                action_type=fn_name,
+                                action_type=act_type,
                                 params=args if isinstance(args, dict) else {},
                                 reasons=danger_reasons,
                             )
@@ -929,28 +951,35 @@ class DaFeiYuBrain:
                             tool_out = get_system_info()
                         elif fn_name == "fetch_webpage":
                             tool_out = fetch_webpage(str(args.get("url") or ""))
-                        elif fn_name == "create_and_send_file":
+                        elif fn_name in ("send_file", "create_and_send_file", "send_existing_file"):
                             fname = str(args.get("filename") or "").strip()
-                            logger.info("📄 Agent 生成并发送文件: %s", fname or "<empty>")
-                            fpath, tool_out = create_and_send_file(fname, str(args.get("content") or ""))
-                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
-                                attachment_path = fpath
-                        elif fn_name == "send_existing_file":
-                            logger.info("📎 Agent 发送已有文件: %s", args.get("path"))
-                            fpath, tool_out = send_existing_file(str(args.get("path") or ""))
-                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
-                                attachment_path = fpath
-                        elif fn_name == "self_pull_and_restart":
-                            logger.info("🔄 Agent 触发自更新与重启")
-                            ok_pull, pull_detail = git_pull_and_check()
-                            if ok_pull:
-                                restart_msg = request_restart(
-                                    reason="从 GitHub 拉取最新代码",
-                                    notify_group=group_id,
+                            path_arg = str(args.get("path") or "").strip()
+                            if act_type == "create_and_send_file":
+                                logger.info("📄 Agent 生成并发送文件: %s", fname or "<empty>")
+                                fpath, tool_out = create_and_send_file(
+                                    fname, str(args.get("content") or "")
                                 )
-                                tool_out = f"{pull_detail}\n{restart_msg}\n请先简洁告知用户即将重启，几秒后会回来。"
                             else:
-                                tool_out = pull_detail
+                                logger.info("📎 Agent 发送已有文件: %s", path_arg)
+                                fpath, tool_out = send_existing_file(path_arg)
+                            if fpath and fpath.is_file() and fpath.stat().st_size > 0:
+                                attachment_path = fpath
+                        elif fn_name in ("self_ops", "self_pull_and_restart", "self_restart"):
+                            if act_type == "self_pull_and_restart":
+                                logger.info("🔄 Agent 触发自更新与重启")
+                                ok_pull, pull_detail = git_pull_and_check()
+                                if ok_pull:
+                                    restart_msg = request_restart(
+                                        reason="从 GitHub 拉取最新代码",
+                                        notify_group=group_id,
+                                    )
+                                    tool_out = f"{pull_detail}\n{restart_msg}\n请先简洁告知用户即将重启，几秒后会回来。"
+                                else:
+                                    tool_out = pull_detail
+                            else:
+                                reason = str(args.get("reason") or "主人要求重启")
+                                logger.info("♻️ Agent 触发重启: %s", reason)
+                                tool_out = request_restart(reason=reason, notify_group=group_id)
                         elif fn_name == "self_edit_code":
                             logger.info("🛠️ Agent 尝试自修改代码: %s", args.get("rel_path"))
                             tool_out = self_edit_code(
@@ -958,10 +987,6 @@ class DaFeiYuBrain:
                                 str(args.get("target") or ""),
                                 str(args.get("replacement") or ""),
                             )
-                        elif fn_name == "self_restart":
-                            reason = str(args.get("reason") or "主人要求重启")
-                            logger.info("♻️ Agent 触发重启: %s", reason)
-                            tool_out = request_restart(reason=reason, notify_group=group_id)
                         elif fn_name == "delegate_to_dsh":
                             task_text = str(args.get("task") or "")
                             sid = str(args.get("session_id") or "")

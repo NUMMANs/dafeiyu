@@ -763,3 +763,81 @@ TRIGGER_DEBOUNCE_MAX_WAIT_SEC=12
 - 攒满后新消息 → `due` 仍为 0，不顺延 ✔
 
 0 点链路：模拟 00:05 心跳 → `is_quiet_hours()=False`，返回 `BotResponse(text=..., file_path=...子代理调用统计_2026-11-25.txt)`，文件存在 ✔
+
+---
+
+## 13. 思考草稿污染历史 + 工具 schema 瘦身（2026-11-25）
+
+### 13.1 修掉：视觉模型的 `<think>` 草稿被写进聊天历史
+
+**现象**：`chat_history` 里有 13 条图片消息长这样——
+
+```
+[发了一张图片：<think>用户现在需要分析这张聊天截图的内容，然后按要求回答。首先看图片里的元素…
+```
+
+不是图片摘要，是智谱 `glm-4.1v-thinking-flash` 的思考草稿。群里当时就有人吐槽「这是思考过程没藏住 漏出来了」。
+
+**根因**：`_inspect_image_with_zhipu` 用 `re.sub(r"<think>.*?</think>", "")` 剥离思考，
+这个正则**必须要求闭合标签**。该模型 `max_tokens=1024` 一截断，`</think>` 根本没输出，
+正则不匹配 → 整段草稿原样返回 → `[:220]` 截断 → 写进 `chat_history`。
+
+后果不是一次的：这条记录会作为「群友说的话」**永久留在历史里，每一轮都喂给模型**。
+
+**修法**
+
+| 位置 | 改动 |
+|---|---|
+| `brain.py` | 新增 `strip_think()`：闭合块删除 → 未闭合 `<think` 之后整段丢弃 → 孤立 `</think>` 只取后半 → 清残留标签 |
+| `brain.py` | `_inspect_image_with_zhipu`：剥完若不足 6 字，判定「这轮全是思考」→ 返回 `None`，回退 DeepSeek 原生视觉，并打告警带 `finish_reason` |
+| `brain.py` | `inspect_image_detail` 的回退路径同样过一遍 `strip_think` |
+| `pet_engine.py` | 新增 `scrub_think()`，在 `update_history_content_by_image` 落库前再洗一遍（双保险，别的路径写脏数据也拦得住）；洗空了就退化成 `[发了一张图片]` |
+| 数据库 | 一次性清洗 13 条历史，全部归整为 `[发了一张图片]`；清洗前备份 `data/dafeiyu.db.bak_20261125_205513` |
+
+**验证**（`strip_think` 8 条用例 + 智谱返回值 4 种形态）
+
+| 输入 | 输出 |
+|---|---|
+| `<think>草稿</think>正式内容` | `正式内容` |
+| `<think>用户现在需要分析这张聊天截图…`（未闭合） | 空 → 回退原生视觉 |
+| `正式内容<think>还没写完` | `正式内容` |
+| `草稿</think>正式内容` | `正式内容` |
+| `<think>a</think>正文<think>b</think>` | `正文` |
+
+### 13.2 工具 schema：3011 → 1100 tokens
+
+**问题**：一次普通回复的输入里，25 个工具的 function schema 占 **3011 tokens（47%）**，
+比 20 条聊天历史（653 tokens）贵 4.6 倍，而且每轮全量重发。
+
+**两刀**
+
+**第一刀：合并同类，压缩文案（25 → 20 个，8117 → 6155 字符）**
+
+| 旧 | 新 | 说明 |
+|---|---|---|
+| `add_schedule` / `list_schedules` / `delete_schedule`（1329 字符） | `schedule(action=add\|list\|delete)` | 三合一 |
+| `search_and_send_image` / `download_image_from_url` | `send_image(query\|url)` | 二合一 |
+| `create_and_send_file` / `send_existing_file` | `send_file(path\|filename+content)` | 二合一 |
+| `self_restart` / `self_pull_and_restart` | `self_ops(action=restart\|update)` | 二合一 |
+
+老名字在执行分发里全部保留（`fn_name in (...)`），模型按旧习惯调用也不会失效。
+合名工具进 `assess_danger` 前会**归一化回动作类型**（如 `send_file` 带 `path` → `send_existing_file`），
+保证二次确认码与路径风险检查照常生效——已实测：`send_file(C:/Windows/.../hosts)` 正确弹出高危确认卡。
+
+**第二刀：主人专用工具不再常驻（真正的杠杆）**
+
+13 个电脑操纵工具（`run_shell` / `self_edit_code` / `delegate_to_dsh` …）平时群聊根本用不上，
+新增 `AGENT_TOOL_CUES` + `_needs_agent_tools(text)`：句子里出现「文件/代码/报错/重启/截图/盘/链接」这类迹象才挂载。
+
+**实测 prompt_tokens**
+
+| 场景 | 改造前 | 改造后 | 变化 |
+|---|---|---|---|
+| 闲聊（7 个工具） | 6379 | **4254** | −33% |
+| 干活（20 个工具） | 6379 | **5348** | −16% |
+| 其中工具本身 | 3011 | **1100 / 2121** | −63% / −30% |
+
+判定用例 8 条全部正确（「那今晚还打不打刺客信条」不挂、「帮我看看 D 盘还有多少空间」挂）。
+
+**权衡**：闲聊时模型看不到电脑工具，纯聊天不受影响；但若有人用很隐晦的说法让它操作电脑
+（完全不含上述关键词），它就不会去调工具。关键词表已放宽到 90 余个，覆盖常见说法。

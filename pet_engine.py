@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import threading
 import time
@@ -8,6 +9,27 @@ from typing import Any
 from config import DATA_DIR
 
 DB_PATH = DATA_DIR / "dafeiyu.db"
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.I | re.S)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.I)
+_THINK_ANY_RE = re.compile(r"</?(?:think|answer)\b[^>]*>", re.I)
+
+
+def scrub_think(text: str) -> str:
+    """
+    清洗写进聊天历史的图片摘要：绝不能把视觉模型的思考草稿当成群友说的话存下来。
+
+    未闭合的 `<think`（被 max_tokens 截断）后面全是草稿，直接丢弃；
+    剥完什么都不剩就返回空串，由调用方退化成「[发了一张图片]」。
+    """
+    s = _THINK_BLOCK_RE.sub("", text or "")
+    parts = _THINK_OPEN_RE.split(s)
+    if len(parts) > 1:
+        s = parts[0]
+    if re.search(r"</think\s*>", s, flags=re.I):
+        s = re.split(r"</think\s*>", s, flags=re.I)[-1]
+    s = _THINK_ANY_RE.sub("", s)
+    return " ".join(s.split()).strip()
 
 LEVEL_TITLES = [
     (0, "Lv.1 小鱼苗"),
@@ -365,9 +387,11 @@ class PetEngine:
             return int(row[0]) if row else 0
 
     def update_history_content_by_image(self, group_id: str, image_path: str, caption: str) -> None:
-        clean_cap = " ".join((caption or "").split()).strip()[:220]
+        # 视觉模型偶尔会把 <think> 思考草稿当正文返回，这里必须洗掉再落库，
+        # 否则这段话会作为一条「群友消息」永久留在历史里，每轮都喂给模型
+        clean_cap = scrub_think(caption)[:220]
         clean_path = (image_path or "").strip()
-        if not clean_cap or not clean_path:
+        if not clean_path:
             return
         with self._lock:
             row = self._conn.execute(
@@ -381,7 +405,12 @@ class PetEngine:
             if not row:
                 return
             cur_content = (row["content"] or "").strip()
-            if not cur_content:
+            if not clean_cap:
+                # 摘要被洗空了（全是思考草稿），只在原来是空消息时补一个占位
+                if cur_content:
+                    return
+                new_content = "[发了一张图片]"
+            elif not cur_content:
                 new_content = f"[发了一张图片：{clean_cap}]"
             elif "[图片内容：" not in cur_content and "[发了一张图片：" not in cur_content:
                 new_content = f"{cur_content}\n[图片内容：{clean_cap}]"

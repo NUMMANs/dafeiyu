@@ -228,10 +228,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_shell",
-            "description": "在当前 Windows 电脑上执行 PowerShell 命令（如查进程、运行脚本、系统操作等）",
+            "description": "在本机执行 PowerShell 命令。",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string", "description": "要执行的 PowerShell 命令"}},
+                "properties": {"command": {"type": "string", "description": "要执行的命令"}},
                 "required": ["command"],
             },
         },
@@ -240,10 +240,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_local_file",
-            "description": "读取本机文本文件内容",
+            "description": "读本机文本文件。",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "文件绝对路径或相对路径"}},
+                "properties": {"path": {"type": "string", "description": "文件路径"}},
                 "required": ["path"],
             },
         },
@@ -252,12 +252,12 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_local_file",
-            "description": "在本机创建或覆盖写入文本文件（如写脚本、记笔记、改配置）",
+            "description": "写本机文本文件（新建或覆盖）。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "目标文件路径"},
-                    "content": {"type": "string", "description": "要写入的完整文本内容"},
+                    "path": {"type": "string", "description": "目标路径"},
+                    "content": {"type": "string", "description": "完整文本内容"},
                 },
                 "required": ["path", "content"],
             },
@@ -267,10 +267,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_directory",
-            "description": "列出本机某个文件夹里的文件和子目录",
+            "description": "列本机目录下的文件与子目录。",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "文件夹路径"}},
+                "properties": {"path": {"type": "string", "description": "目录路径"}},
                 "required": ["path"],
             },
         },
@@ -279,10 +279,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "open_url_or_app",
-            "description": "在电脑上打开一个网址（如B站/网页）或启动本机应用程序/文件",
+            "description": "打开网址，或启动本机程序/文件。",
             "parameters": {
                 "type": "object",
-                "properties": {"target": {"type": "string", "description": "网址（https://...）或程序/文件路径"}},
+                "properties": {"target": {"type": "string", "description": "网址或程序/文件路径"}},
                 "required": ["target"],
             },
         },
@@ -291,7 +291,7 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "take_screenshot",
-            "description": "截取当前电脑桌面画面，并将截图发回给群友/主人看",
+            "description": "截取当前桌面并发回群里。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -299,7 +299,7 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_system_info",
-            "description": "查看当前电脑的 CPU、内存、C盘空间和占用最高的进程",
+            "description": "查 CPU、内存、C盘空间和占用最高的进程。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -307,10 +307,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "fetch_webpage",
-            "description": "抓取指定网页 URL 的正文纯文本内容",
+            "description": "抓指定网页的正文纯文本。",
             "parameters": {
                 "type": "object",
-                "properties": {"url": {"type": "string", "description": "以 http:// 或 https:// 开头的网页链接"}},
+                "properties": {"url": {"type": "string", "description": "网页链接"}},
                 "required": ["url"],
             },
         },
@@ -318,67 +318,44 @@ AGENT_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "create_and_send_file",
-            "description": (
-                "生成一个完整文件（如 .md 攻略/报告、.txt 整理文档、.py/.html/.js 代码脚本、.csv 表格、.json 数据）"
-                "并直接作为微信文件附件发到群里。当群友要你写长文档、攻略、代码文件、表格或明确要求「发个文件」时调用！"
-            ),
+            "name": "send_file",
+            "description": "发文件到群里：给 path 发本机已有文件；给 filename+content 先生成再发。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filename": {"type": "string", "description": "文件名（带后缀，如 剑魔攻略.md 或 整理脚本.py 或 清单.csv）"},
-                    "content": {"type": "string", "description": "文件的完整文本内容"},
+                    "path": {"type": "string", "description": "本机已有文件的完整路径"},
+                    "filename": {"type": "string", "description": "要生成的文件名（带后缀）"},
+                    "content": {"type": "string", "description": "要生成文件的完整内容"},
                 },
-                "required": ["filename", "content"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "send_existing_file",
-            "description": "把本机硬盘上已有的文件（文档/图片/代码/压缩包等）直接发到当前微信聊天里",
+            "name": "self_ops",
+            "description": "自身运维：restart=优雅重启；update=从 GitHub 拉最新代码并校验后重启。",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "本机文件的完整路径"}},
-                "required": ["path"],
+                "properties": {
+                    "action": {"type": "string", "enum": ["restart", "update"]},
+                    "reason": {"type": "string", "description": "原因说明，如「应用新的性格配置」"},
+                },
+                "required": ["action"],
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "self_pull_and_restart",
-            "description": (
-                "从 GitHub origin/main 拉取最新代码，自动校验全部 Python 文件语法（若有新依赖则安装），"
-                "若拉取到新版本且校验通过，则安排进程在约 2 秒后通过看门狗自动重启。"
-            ),
-            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "self_edit_code",
-            "description": (
-                "安全修改大肥鱼自身项目代码（支持精确局部替换或创建新文件），自动执行全量 Python 语法校验，"
-                "语法错误会自动回滚；禁止修改 .env、watchdog.py、self_ops.py 和 .git。"
-            ),
+            "description": "改自身源码（精确替换或新建文件），语法错误自动回滚；禁改 .env、watchdog.py、self_ops.py 和 .git。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "rel_path": {
-                        "type": "string",
-                        "description": "相对项目根目录的文件路径（如 brain.py、persona_runtime.py 或新插件文件路径）",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "要替换的精确原代码片段（若新建文件则传空字符串）",
-                    },
-                    "replacement": {
-                        "type": "string",
-                        "description": "替换后的新代码（或新建文件的完整内容）",
-                    },
+                    "rel_path": {"type": "string", "description": "相对项目根目录的路径，如 brain.py"},
+                    "target": {"type": "string", "description": "要替换的原片段；新建文件传空串"},
+                    "replacement": {"type": "string", "description": "替换后的新代码，或新文件完整内容"},
                 },
                 "required": ["rel_path", "target", "replacement"],
             },
@@ -387,43 +364,14 @@ AGENT_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "self_restart",
-            "description": "让大肥鱼优雅保存状态并在约 2 秒后退出，由看门狗进程自动重新拉起（适合改完代码或配置后生效）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "重启原因说明（例如：应用刚修改的性格配置）",
-                    }
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "delegate_to_dsh",
-            "description": (
-                "将需要多步编程、创建完整多文件项目或复杂互动网页、深度调试修 Bug、多次执行命令试错、"
-                "或为大肥鱼自身开发大型新功能的耗时任务，异步交给脱离主进程的 DSH (DeepSeek Harness) CLI 后台执行。"
-                "即使主程序重启也不中断，干完会自动发回群里。注意：普通闲聊、简单搜索、定时提醒和单文件小回答不要调用此工具。"
-            ),
+            "description": "把多步编程、多文件项目、深度调试等耗时任务异步交给后台 DSH，干完自动发回群里。闲聊和简单问题别用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "交给 DSH 执行的清晰完整任务需求（包含期望产物、文件路径或验证要求）",
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": "可选：留空则新建独立会话；填 'last' 可续接本群最近一次 DSH 会话上下文继续迭代",
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "可选：指定工作目录，留空默认项目根目录",
-                    },
+                    "task": {"type": "string", "description": "完整任务需求（含产物、路径、验证要求）"},
+                    "session_id": {"type": "string", "description": "留空新建会话；填 last 续接本群上次上下文"},
+                    "workdir": {"type": "string", "description": "工作目录，留空默认项目根目录"},
                 },
                 "required": ["task"],
             },
@@ -433,15 +381,10 @@ AGENT_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "check_dsh_jobs",
-            "description": "查询当前和最近后台 DSH 任务的运行状态、耗时及结果摘要。",
+            "description": "查后台 DSH 任务的状态、耗时和结果摘要。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "最多返回条数，默认 5",
-                    }
-                },
+                "properties": {"limit": {"type": "integer", "description": "返回条数，默认 5"}},
             },
         },
     },
