@@ -66,6 +66,21 @@ SENSITIVE_RE = re.compile(
 )
 
 
+def estimate_tokens(text: str) -> int:
+    """
+    粗略估算 token 数（不调用 tokenizer，脱离外网也能算）。
+
+    依据实测：中文约 1.5 字/token，英文与符号约 3~3.5 字符/token。
+    这里刻意取偏大的系数（中文 1.4、其他 3.0），宁可早一点触发压缩。
+    """
+    s = text or ""
+    if not s:
+        return 0
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", s))
+    other = len(s) - cjk
+    return int(cjk / 1.4 + other / 3.0) + 1
+
+
 def _tokenize(text: str) -> set[str]:
     """
     中文 2 字滑窗 + 英文单词，并过滤虚词。

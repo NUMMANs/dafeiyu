@@ -89,6 +89,15 @@ class Settings:
     # 四层记忆：夜间是否用一次轻量调用从当天群里提炼 L1 事实（否则只靠模型自己想起来记）
     MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
 
+    # L3 会话层：每次回复带多少条近期对话（原写死 20），0 表示不带
+    L3_HISTORY_LIMIT: int = max(0, int(os.getenv("L3_HISTORY_LIMIT", "20")))
+    # L3 会话层：整层占用超过多少 token 就压缩（每天 0 点后检查一次，按群判断）
+    L3_CONTEXT_LIMIT_TOKENS: int = max(10_000, int(os.getenv("L3_CONTEXT_LIMIT_TOKENS", "300000")))
+    # 压缩时无论如何都保留的最近消息条数（绝不参与压缩，防「刚聊的就被删」）
+    L3_KEEP_RECENT: int = max(20, int(os.getenv("L3_KEEP_RECENT", "120")))
+    # 一次压缩最多送给模型多少条旧消息（太多会撑爆摘要请求本身）
+    L3_COMPRESS_CHUNK: int = max(20, int(os.getenv("L3_COMPRESS_CHUNK", "200")))
+
     # 常规桌面 Agent 电脑操作权限
     ENABLE_AGENT_TOOLS: bool = _parse_bool(os.getenv("ENABLE_AGENT_TOOLS"), True)
     # 允许操纵电脑的主人昵称（逗号分隔，留空表示专用电脑/虚拟机内不限制；在多人大群里建议填你自己的微信名）

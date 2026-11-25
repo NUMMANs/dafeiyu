@@ -365,14 +365,8 @@ def _build_system_prompt(
 ) -> str:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     card_text = load_card()
-    if get_active_persona() == "fengge":
-        hunger_hint = f"段位 {status.title}。"
-    else:
-        hunger_hint = (
-            f"你现在有点饿了（饱食度 {status.hunger}/100），可以顺嘴提一句 /投喂。"
-            if status.hunger <= 25
-            else f"饱食度 {status.hunger}/100，段位 {status.title}。"
-        )
+    # 【实时状态】块已按需求移除（饱食度/段位/好感度不再注入 system）。
+    # 这三个参数保留在签名里只是为了让调用方不用改，函数内不再使用。
     extra_blocks = []
     if recalled_memory:
         extra_blocks.append(recalled_memory)
@@ -388,8 +382,7 @@ def _build_system_prompt(
     return (
         f"【当前时间】{now_str}（Asia/Shanghai）\n"
         f"{extra_text}"
-        f"{card_text}\n\n"
-        f"【实时状态】{hunger_hint} 当前说话人：{sender}（好感度 {user_affinity['affinity']}/100）。"
+        f"{card_text}\n"
     )
 
 
@@ -571,11 +564,14 @@ class DaFeiYuBrain:
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
 
-        # 注入最近 20 条群聊上下文（排除刚写入的当前这条，避免重复），让大肥鱼真正跟得上群里聊的每一句
-        history_slice = recent_history[-21:]
+        # L3 会话层：带最近 N 条群聊上下文（默认 20，L3_HISTORY_LIMIT 可调），
+        # 让大肥鱼真正跟得上群里聊的每一句。这一层是四层里唯一可以丢的：
+        # 超过 L3_CONTEXT_LIMIT_TOKENS 时由 bot_core._compress_l3 每天 0 点压缩。
+        l3_limit = settings.L3_HISTORY_LIMIT
+        history_slice = recent_history[-(l3_limit + 1) :] if l3_limit else []
         if history_slice and history_slice[-1].get("role") == "user" and history_slice[-1].get("sender") == sender and (history_slice[-1].get("content") or "").strip() == text.strip():
             history_slice = history_slice[:-1]
-        for item in history_slice[-20:]:
+        for item in (history_slice[-l3_limit:] if l3_limit else []):
             role = "assistant" if item["role"] == "assistant" else "user"
             prefix = "" if role == "assistant" else f"[{item['sender']}]: "
             content = item["content"] or ("[发了一张图片]" if item.get("image_path") else "")
@@ -1341,6 +1337,42 @@ class DaFeiYuBrain:
                 tokens_used=0,
                 used_vision=False,
             )
+
+    def summarize_l3_history(self, rows: list[dict], group_id: str = "") -> str:
+        """
+        把一段即将从 L3 会话层删掉的旧聊天压成一段摘要（≤200 字）。
+
+        L3 是可以丢的一层，但「丢了什么」得留下个影子：这段摘要会被写成一条
+        important 记忆进 L1，以后还能被召回。压缩只处理最旧的一批消息，
+        最近 L3_KEEP_RECENT 条永远不参与（见 bot_core._compress_l3）。
+        """
+        if not settings.has_valid_api_key or not rows:
+            return ""
+        lines = []
+        for r in rows:
+            who = settings.BOT_NAME if r.get("role") == "assistant" else r.get("sender", "群友")
+            body = " ".join(str(r.get("content") or "").split())[:120]
+            if body:
+                lines.append(f"[{who}]: {body}")
+        if not lines:
+            return ""
+        prompt = (
+            "下面是一段微信群聊记录（旧消息，即将被清理）。请压成一段 200 字以内的中文摘要，只保留：\n"
+            "1) 谁是什么人、有什么特征；2) 聊过什么话题、达成了什么约定或结论；3) 出现过的梗/外号；\n"
+            "4) 有明确结果的事（谁要做什么、谁不做什么）。\n"
+            "不要逐条复述，不要评价，不要编造记录里没有的东西。直接输出摘要正文，不要标题。\n\n"
+            + "\n".join(lines)
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            return " ".join(strip_think(resp.choices[0].message.content or "").split())[:200]
+        except Exception as exc:
+            logger.warning("L3 会话压缩摘要失败: %s", exc)
+            return ""
 
     def extract_daily_facts(self, recent_history: list[dict], group_id: str = "", max_items: int = 3) -> list[dict]:
         """

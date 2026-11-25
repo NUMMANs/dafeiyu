@@ -386,6 +386,41 @@ class PetEngine:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def list_history(
+        self,
+        group_id: str,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        """按 id 顺序取 L3 会话（默认从旧到新），供占用统计与压缩使用。"""
+        order = "DESC" if newest_first else "ASC"
+        sql = (
+            "SELECT id, sender, role, content, image_path, created_ts "
+            f"FROM chat_history WHERE group_id = ? ORDER BY id {order}"
+        )
+        args: tuple = (group_id,)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = (group_id, limit, offset)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_history_ids(self, ids: list[int]) -> int:
+        """按 id 删除 L3 会话行（调用方必须先完成归档）。返回实际删除条数。"""
+        if not ids:
+            return 0
+        deleted = 0
+        with self._lock:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i : i + 500]
+                marks = ",".join("?" * len(chunk))
+                cur = self._conn.execute(f"DELETE FROM chat_history WHERE id IN ({marks})", chunk)
+                deleted += cur.rowcount or 0
+            self._conn.commit()
+        return deleted
+
     def update_history_content_by_image(self, group_id: str, image_path: str, caption: str) -> None:
         # 视觉模型偶尔会把 <think> 思考草稿当正文返回，这里必须洗掉再落库，
         # 否则这段话会作为一条「群友消息」永久留在历史里，每轮都喂给模型

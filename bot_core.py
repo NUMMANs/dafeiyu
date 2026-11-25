@@ -1,4 +1,5 @@
 import logging
+import json
 import random
 import re
 import threading
@@ -16,10 +17,10 @@ from agent_tools import (
     write_local_file,
 )
 from brain import brain
-from config import settings
+from config import settings, DATA_DIR
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
-from memory import memory_store
+from memory import estimate_tokens, memory_store
 import metrics
 from persona_runtime import emotion_sm, heartflow, slang_book
 from pet_engine import PetStatus, pet_engine, progress_bar
@@ -176,6 +177,8 @@ class DaFeiYuBotCore:
         self._last_nightly_group_day: dict[str, str] = {}
         self._last_nightly_date: str = ""
         self._last_metrics_date: str = ""
+        # L3 会话层占用检查：每群每天 0 点后查一次
+        self._last_l3_check_day: dict[str, str] = {}
 
     def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
         """峰哥人设不发表情包（仅保留搜图/截屏/文件等功能性附件），塔菲人设正常发表情包。"""
@@ -1289,10 +1292,10 @@ class DaFeiYuBotCore:
                 quoted_sender=quoted_sender,
             )
 
-        # 6. 调用 DeepSeek 多模态大脑（拉取最近 22 条群聊记录，保证多人群聊不断片）
+        # 6. 调用 DeepSeek 多模态大脑（L3 会话层：多取 1 条用于排除当前这句，默认共 20 条）
         status = pet_engine.get_status()
         user_aff = pet_engine.get_user_affinity(group_id, sender)
-        recent = pet_engine.get_recent_history(group_id, limit=22)
+        recent = pet_engine.get_recent_history(group_id, limit=settings.L3_HISTORY_LIMIT + 2)
         # 去抖路径下 text 是「这一波的合并文本」，与历史里已落库的单条重复，
         # 先把这些单条从历史里摘掉，避免模型以为群友把同一句说了两遍
         if history_strip:
@@ -1438,6 +1441,123 @@ class DaFeiYuBotCore:
         logger.info("📊 已生成 %s 的 L2/L2.5 调用统计: %s", target, path)
         return path
 
+    def _maybe_compress_l3(self, group_id: str) -> dict | None:
+        """
+        每天 0 点之后检查一次 L3 会话层占用，超过 L3_CONTEXT_LIMIT_TOKENS 就压缩。
+
+        0~4 点之间都可以补跑（进程半夜重启也不丢），每群每天只查一次。
+        """
+        dt = datetime.now()
+        if dt.hour >= 4:
+            return None
+        today = dt.strftime("%Y-%m-%d")
+        if self._last_l3_check_day.get(group_id) == today:
+            return None
+        self._last_l3_check_day[group_id] = today
+        try:
+            return self._compress_l3(group_id)
+        except Exception as exc:
+            logger.warning("[%s] L3 会话压缩异常: %s", group_id, exc)
+            return None
+
+    def _compress_l3(self, group_id: str) -> dict:
+        """
+        L3 会话层压缩：把最旧的一批消息交给模型压成一段摘要 → 原文归档 → 才删库。
+
+        铁律：
+        - 最近 L3_KEEP_RECENT 条永远不动（防止「刚聊完的就被压没了」）；
+        - 原文必须先落盘成 jsonl 且文件非空，才允许 DELETE；
+        - 摘要失败就中止，宁可下一天再试，也不删没有留底的消息；
+        - 摘要写成一条 important 记忆进 L1，压缩掉的内容以后仍能被召回。
+        """
+        rows = pet_engine.list_history(group_id)
+        total = sum(estimate_tokens(r.get("content") or "") for r in rows)
+        limit = settings.L3_CONTEXT_LIMIT_TOKENS
+        result: dict = {"rows": len(rows), "tokens": total, "limit": limit, "deleted": 0, "summary": ""}
+        if total <= limit:
+            logger.info("[%s] L3 会话占用 %d tk / 上限 %d tk（%d 条），无需压缩", group_id, total, limit, len(rows))
+            return result
+
+        keep = settings.L3_KEEP_RECENT
+        compressible = rows[:-keep] if len(rows) > keep else []
+        if not compressible:
+            logger.warning("[%s] L3 已超限但可压缩消息为 0（保留 %d 条），跳过", group_id, keep)
+            return result
+
+        logger.info(
+            "[%s] L3 会话占用 %d tk 超过上限 %d tk，开始压缩（共 %d 条，保留最近 %d 条）",
+            group_id,
+            total,
+            limit,
+            len(rows),
+            keep,
+        )
+        archive_dir = DATA_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        safe_group = re.sub(r'[\\/:*?"<>|\s]', "_", group_id) or "group"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_md = archive_dir / f"L3摘要_{safe_group}.md"
+        summaries: list[str] = []
+
+        # 一次最多压 5 批，防止某天超太多时一口气跑很久
+        for _ in range(5):
+            if total <= limit or not compressible:
+                break
+            chunk = compressible[: settings.L3_COMPRESS_CHUNK]
+            first_ts = datetime.fromtimestamp(float(chunk[0].get("created_ts") or 0)).strftime("%Y-%m-%d %H:%M")
+            last_ts = datetime.fromtimestamp(float(chunk[-1].get("created_ts") or 0)).strftime("%Y-%m-%d %H:%M")
+
+            archive_path = archive_dir / f"L3原始_{safe_group}_{stamp}_{len(summaries) + 1}.jsonl"
+            try:
+                with archive_path.open("w", encoding="utf-8") as f:
+                    for r in chunk:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                if archive_path.stat().st_size <= 0:
+                    raise RuntimeError("归档文件为空")
+            except Exception as exc:
+                logger.warning("[%s] L3 压缩中止：原文归档失败（%s），未删除任何消息", group_id, exc)
+                break
+
+            summary = brain.summarize_l3_history(chunk, group_id=group_id)
+            if not summary:
+                logger.warning("[%s] L3 压缩中止：摘要生成失败，未删除任何消息（原文已存 %s）", group_id, archive_path.name)
+                break
+
+            deleted = pet_engine.delete_history_ids([int(r["id"]) for r in chunk])
+            chunk_tokens = sum(estimate_tokens(r.get("content") or "") for r in chunk)
+            total -= chunk_tokens
+            result["deleted"] += deleted
+            summaries.append(summary)
+            compressible = compressible[len(chunk) :]
+
+            memory_store.remember(
+                text=f"L3会话摘要 {first_ts}~{last_ts}：{summary}",
+                level="important",
+                tags=["会话摘要", "旧聊天"],
+                source="group",
+                group_id=group_id,
+            )
+            logger.info(
+                "[%s] L3 压缩一批：%s ~ %s，归档 %s，删除 %d 条，剩余约 %d tk",
+                group_id,
+                first_ts,
+                last_ts,
+                archive_path.name,
+                deleted,
+                total,
+            )
+
+        if summaries:
+            block = [
+                f"\n## {datetime.now().strftime('%Y-%m-%d %H:%M')} 压缩（删 {result['deleted']} 条，剩余约 {total} tk）",
+                *[f"- {s}" for s in summaries],
+            ]
+            with summary_md.open("a", encoding="utf-8") as f:
+                f.write("\n".join(block) + "\n")
+            result["summary"] = summaries[-1]
+            result["tokens"] = total
+        return result
+
     def _maybe_run_nightly_maintenance(self, group_id: str, status=None) -> None:
         """23:45 之后（或凌晨 0~4 点补跑）触发夜间养护，每个群每个逻辑日各跑一次。"""
         dt = datetime.now()
@@ -1523,6 +1643,9 @@ class DaFeiYuBotCore:
 
         # 0. 每晚 23:45 之后自动执行四层记忆夜间养护（写 L2 日记 + L1 巩固合并淘汰 + 周日周结 + 自动备份）
         self._maybe_run_nightly_maintenance(group_id, status)
+
+        # 0.05 每天 0:00 之后检查 L3 会话层占用，超 300k token 就压缩（原文归档 → 摘要进 L1 → 再删库）
+        self._maybe_compress_l3(group_id)
 
         # 0.1 每天 0:00 之后出一份前一日 L2/L2.5 子代理调用统计（纯代码，不调模型）
         report_path = self._maybe_write_daily_metrics()
