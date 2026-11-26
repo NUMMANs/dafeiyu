@@ -90,7 +90,7 @@ foreach ($w in $cands) {
     })
     if ($k.Count -eq 1) {
         $up = ((Get-Date) - $k[0].CreationDate).TotalSeconds
-        Write-Output (ConvertTo-Json -Compress @{ watchdog = $w.ProcessId; child = $k[0].ProcessId; uptime = $up })
+        Write-Output (ConvertTo-Json -Compress @{ watchdog = $w.ProcessId; child = $k[0].ProcessId; uptime = $up; watchdog_count = $cands.Count })
         exit 0
     }
 }
@@ -453,10 +453,13 @@ def health_payload(before_pid: int = 0) -> dict[str, Any]:
         pass
     rc, out = _ps(PS_FIND)
     child_now = 0
+    watchdog_count = 0
     if rc == 0:
         try:
-            child_now = int(json.loads(out.splitlines()[-1]).get("child") or 0)
-        except (ValueError, IndexError):
+            proc_info = json.loads(out.splitlines()[-1])
+            child_now = int(proc_info.get("child") or 0)
+            watchdog_count = int(proc_info.get("watchdog_count") or 0)
+        except (ValueError, IndexError, AttributeError):
             pass
     last_good = str(state.get("last_good_commit") or "")
     # HEAD 领先健康版本不一定有问题：只改 tools/、docs/、.gitignore 这类
@@ -475,7 +478,14 @@ def health_payload(before_pid: int = 0) -> dict[str, Any]:
         int(state.get("crash_streak") or 0) == 0
         and (last_good.startswith(head[:7]) or not needs_restart)
         and child_now not in (0, before_pid)
+        and watchdog_count <= 1
     )
+    hint = "ok=false 时先别继续改：改了运行模块却没重启就补 --restart，或跑 rollback / 人工查日志"
+    if watchdog_count > 1:
+        hint = (
+            f"检测到 {watchdog_count} 个 watchdog 同时运行：它们会互抢 8765 端口，"
+            "还会把端口冲突误判成代码崩溃并反复回滚版本，请只保留一个"
+        )
     return {
         "ok": healthy,
         "head": head[:7],
@@ -483,9 +493,10 @@ def health_payload(before_pid: int = 0) -> dict[str, Any]:
         "crash_streak": state.get("crash_streak"),
         "old_child_pid": before_pid,
         "new_child_pid": child_now,
+        "watchdog_count": watchdog_count,
         "pending_restart": needs_restart,
         "changed_since_good": changed_since_good,
-        "hint": "ok=false 时先别继续改：改了运行模块却没重启就补 --restart，或跑 rollback / 人工查日志",
+        "hint": hint,
     }
 
 

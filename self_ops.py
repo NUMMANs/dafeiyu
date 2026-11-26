@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import py_compile
+import socket
 import subprocess
 import sys
 import threading
@@ -18,8 +19,30 @@ from config import BASE_DIR, DATA_DIR
 logger = logging.getLogger("dafeiyu.self_ops")
 
 RESTART_EXIT_CODE = 42
+# Web 端口被占用时的专用退出码：属于环境冲突，不是代码崩溃，看门狗不得据此回滚版本
+PORT_BUSY_EXIT_CODE = 78
 WATCHDOG_STATE_PATH = DATA_DIR / "watchdog_state.json"
 RESTART_NOTICE_PATH = DATA_DIR / "restart_notice.json"
+
+
+def is_port_in_use(host: str, port: int, timeout: float = 0.4) -> bool:
+    """探测本机端口是否已有服务在监听，用于避免两个大肥鱼实例抢 8765。
+
+    以 bind 探测为主：能绑上说明没人监听，绑不上说明被占。比 connect 探测
+    稳得多 —— 后者在对方 accept 队列满 / 连接超时时会把「有人占着」误判成空闲。
+    再补一次 connect 兜底，覆盖绑在不同地址族上的情况。
+    """
+    probe = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_sock:
+            probe_sock.bind((probe, port))
+    except OSError:
+        return True
+    try:
+        with socket.create_connection((probe, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 _SKIP_COMPILE_DIRS = {
     ".git",
