@@ -93,10 +93,14 @@ def is_dsh_available() -> tuple[bool, str]:
         found = find_cbc_binary()
         if found:
             return True, found
+        backup = find_dsh_binary()
+        if backup:
+            logger.warning("⚠️ 找不到 CodeBuddy CLI，工具后端自动回退到 DSH：%s", backup)
+            return True, backup
         return (
             False,
             "TOOL_BACKEND=codebuddy 但未找到 CodeBuddy CLI（可用 CBC_BIN 指定，或安装 "
-            "@tencent-ai/codebuddy-code 到 ~/.codebuddy-cli）",
+            "@tencent-ai/codebuddy-code 到 ~/.codebuddy-cli），DSH 也不可用",
         )
     found = find_dsh_binary()
     if found:
@@ -216,15 +220,24 @@ def submit_dsh_job(
     backend = (settings.TOOL_BACKEND or "dsh").strip().lower()
     dsh_bin = ""
     cbc_bin = ""
+    fallback_reason = ""
+    # 备用后端先探好，运行期回退时不用再找一次
+    dsh_backup = find_dsh_binary(dsh_bin_override) or ""
+
     if backend == "codebuddy":
         cbc_bin = find_cbc_binary() or ""
         if not cbc_bin:
-            return False, "未找到 CodeBuddy CLI，请检查 CBC_BIN 或确认已安装 @tencent-ai/codebuddy-code"
-    else:
+            fallback_reason = "CodeBuddy CLI 未找到"
+            logger.warning("⚠️ %s，本单自动回退 DSH 执行", fallback_reason)
+    if backend != "codebuddy" or fallback_reason:
         backend = "dsh"
-        dsh_bin = find_dsh_binary(dsh_bin_override) or ""
+        dsh_bin = dsh_backup
         if not dsh_bin:
+            if fallback_reason:
+                return False, f"{fallback_reason}，且 DSH 也不可用，无法执行任务"
             return False, "未找到 DSH CLI，请确认已全局安装 @deepseek-ai/dsh 或检查 DSH_BIN 配置"
+    else:
+        dsh_bin = dsh_backup
 
     req_sid = (session_id or "").strip()
     prompt_text = clean_task
@@ -260,6 +273,8 @@ def submit_dsh_job(
         "session_id": resolved_sid,
         "task": clean_task,
         "backend": backend,
+        "fallback_from": "codebuddy" if fallback_reason else "",
+        "fallback_reason": fallback_reason,
         "dsh_bin": dsh_bin,
         "cbc_bin": cbc_bin,
         "cbc_model": settings.CBC_MODEL,
@@ -375,7 +390,10 @@ def pop_finished_jobs() -> list[dict[str, Any]]:
 
 def _backend_label(done_data: dict[str, Any]) -> str:
     """给用户看的后端名，别让群友看到「DSH」却在走 CodeBuddy。"""
-    return "CodeBuddy" if str(done_data.get("backend") or "").lower() == "codebuddy" else "DSH"
+    label = "CodeBuddy" if str(done_data.get("backend") or "").lower() == "codebuddy" else "DSH"
+    if str(done_data.get("fallback_from") or "").lower() == "codebuddy":
+        return f"{label}（CodeBuddy 失效自动回退）"
+    return label
 
 
 def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
@@ -408,6 +426,9 @@ def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
 
     body_text = summary[:650] + ("..." if len(summary) > 650 else "")
     lines = [header, f"📝 任务：{task_preview}"]
+    _fb_reason = str(done_data.get("fallback_reason") or "").strip()
+    if str(done_data.get("fallback_from") or "").lower() == "codebuddy" and _fb_reason:
+        lines.append(f"⚠️ CodeBuddy 本次不可用（{_fb_reason}），已自动改用 DSH 执行")
     if session_id:
         lines.append(f"🔗 会话：{session_id}（发 `/dsh 续 补充要求` 可继续追问）")
     elif status == "done":
@@ -579,6 +600,7 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
         "",
         f"任务编号：{job_id}",
         f"执行状态：{label}（status={status}）",
+        f"实际后端：{_backend_label(done_data)}",
         f"退出码：{done_data.get('exit_code')}",
         f"派单人：{done_data.get('sender') or job_meta.get('sender') or '-'}",
         f"会话 ID：{done_data.get('session_id') or '-'}",

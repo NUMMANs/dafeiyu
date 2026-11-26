@@ -210,8 +210,58 @@ def _cbc_usage(result: dict, model: str) -> dict:
     }
 
 
-def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float) -> int:
-    """CodeBuddy CLI 版执行路径：结构与 DSH 版一致，只是命令行与解析不同。"""
+def _cbc_broken_reason(result: dict, status: str, exit_code: int, stderr_text: str, error_msg: str) -> str:
+    """判断这次失败是「CodeBuddy 本身不可用」还是「活干砸了」。
+
+    只有前者才值得用 DSH 重跑一遍：认证失效 / CLI 崩了属于基础设施问题；
+    模型把任务做错、工具报错属于业务结果，重跑只会白烧一遍额度。
+    """
+    if status == "timeout":
+        return ""
+
+    text = " ".join([str(result.get("result") or ""), stderr_text or "", error_msg or ""]).lower()
+    for marker in ("authentication required", "please use /login", "invalid api key", "unauthorized"):
+        if marker in text:
+            return "CodeBuddy 未登录或凭证已失效"
+    if "未找到 codebuddy cli" in text:
+        return "CodeBuddy CLI 未找到"
+    if status == "failed" and not result and exit_code != 0:
+        return f"CodeBuddy 异常退出（exit={exit_code}）"
+    return ""
+
+
+def _log_backend_fallback(reason: str, job: dict, job_dir: Path) -> None:
+    """回退事件单独留一份流水，方便事后看「到底多久退一次」。"""
+    record = {
+        "ts": time.time(),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "job_id": job.get("job_id", job_dir.name),
+        "group_id": job.get("group_id", ""),
+        "from": "codebuddy",
+        "to": "dsh",
+        "reason": reason,
+    }
+    try:
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "tool_backend_fallback.log").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    try:
+        (job_dir / "fallback.json").write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float):
+    """CodeBuddy CLI 版执行路径。
+
+    返回 (done_payload, "") 表示跑完了（成功或业务失败都算跑完）；
+    返回 (None, 原因) 表示 CodeBuddy 这层不可用，调用方应改用 DSH 重跑。
+    """
     running_path = job_dir / "running.json"
     done_path = job_dir / "done.json"
 
@@ -238,9 +288,9 @@ def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float
     error_msg = ""
 
     if not cbc_bin:
-        status = "failed"
-        exit_code = -2
-        error_msg = "未找到 CodeBuddy CLI，请检查 CBC_BIN 或确认已安装 @tencent-ai/codebuddy-code"
+        _log_backend_fallback("CodeBuddy CLI 未找到", job, job_dir)
+        running_path.unlink(missing_ok=True)
+        return None, "CodeBuddy CLI 未找到"
 
     result: dict = {}
     if status == "done":
@@ -297,6 +347,18 @@ def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float
                 status = "failed"
                 error_msg = error_msg or str(result.get("result") or subtype or "任务未成功")
 
+        broken = _cbc_broken_reason(result, status, exit_code, stderr_text, error_msg)
+        if broken:
+            # 先把 CodeBuddy 自己的现场留下来，再交给 DSH 重跑，别把原始报错丢掉
+            try:
+                (job_dir / "stdout.txt").write_text(stdout_text, encoding="utf-8")
+                (job_dir / "stderr.txt").write_text(stderr_text, encoding="utf-8")
+            except Exception:
+                pass
+            _log_backend_fallback(broken, job, job_dir)
+            running_path.unlink(missing_ok=True)
+            return None, broken
+
     final_text = str(result.get("result") or "").strip()
     real_sid = str(result.get("session_id") or session_id)
     usage = _cbc_usage(result, model)
@@ -326,7 +388,7 @@ def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float
     }
     _atomic_write_text(done_path, json.dumps(done_payload, ensure_ascii=False, indent=2))
     running_path.unlink(missing_ok=True)
-    return 0
+    return done_payload, ""
 
 
 # ======================================================================
@@ -505,8 +567,19 @@ def main() -> int:
     )
 
     backend = str(job.get("backend") or os.environ.get("TOOL_BACKEND") or "dsh").strip().lower()
+    fallback_from = ""
+    fallback_reason = ""
     if backend == "codebuddy":
-        return _run_codebuddy(job, prompt_text, job_dir, started_at)
+        payload, reason = _run_codebuddy(job, prompt_text, job_dir, started_at)
+        if payload is not None:
+            return 0
+        # CodeBuddy 这层不可用（没登录 / CLI 崩了 / 找不到）——同一进程直接改用 DSH 重跑，
+        # 派单方和群友都不用重来一遍。
+        fallback_from = "codebuddy"
+        fallback_reason = reason or "CodeBuddy 不可用"
+        backend = "dsh"
+        job["backend"] = "dsh"
+        print(f"[fallback] CodeBuddy 不可用（{fallback_reason}），改用 DSH 重跑", file=sys.stderr)
 
     dsh_bin = str(job.get("dsh_bin") or "dsh")
     session_id = str(job.get("session_id") or "").strip()
@@ -645,6 +718,8 @@ def main() -> int:
         "model": model_used,
         "usage_session": usage_session,
         "backend": "dsh",
+        "fallback_from": fallback_from,
+        "fallback_reason": fallback_reason,
         "delivered": False,
     }
     _atomic_write_text(done_path, json.dumps(done_payload, ensure_ascii=False, indent=2))
