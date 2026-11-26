@@ -31,7 +31,16 @@ DAILY_EVOLVE_LIMIT = 2
 
 
 def _strip_quotes(text: str) -> str:
-    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(">")).strip()
+    """去掉文件开头那段「本文件是…」的说明引用。
+
+    曾经的实现是删掉全文所有 `>` 开头的行，结果人格文件里「例子」那一段
+    全是引用块（> 有人问… / > 我：…），被整段清空，编译出来的卡片
+    只剩下一个空的「## 例子」标题。现在只处理第一个 `##` 标题之前的引用。
+    """
+    lines = text.splitlines()
+    first_heading = next((i for i, line in enumerate(lines) if line.startswith("## ")), len(lines))
+    kept = [line for i, line in enumerate(lines) if i >= first_heading or not line.lstrip().startswith(">")]
+    return "\n".join(kept).strip()
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
