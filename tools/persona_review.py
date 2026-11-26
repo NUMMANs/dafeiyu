@@ -962,6 +962,14 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="真的写文件；不加只出报告")
     parser.add_argument("--no-llm", action="store_true", help="跳过模型，只出统计")
     parser.add_argument("--top", type=int, default=9, help="证据片段数量")
+    parser.add_argument(
+        "--owner", choices=("all", "mind", "sense"), default="all",
+        help=(
+            "两个夜间任务分工：mind 只落人格进化 + L1 召回参数，"
+            "sense 只落判定器补充规则 + 唤醒/路由阈值；默认 all 是旧行为。"
+            "不加这个开关会让 0:45 的任务把 0:15 刚写的 judges 规则整体覆盖掉。"
+        ),
+    )
     args = parser.parse_args()
 
     day = date.fromisoformat(args.day) if args.day else logical_day()
@@ -1036,34 +1044,51 @@ def main() -> int:
                     changes["skipped"].append(f"{field} 被拦：{str(item)[:60]}")
 
         try:
-            persona_items = plan.get("persona_evolution") or []
-            today_tag = f"[{day.isoformat()}]"
-            used = sum(
-                1 for old in card_mod._load_evolutions_list() if old.startswith(today_tag)
-            )
-            changes["persona"] = apply_persona(persona_items, day)
-            if used >= MAX_PERSONA_ITEMS:
-                # 额度用完时不要说成「被守门规则拦下」，那会让人以为是规则太严
-                changes["skipped"].append(
-                    f"人格：今天已经长了 {used} 条（上限 {MAX_PERSONA_ITEMS}），"
-                    f"本次 {len(persona_items)} 条建议未采用"
-                )
+            if args.owner == "sense":
+                changes["skipped"].append("人格进化归 0:45 的 mind 任务，本轮不落盘")
             else:
-                _diff(persona_items, changes["persona"], "人格")
+                persona_items = plan.get("persona_evolution") or []
+                today_tag = f"[{day.isoformat()}]"
+                used = sum(
+                    1 for old in card_mod._load_evolutions_list() if old.startswith(today_tag)
+                )
+                changes["persona"] = apply_persona(persona_items, day)
+                if used >= MAX_PERSONA_ITEMS:
+                    # 额度用完时不要说成「被守门规则拦下」，那会让人以为是规则太严
+                    changes["skipped"].append(
+                        f"人格：今天已经长了 {used} 条（上限 {MAX_PERSONA_ITEMS}），"
+                        f"本次 {len(persona_items)} 条建议未采用"
+                    )
+                else:
+                    _diff(persona_items, changes["persona"], "人格")
 
-            l2_items = plan.get("judge_l2") or []
-            changes["judge_l2"] = apply_judge("l2", l2_items, day)
-            _diff(l2_items, changes["judge_l2"], "L2")
+            if args.owner == "mind":
+                changes["skipped"].append("判定器补充规则归 0:15 的 sense 任务，本轮不落盘")
+            else:
+                l2_items = plan.get("judge_l2") or []
+                changes["judge_l2"] = apply_judge("l2", l2_items, day)
+                _diff(l2_items, changes["judge_l2"], "L2")
 
-            l25_items = plan.get("judge_l2_5") or []
-            changes["judge_l2_5"] = apply_judge("l2_5", l25_items, day)
-            _diff(l25_items, changes["judge_l2_5"], "L2.5")
+                l25_items = plan.get("judge_l2_5") or []
+                changes["judge_l2_5"] = apply_judge("l2_5", l25_items, day)
+                _diff(l25_items, changes["judge_l2_5"], "L2.5")
 
-            router_items = plan.get("judge_tool_router") or []
-            changes["judge_tool_router"] = apply_judge("tool_router", router_items, day)
-            _diff(router_items, changes["judge_tool_router"], "工具路由")
+                router_items = plan.get("judge_tool_router") or []
+                changes["judge_tool_router"] = apply_judge("tool_router", router_items, day)
+                _diff(router_items, changes["judge_tool_router"], "工具路由")
 
-            _, changes["knob_notes"] = apply_knobs(plan, day)
+            # 数值闸门按 owner 分流：core/router 归 sense，L1 召回归 mind。
+            # 两边都写同一个 data/tuning.json，但互不改对方的键。
+            if args.owner == "mind":
+                knob_plan = {"recall_knobs": plan.get("recall_knobs") or {}}
+            elif args.owner == "sense":
+                knob_plan = {
+                    "knobs": plan.get("knobs") or {},
+                    "router_knobs": plan.get("router_knobs") or {},
+                }
+            else:
+                knob_plan = plan
+            _, changes["knob_notes"] = apply_knobs(knob_plan, day)
         except Exception as exc:
             print(f"落盘失败，已回滚人设：{exc}", file=sys.stderr)
             write_report(day, stats, log_info, plan, {**changes, "skipped": [f"落盘失败：{exc}"]}, "")
@@ -1080,7 +1105,7 @@ def main() -> int:
 
     print(f"报告：{path}")
     print(
-        f"改动：人格 {len(changes['persona'])} 条 / L2 {len(changes['judge_l2'])} 条 / "
+        f"改动（owner={args.owner}）：人格 {len(changes['persona'])} 条 / L2 {len(changes['judge_l2'])} 条 / "
         f"L2.5 {len(changes['judge_l2_5'])} 条 / 工具路由 {len(changes['judge_tool_router'])} 条 / "
         f"数值 {len(changes['knob_notes'])} 项"
     )
