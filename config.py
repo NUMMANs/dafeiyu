@@ -144,6 +144,7 @@ class Settings:
     # 工具路由：每条要回复的消息先让小模型判一次「要不要派活给 DSH」
     ENABLE_TOOL_ROUTER: bool = _parse_bool(os.getenv("ENABLE_TOOL_ROUTER"), True)
     # 短于这么多字的消息不做判定（「在吗」「哈哈」「+1」不可能是活，省一次调用）
+    # 夜间复盘可通过 data/tuning.json 热调（见 tuning.BOUNDS），这里只是默认值
     TOOL_ROUTER_MIN_CHARS: int = max(2, int(os.getenv("TOOL_ROUTER_MIN_CHARS", "8")))
     # 工具全部交给 DSH：True 时大肥鱼不再挂 13 个电脑工具（DSH 不可用也不挂），
     # 干活一律走后台执行助手。False 时退回旧行为（DSH 不可用才挂电脑工具兜底）。

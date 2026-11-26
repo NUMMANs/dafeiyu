@@ -1,7 +1,8 @@
 """运行期调参层：夜间复盘写这两个地方，机器人不用重启就生效。
 
-- ``data/tuning.json``      数值闸门（L2 时间窗、L2.5 冷场间隔、吐槽阈值）
-- ``roles/judges/*.md``     判定器补充规则（给 L2 / L2.5 的提示词加几条临时偏好）
+- ``data/tuning.json``      数值闸门（L2 时间窗、L2.5 冷场间隔、吐槽阈值、
+                            L1 识海召回、工具路由判定）
+- ``roles/judges/*.md``     判定器补充规则（L2 / L2.5 / 工具路由的提示词加临时偏好）
 
 为什么单独做一层：
 配置项都写在 ``config.Settings`` 的类属性里，进程启动时求值一次，之后改 ``.env``
@@ -37,6 +38,20 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "FOLLOWUP_WINDOW_SEC": (120, 900),
     # L2.5 冷场判定间隔（秒）：群里安静多久才算「重新开话题」
     "TOPIC_GAP_SEC": (300, 1800),
+
+    # ---- L1 识海召回（2026-11-26 夜间复盘新增）----
+    # 最终打分低于这个值直接丢掉。调高 = 少想旧事，调低 = 更容易触景生情。
+    # 0.15 是下限：再低会让每条记忆在每条消息上都冒出来。
+    "RECALL_SCORE_THRESHOLD": (0.15, 0.45),
+    # 字面闸门：查询词 ≥3 个时至少命中几个二元组才算相关（短查询恒为 1，不受此项影响）
+    "MIN_LITERAL_HITS": (1, 3),
+    # 一次最多召回几条 / 注入最多多少字
+    "RECALL_TOP_N": (3, 8),
+    "RECALL_MAX_CHARS": (200, 800),
+
+    # ---- 工具路由小模型（判断「这句要不要派活」）----
+    # 短于这么多字的消息不送判定器，省一次调用（也可用来压误派率）
+    "TOOL_ROUTER_MIN_CHARS": (4, 20),
 }
 
 _cache_lock = threading.Lock()
@@ -131,7 +146,7 @@ def snapshot() -> dict[str, Any]:
         "bounds": {k: list(v) for k, v in BOUNDS.items()},
         "judges": {
             kind: judge_extra(kind)
-            for kind in ("l2", "l2_5")
+            for kind in ("l2", "l2_5", "tool_router")
         },
     }
 

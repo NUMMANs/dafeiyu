@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""夜间人格复盘：读当天群聊，找「不像人」的地方，微调人格与 L2/L2.5 判定。
+"""夜间人格复盘：读当天群聊，找「不像人」的地方，微调人格、判定器与数值闸门。
+覆盖五层：人格进化记录 / L2 / L2.5 / L1 识海召回 / 工具路由小模型。
 
 用法：
     python tools/persona_review.py                 # 只看不改（默认）
@@ -9,15 +10,16 @@
 
 为什么要「复盘 + 微调」而不是直接改代码：
 - 人格文件里有一节「自我进化记录」，本来就是留给它自己长的，改这里不破坏模板结构；
-- L2 / L2.5 的提示词是硬编码在 brain.py 里的，让模型写代码太危险，所以把「临时偏好」
+- L2 / L2.5 / 工具路由的提示词是硬编码在 brain.py 里的，让模型写代码太危险，所以把「临时偏好」
   抽到 roles/judges/*.md，brain 每次判定时热加载拼接；
-- 数值闸门（阈值、时间窗）走 data/tuning.json，bot_core / brain 每次用时读一次，
-  改完不用重启 —— 半夜重启机器人会打断冒泡、还会在群里多发一条「重启回来」。
+- 数值闸门（L2 阈值、L1 召回、工具路由）走 data/tuning.json，bot_core / brain / memory
+  每次用时读一次，改完不用重启 —— 半夜重启机器人会打断冒泡、还会在群里多发一条「重启回来」。
 
 守门规则（模型只能建议，落盘由脚本决定）：
 - 人设每晚最多 2 条、每条 ≤60 字、累计 15 条，去重，出现「喵/塔菲/峰哥/AI/模型/机器人/助手」直接丢；
-- 判定补充每晚整体重写、最多 5 条、每条 ≤45 字，出现「输出/格式/JSON/YES/NO」直接丢；
-- 数值每晚只准动 1 项，且必须落在 tuning.BOUNDS 内、单次变动不超过预设步长；
+- 判定补充每晚整体重写、最多 5 条（工具路由最多 3 条）、每条 ≤45 字，出现「输出/格式/JSON/YES/NO」直接丢；
+- 数值分三组（L2/L2.5、L1 召回、工具路由），每组每晚最多动 1 项，
+  且必须落在 tuning.BOUNDS 内、单次变动不超过预设步长；
 - 任一环节失败就整轮放弃并写报告，绝不半途改一半。
 """
 
@@ -54,6 +56,7 @@ MAX_PERSONA_ITEMS = 2
 MAX_PERSONA_CHARS = 60
 MAX_JUDGE_ITEMS = 5
 MAX_JUDGE_CHARS = 45
+MAX_ROUTER_ITEMS = 3
 
 PERSONA_BANNED = ("喵", "塔菲", "峰哥", "AI", "模型", "机器人", "助手", "客服", "作为一个")
 # 只挡「改输出格式」的措辞。YES/NO 不能挡 —— 判定规则本来就要写「什么情况判 YES」，
@@ -67,6 +70,41 @@ L25_BANNED = (
     "没人接", "无人@", "没人@", "@我",
     "别开口", "不找话", "不接话", "闭嘴", "别发", "不要发",
 )
+# 工具路由只收「具体什么场景该派 / 不该派」。最怕模型写出「一律不派活」「所有闲聊都判 false」
+# 这种一刀切规则，等于把整个工具层关掉 —— 和 L2.5 被「话题已冷给 0 分」废掉是同一类坑。
+ROUTER_BANNED = JUDGE_BANNED + (
+    "一律", "所有", "全部", "永远", "任何", "禁用", "关闭", "关掉",
+    "不用判", "跳过判定", "直接返回", "不派任何", "不再派活", "所有都不",
+)
+
+# 数值闸门：默认值和 config.Settings / memory.py 的常量保持一致。
+# 分三组，每组每晚最多落 1 项 —— 五层一起调容易互相打架，分层各走一步最稳。
+KNOB_DEFAULTS = {
+    "TOPIC_ROAST_MIN_SCORE": settings.TOPIC_ROAST_MIN_SCORE,
+    "FOLLOWUP_WINDOW_SEC": settings.FOLLOWUP_WINDOW_SEC,
+    "TOPIC_GAP_SEC": settings.TOPIC_GAP_SEC,
+    "RECALL_SCORE_THRESHOLD": 0.25,
+    "MIN_LITERAL_HITS": 2,
+    "RECALL_TOP_N": 5,
+    "RECALL_MAX_CHARS": 400,
+    "TOOL_ROUTER_MIN_CHARS": settings.TOOL_ROUTER_MIN_CHARS,
+}
+KNOB_STEPS = {
+    "TOPIC_ROAST_MIN_SCORE": 0.05,
+    "FOLLOWUP_WINDOW_SEC": 150,
+    "TOPIC_GAP_SEC": 300,
+    "RECALL_SCORE_THRESHOLD": 0.03,
+    "MIN_LITERAL_HITS": 1,
+    "RECALL_TOP_N": 1,
+    "RECALL_MAX_CHARS": 100,
+    "TOOL_ROUTER_MIN_CHARS": 2,
+}
+KNOB_GROUPS = {
+    "knobs": ("TOPIC_ROAST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC"),
+    "recall_knobs": ("RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS"),
+    "router_knobs": ("TOOL_ROUTER_MIN_CHARS",),
+}
+GROUP_LABELS = {"knobs": "L2/L2.5", "recall_knobs": "L1 召回", "router_knobs": "工具路由"}
 
 # 代码自己发的消息，不是模型说的，复盘时要剔掉，否则会把系统播报当成「它话多」
 SYSTEM_PREFIXES = (
@@ -204,6 +242,8 @@ def compute_stats(human: list[dict], machine: list[dict], counters: dict) -> dic
 
     l2 = counters.get("l2", {})
     l2_5 = counters.get("l2_5", {})
+    l1 = counters.get("l1_recall", {})
+    router = counters.get("tool_router", {})
     return {
         "user_msgs": len(user_msgs),
         "bot_msgs": len(bot_msgs),
@@ -224,6 +264,12 @@ def compute_stats(human: list[dict], machine: list[dict], counters: dict) -> dic
         "l25_call": l2_5.get("call", 0),
         "l25_hit": l2_5.get("hit", 0),
         "l25_hit_pct": _pct(l2_5.get("hit", 0), l2_5.get("call", 0)),
+        "l1_call": l1.get("call", 0),
+        "l1_hit": l1.get("hit", 0),
+        "l1_hit_pct": _pct(l1.get("hit", 0), l1.get("call", 0)),
+        "router_call": router.get("call", 0),
+        "router_hit": router.get("hit", 0),
+        "router_hit_pct": _pct(router.get("hit", 0), router.get("call", 0)),
     }
 
 
@@ -238,13 +284,18 @@ def load_counters(day: date) -> dict:
 
 
 def parse_log(day: date) -> dict:
-    """从运行日志里挖 L2/L2.5 的真实判定结果（比计数器更有信息量）。"""
+    """从运行日志里挖 L2/L2.5 判定、L1 召回条数、工具路由派活样本（比计数器更有信息量）。"""
     path = LOG_DIR / f"app_{day.strftime('%Y%m%d')}.log"
-    out = {"l2_yes": 0, "l2_no": 0, "l2_samples": [], "roast_scores": [], "roast_pass": 0}
+    out = {
+        "l2_yes": 0, "l2_no": 0, "l2_samples": [], "roast_scores": [], "roast_pass": 0,
+        "router_samples": [], "l1_counts": [], "l1_thresholds": [], "l1_min_hits": [],
+    }
     if not path.is_file():
         return out
     l2_re = re.compile(r"L2 追认判定 \[(.+?)\] @他人=(\w+): (.+?) -> (YES|NO)")
     roast_re = re.compile(r"吐槽判定 \[(.+?)\] ([\d.]+)/10 \(阈值 ([\d.]+)\) 槽点=(.+?) \| (.+)")
+    router_re = re.compile(r"工具路由判定：需要派活 → (.+?)（理由：(.+?)）")
+    l1_re = re.compile(r"L1 召回 (\d+) 条｜阈值 ([\d.]+)｜字面 (\d+)")
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
@@ -262,6 +313,19 @@ def parse_log(day: date) -> dict:
                     out["roast_scores"].append(float(m.group(2)))
                     if m.group(4) not in ("无", ""):
                         out["roast_pass"] += 1
+                    continue
+                m = router_re.search(line)
+                if m:
+                    if len(out["router_samples"]) < 8:
+                        out["router_samples"].append(
+                            f"{m.group(1).strip()[:50]}（{m.group(2).strip()}）"
+                        )
+                    continue
+                m = l1_re.search(line)
+                if m:
+                    out["l1_counts"].append(int(m.group(1)))
+                    out["l1_thresholds"].append(float(m.group(2)))
+                    out["l1_min_hits"].append(int(m.group(3)))
     except OSError:
         pass
     return out
@@ -338,7 +402,13 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
     current_evo = card_mod._load_evolutions_list()
     current_l2 = tuning.judge_extra("l2") or "（无）"
     current_l25 = tuning.judge_extra("l2_5") or "（无）"
+    current_router = tuning.judge_extra("tool_router") or "（无）"
     knobs = tuning.current_knobs() or "（无覆盖，全走默认）"
+    recall_now = ", ".join(
+        f"{k}={tuning.get(k, KNOB_DEFAULTS[k]):g}"
+        for k in KNOB_GROUPS["recall_knobs"]
+    )
+    router_min = tuning.get("TOOL_ROUTER_MIN_CHARS", KNOB_DEFAULTS["TOOL_ROUTER_MIN_CHARS"])
 
     stats_block = (
         f"群友消息 {stats['user_msgs']} 条，大肥鱼发言 {stats['bot_msgs']} 条"
@@ -360,6 +430,22 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
         scores = log_info["roast_scores"]
         stats_block += f"\n吐槽分：最高 {max(scores):.0f}、平均 {sum(scores)/len(scores):.1f}、最低 {min(scores):.0f}。"
 
+    stats_block += (
+        f"\nL1 识海：每轮召回注入 {stats['l1_hit']}/{stats['l1_call']} 次"
+        f"（{stats['l1_hit_pct']}%）。"
+    )
+    if log_info.get("l1_counts"):
+        counts = log_info["l1_counts"]
+        stats_block += (
+            f"日志里每次平均想起 {sum(counts)/len(counts):.1f} 条，最多 {max(counts)} 条。"
+        )
+    stats_block += (
+        f"\n工具路由：判定 {stats['router_call']} 次，决定派活 {stats['router_hit']} 次"
+        f"（{stats['router_hit_pct']}%）。"
+    )
+    if log_info.get("router_samples"):
+        stats_block += "\n派出去的活：" + "；".join(log_info["router_samples"][:5])
+
     return f"""你要复盘一个微信群机器人「大肥鱼」在 {day.isoformat()} 这一天的表现。
 它的目标不是当一个好助手，而是**像一个真实的人**待在群里：有节制、有情绪、会说半截话、不句句都接。
 
@@ -378,8 +464,22 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
 # L2.5 判定器当前的补充规则（判断「冷场后这个话题值不值得吐槽」）
 {current_l25}
 
+# 工具路由判定器当前的补充规则（判断「这句要不要派活给执行助手」）
+{current_router}
+
 # 当前数值覆盖
 {knobs}
+
+# 当前 L1 识海召回闸门
+{recall_now}
+注入率过高 = 总把无关旧事带进每轮回复（内容脱节、像在自言自语）；过低 = 该想起的没想起。
+调高 RECALL_SCORE_THRESHOLD / MIN_LITERAL_HITS 会少想旧事，调低会更容易触景生情；
+RECALL_TOP_N / RECALL_MAX_CHARS 只控制一次塞多少，不影响想不想得起来。
+
+# 当前工具路由闸门
+TOOL_ROUTER_MIN_CHARS={router_min:g}（短于此不送判定器）
+派活率过高 = 闲聊也被派活（群里多一堆占位和空任务）；过低 = 明显该干的活没接。
+补充规则只写「什么具体场景该派 / 不该派」，不许一刀切，也不许改输出格式。
 
 # 你的任务
 只诊断「不像人」的地方，并给出最小幅度的修正。不要写代码，不要重写人格文件全文。
@@ -389,10 +489,13 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
 2. 回复太长、太完整、结构太整齐（列点、总结、面面俱到）—— 真人在微信里不回长段落；
 3. 接不住梗、接得太规矩、把玩笑当真解释 —— 真人会损回去或者干脆不理；
 4. 冷场时硬找话说 —— 真人会让群冷着；
-5. 内容跟上下文脱节（自言自语、突然转话题）。
+5. 内容跟上下文脱节（自言自语、突然转话题）；
+6. 总把无关的旧事带进回复（L1 识海召回太松）；
+7. 明明是闲聊却派了活、或明显该派活却没派（工具路由判偏了）。
 
-对 L2 / L2.5 的修正要具体到「什么情况该放行、什么情况该拦」，能直接写进判定提示词。
+对 L2 / L2.5 / 工具路由的修正要具体到「什么情况该放行、什么情况该拦」，能直接写进判定提示词。
 对人格的修正要写成「习惯/态度」，不要写「我要更幽默」这种空话。
+对 L1 / 工具路由的数值只按上面的方向动一小步，没有把握就给空对象。
 
 # 输出格式
 只输出一个 JSON 对象，不要 markdown 代码块，不要解释：
@@ -402,11 +505,17 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
   "persona_evolution": ["0到2条，每条60字以内，第一人称，写成以后要改的习惯"],
   "judge_l2": ["0到4条，每条40字以内，只写什么情况判YES/什么情况判NO"],
   "judge_l2_5": ["0到4条，每条40字以内，只写什么情况给高分/给0分"],
+  "judge_tool_router": ["0到3条，每条45字以内，只写什么场景该派活/不该派活"],
   "knobs": {{"TOPIC_ROAST_MIN_SCORE": 0.75}},
+  "recall_knobs": {{"RECALL_SCORE_THRESHOLD": 0.28}},
+  "router_knobs": {{"TOOL_ROUTER_MIN_CHARS": 10}},
   "note": "一句话总结今天"
 }}
-knobs 只允许出现这三个键，最多改一个，不改就给空对象：TOPIC_ROAST_MIN_SCORE(0.5~0.9)、FOLLOWUP_WINDOW_SEC(120~900)、TOPIC_GAP_SEC(300~1800)。
-没有把握的字段给空数组，不要凑数。
+三组数值每组最多改 1 项，不改就给空对象；脚本还会再卡一次边界和步长：
+- knobs: TOPIC_ROAST_MIN_SCORE(0.5~0.9)、FOLLOWUP_WINDOW_SEC(120~900)、TOPIC_GAP_SEC(300~1800)
+- recall_knobs: RECALL_SCORE_THRESHOLD(0.15~0.45)、MIN_LITERAL_HITS(1~3)、RECALL_TOP_N(3~8)、RECALL_MAX_CHARS(200~800)
+- router_knobs: TOOL_ROUTER_MIN_CHARS(4~20)
+没有把握的字段给空数组或空对象，不要凑数。
 """
 
 
@@ -574,9 +683,20 @@ def apply_persona(items: list[str], day: date) -> list[str]:
 
 
 def apply_judge(kind: str, items: list[str], day: date) -> list[str]:
+    if kind == "tool_router":
+        banned = ROUTER_BANNED
+        max_items = MAX_ROUTER_ITEMS
+        label = "工具路由判定补充规则"
+    elif kind == "l2_5":
+        banned = JUDGE_BANNED + L25_BANNED
+        max_items = MAX_JUDGE_ITEMS
+        label = "L2.5 冷场吐槽判定补充规则"
+    else:
+        banned = JUDGE_BANNED
+        max_items = MAX_JUDGE_ITEMS
+        label = "L2 追认判定补充规则"
     bullets: list[str] = []
-    banned = JUDGE_BANNED + (L25_BANNED if kind == "l2_5" else ())
-    for raw in items[:MAX_JUDGE_ITEMS]:
+    for raw in items[:max_items]:
         text = _clean_line(raw, MAX_JUDGE_CHARS)
         if len(text) < 4:
             continue
@@ -593,7 +713,6 @@ def apply_judge(kind: str, items: list[str], day: date) -> list[str]:
     if path.is_file():
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         shutil.copy2(path, JUDGE_ARCHIVE / f"{kind}_{stamp}.md")
-    label = "L2 追认判定补充规则" if kind == "l2" else "L2.5 冷场吐槽判定补充规则"
     lines = [
         f"# {label}",
         f"<!-- 由 tools/persona_review.py 夜间复盘自动维护，最后更新 {day.isoformat()} -->",
@@ -606,42 +725,43 @@ def apply_judge(kind: str, items: list[str], day: date) -> list[str]:
     return bullets
 
 
-KNOB_STEPS = {
-    "TOPIC_ROAST_MIN_SCORE": 0.05,
-    "FOLLOWUP_WINDOW_SEC": 150,
-    "TOPIC_GAP_SEC": 300,
-}
+def apply_knobs(plan: dict, day: date) -> tuple[dict, list[str]]:
+    """三组数值闸门，每组每晚最多落 1 项；边界 + 步长双重守门。
 
-
-def apply_knobs(knobs: dict, day: date) -> tuple[dict, list[str]]:
-    if not isinstance(knobs, dict):
+    plan 里读 knobs / recall_knobs / router_knobs 三个字段，合并写进同一个
+    data/tuning.json —— tuning.py 只读 "knobs" 这一个平面字典，所以不分组存。
+    """
+    if not isinstance(plan, dict):
         return {}, []
     current = tuning.current_knobs()
-    defaults = {
-        "TOPIC_ROAST_MIN_SCORE": settings.TOPIC_ROAST_MIN_SCORE,
-        "FOLLOWUP_WINDOW_SEC": settings.FOLLOWUP_WINDOW_SEC,
-        "TOPIC_GAP_SEC": settings.TOPIC_GAP_SEC,
-    }
     applied: dict = {}
     notes: list[str] = []
-    for key, raw in knobs.items():
-        if key not in tuning.BOUNDS or len(applied) >= 1:
+    for field, allowed in KNOB_GROUPS.items():
+        group = plan.get(field)
+        if not isinstance(group, dict):
             continue
-        try:
-            target = float(raw)
-        except (TypeError, ValueError):
-            continue
-        low, high = tuning.BOUNDS[key]
-        base = float(current.get(key, defaults.get(key, 0)))
-        target = min(high, max(low, target))
-        step = KNOB_STEPS.get(key, 0)
-        if abs(target - base) > step:
-            target = base + step if target > base else base - step
+        if any(k in applied for k in allowed):
+            continue  # 这一组已经落过一项
+        for key, raw in group.items():
+            if key not in allowed:
+                continue
+            try:
+                target = float(raw)
+            except (TypeError, ValueError):
+                continue
+            low, high = tuning.BOUNDS[key]
+            default = KNOB_DEFAULTS[key]
+            base = float(tuning.get(key, default))
             target = min(high, max(low, target))
-        if target == base:
-            continue
-        applied[key] = int(target) if isinstance(defaults.get(key), int) else round(target, 3)
-        notes.append(f"{key}: {base:g} → {target:g}")
+            step = KNOB_STEPS.get(key, 0)
+            if step and abs(target - base) > step:
+                target = base + step if target > base else base - step
+                target = min(high, max(low, target))
+            if target == base:
+                continue
+            applied[key] = int(target) if isinstance(default, int) else round(target, 3)
+            notes.append(f"[{GROUP_LABELS[field]}] {key}: {base:g} → {target:g}")
+            break  # 每组最多 1 项
 
     if not applied:
         return {}, []
@@ -714,6 +834,8 @@ def write_report(
         f"| 连续自说自话 | {stats['self_talk']} 次 |",
         f"| L2 调用 / 放行 | {stats['l2_call']} / {stats['l2_hit']}（{stats['l2_hit_pct']}%） |",
         f"| L2.5 调用 / 放行 | {stats['l25_call']} / {stats['l25_hit']}（{stats['l25_hit_pct']}%） |",
+        f"| L1 召回注入 | {stats['l1_hit']} / {stats['l1_call']}（{stats['l1_hit_pct']}%） |",
+        f"| 工具路由派活 | {stats['router_hit']} / {stats['router_call']}（{stats['router_hit_pct']}%） |",
         "",
     ]
     if plan:
@@ -739,10 +861,11 @@ def write_report(
         lines.append("**人格进化记录（data/persona_evolutions.json）**")
         lines += [f"- {x}" for x in changes["persona"]]
         lines.append("")
-    if changes.get("judge_l2") or changes.get("judge_l2_5"):
+    if changes.get("judge_l2") or changes.get("judge_l2_5") or changes.get("judge_tool_router"):
         lines.append("**判定补充规则（roles/judges/）**")
         lines += [f"- L2：{x}" for x in changes.get("judge_l2", [])]
         lines += [f"- L2.5：{x}" for x in changes.get("judge_l2_5", [])]
+        lines += [f"- 工具路由：{x}" for x in changes.get("judge_tool_router", [])]
         lines.append("")
     if changes.get("knob_notes"):
         lines.append("**数值闸门（data/tuning.json）**")
@@ -752,7 +875,10 @@ def write_report(
         lines += ["**被守门规则丢弃的建议**", ""]
         lines += [f"- {x}" for x in changes["skipped"]]
         lines += [""]
-    if not any(changes.get(k) for k in ("persona", "judge_l2", "judge_l2_5", "knob_notes")):
+    if not any(
+        changes.get(k)
+        for k in ("persona", "judge_l2", "judge_l2_5", "judge_tool_router", "knob_notes")
+    ):
         lines += ["本轮没有改动（证据不足或建议都撞了守门规则）。", ""]
 
     if plan and not applied:
@@ -769,10 +895,19 @@ def write_report(
             lines.append("**L2.5 补充**")
             lines += [f"- {x}" for x in plan["judge_l2_5"]]
             lines.append("")
-        if plan.get("knobs"):
-            lines.append("**建议改的数值**")
-            lines += [f"- {k}: {v}" for k, v in plan["knobs"].items()]
+        if plan.get("judge_tool_router"):
+            lines.append("**工具路由补充**")
+            lines += [f"- {x}" for x in plan["judge_tool_router"]]
             lines.append("")
+        for field, label in (
+            ("knobs", "L2/L2.5 数值"),
+            ("recall_knobs", "L1 召回数值"),
+            ("router_knobs", "工具路由数值"),
+        ):
+            if plan.get(field):
+                lines.append(f"**建议改的数值（{label}）**")
+                lines += [f"- {k}: {v}" for k, v in plan[field].items()]
+                lines.append("")
 
     if note:
         lines += ["## 备注", "", note, ""]
@@ -793,7 +928,8 @@ def git_commit(paths: list[str], day: date) -> str:
         return "no staged change"
     msg = (
         f"chore(persona): {day.isoformat()} 夜间复盘自动微调\n\n"
-        "由 tools/persona_review.py 生成：人格进化记录、L2/L2.5 判定补充规则、数值闸门。\n"
+        "由 tools/persona_review.py 生成：人格进化记录、L2/L2.5/工具路由判定补充规则、\n"
+        "L2 与 L1 召回、工具路由的数值闸门。\n"
         "人设记录与 tuning.json 在 data/ 下不入库，本次只提交 roles/judges 的规则文件。"
     )
     proc = subprocess.run(
@@ -851,6 +987,7 @@ def main() -> int:
         f"群友 {stats['user_msgs']} 条 / 大肥鱼 {stats['bot_msgs']} 条 "
         f"({stats['bot_share_pct']}%) / 均长 {stats['avg_len']} 字 / "
         f"无人接 {stats['no_reply_pct']}% / L2 {stats['l2_hit_pct']}% / L2.5 {stats['l25_hit_pct']}%"
+        f" / L1 注入 {stats['l1_hit_pct']}% / 派活 {stats['router_hit_pct']}%"
     )
 
     if args.no_llm:
@@ -883,6 +1020,7 @@ def main() -> int:
         "persona": [],
         "judge_l2": [],
         "judge_l2_5": [],
+        "judge_tool_router": [],
         "knob_notes": [],
         "skipped": [],
     }
@@ -919,7 +1057,11 @@ def main() -> int:
             changes["judge_l2_5"] = apply_judge("l2_5", l25_items, day)
             _diff(l25_items, changes["judge_l2_5"], "L2.5")
 
-            _, changes["knob_notes"] = apply_knobs(plan.get("knobs") or {}, day)
+            router_items = plan.get("judge_tool_router") or []
+            changes["judge_tool_router"] = apply_judge("tool_router", router_items, day)
+            _diff(router_items, changes["judge_tool_router"], "工具路由")
+
+            _, changes["knob_notes"] = apply_knobs(plan, day)
         except Exception as exc:
             print(f"落盘失败，已回滚人设：{exc}", file=sys.stderr)
             write_report(day, stats, log_info, plan, {**changes, "skipped": [f"落盘失败：{exc}"]}, "")
@@ -929,13 +1071,16 @@ def main() -> int:
         day, stats, log_info, plan, changes, plan.get("note", ""), applied=args.apply
     )
 
-    if args.apply and (changes["judge_l2"] or changes["judge_l2_5"]):
+    if args.apply and (
+        changes["judge_l2"] or changes["judge_l2_5"] or changes["judge_tool_router"]
+    ):
         print("git:", git_commit(["roles/judges"], day))
 
     print(f"报告：{path}")
     print(
         f"改动：人格 {len(changes['persona'])} 条 / L2 {len(changes['judge_l2'])} 条 / "
-        f"L2.5 {len(changes['judge_l2_5'])} 条 / 数值 {len(changes['knob_notes'])} 项"
+        f"L2.5 {len(changes['judge_l2_5'])} 条 / 工具路由 {len(changes['judge_tool_router'])} 条 / "
+        f"数值 {len(changes['knob_notes'])} 项"
     )
     if changes["knob_notes"]:
         for n in changes["knob_notes"]:

@@ -1,4 +1,4 @@
-"""每日 L2 / L2.5 子代理调用统计（纯标准库，全程不调模型）。
+"""每日子代理调用统计（纯标准库，全程不调模型）。
 
 - 每发生一次判定就记一次，按天落盘到 ``data/统计/counters_YYYY-MM-DD.json``
 - 报告文本只读这些计数文件 + 历史表，不经过任何 LLM
@@ -6,8 +6,12 @@
 
 计数口径：
 - ``call``：真正把判定请求发给模型的次数（被闸门挡掉的不算）
-- ``hit`` ：判定打通、触发大肥鱼开口的次数
+- ``hit`` ：判定打通、触发开口 / 真的注入 / 决定派活的次数
 - 回复率 = hit / call
+
+前两类（l2 / l2_5）是子代理判定；后两类是 2026-11-26 给夜间人格复盘加的
+观测点：L1 识海每轮有没有召回旧事、工具路由小模型每句判不判「要干活」。
+报告主体仍只统计前两类，新增两类放在末尾附注里，不改动原有日报格式。
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ STATS_DIR.mkdir(parents=True, exist_ok=True)
 KIND_LABELS = {
     "l2": "L2 上下文追认（这句是不是在接我的话）",
     "l2_5": "L2.5 冷场吐槽雷达（冷场后开的话题值不值得吐槽）",
+    "l1_recall": "L1 识海召回（这句有没有想起旧事）",
+    "tool_router": "工具路由判定（这句要不要派活）",
 }
 
 _lock = threading.Lock()
@@ -71,7 +77,7 @@ def _write(path: Path, data: dict) -> None:
 
 
 def record(kind: str, group_id: str = "", hit: bool = False) -> None:
-    """记一次判定调用。kind 取 ``l2`` / ``l2_5``。"""
+    """记一次调用。kind 取 ``l2`` / ``l2_5`` / ``l1_recall`` / ``tool_router``。"""
     if kind not in KIND_LABELS:
         return
     day = datetime.now().strftime("%Y-%m-%d")
@@ -162,6 +168,18 @@ def build_report(day: str) -> str:
             "",
         ]
     )
+
+    # 附注：夜间人格复盘新增的两个观测点（旧 counters 文件没这两项时不显示）
+    extra_rows = []
+    for kind, label in (("l1_recall", "L1 召回注入"), ("tool_router", "工具路由派活")):
+        bucket = data.get(kind)
+        if not isinstance(bucket, dict) or not bucket.get("call"):
+            continue
+        extra_rows.append(
+            f"{label}：{bucket['hit']} / {bucket['call']}（{_pct(bucket['hit'], bucket['call'])}）"
+        )
+    if extra_rows:
+        lines.extend(["附：L1 / 工具路由（复盘用）"] + [f"  {r}" for r in extra_rows] + [""])
 
     # 分群明细
     groups: dict[str, dict[str, dict]] = {}

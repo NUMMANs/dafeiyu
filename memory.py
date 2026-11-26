@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from config import BASE_DIR, DATA_DIR
+import tuning
 
 logger = logging.getLogger("dafeiyu.memory")
 
@@ -275,6 +276,9 @@ class FourLayerMemory:
             nodes = self._graph["nodes"]
             if not nodes:
                 return []
+            # 夜间复盘可以热调这三个闸门（data/tuning.json），不用重启
+            score_threshold = tuning.get_float("RECALL_SCORE_THRESHOLD", RECALL_SCORE_THRESHOLD)
+            min_literal = tuning.get_int("MIN_LITERAL_HITS", MIN_LITERAL_HITS)
 
             # 群聊隔离：优先匹配当前群或全局（group_id == ""）的记忆
             valid_nodes: dict[str, dict[str, Any]] = {}
@@ -288,8 +292,8 @@ class FourLayerMemory:
                 return []
 
             denom = min(len(q_tokens), 4)
-            # 查询很短（1~2 个词）时命中 1 个就够，否则要求命中 2 个
-            min_hits = 1 if len(q_tokens) <= 2 else MIN_LITERAL_HITS
+            # 查询很短（1~2 个词）时命中 1 个就够，否则要求命中 min_literal 个
+            min_hits = 1 if len(q_tokens) <= 2 else min_literal
             literal_scores: dict[str, float] = {}
             for nid, n in valid_nodes.items():
                 doc_tokens = _tokenize(n["text"] + " " + " ".join(n.get("tags") or []))
@@ -331,7 +335,7 @@ class FourLayerMemory:
                 node = valid_nodes[nid]
                 eff_w = _effective_weight(node, now)
                 final_score = rel * (0.5 + min(eff_w, 12.0) / 24.0)
-                if final_score >= RECALL_SCORE_THRESHOLD:
+                if final_score >= score_threshold:
                     scored.append((final_score, node))
 
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -348,6 +352,13 @@ class FourLayerMemory:
                     node["updated"] = round(now, 2)
                 self._save_graph_locked()
 
+            logger.info(
+                "L1 召回 %d 条｜阈值 %.2f｜字面 %d｜query=%s",
+                len(top_items),
+                score_threshold,
+                min_literal,
+                " ".join((query or "").split())[:24],
+            )
             return [
                 {
                     "id": n["id"],
@@ -361,8 +372,10 @@ class FourLayerMemory:
             ]
 
     def render_context(self, query: str, group_id: str | None = None, max_chars: int = 400) -> str:
-        """拼装本轮注入提示词（≤5 条、≤400 字；没有相关记忆时返回空串，绝不硬凑）"""
-        items = self.recall(query, top_n=5, group_id=group_id, reinforce=True)
+        """拼装本轮注入提示词；条数/字数/阈值都能被夜间复盘热调，没相关记忆时返回空串。"""
+        top_n = tuning.get_int("RECALL_TOP_N", 5)
+        limit = tuning.get_int("RECALL_MAX_CHARS", max_chars)
+        items = self.recall(query, top_n=top_n, group_id=group_id, reinforce=True)
         if not items:
             return ""
         src_map = {"owner": "主人说的", "self": "你自己记的", "group": "群里聊的", "web": "查到的"}
@@ -370,7 +383,7 @@ class FourLayerMemory:
         total = len(lines[0])
         for it in items:
             line = f"- {it['text']}（{src_map.get(it['source'], '群里聊的')}）"
-            if total + len(line) + 1 > max_chars:
+            if total + len(line) + 1 > limit:
                 break
             lines.append(line)
             total += len(line) + 1

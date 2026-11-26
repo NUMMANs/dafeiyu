@@ -1437,7 +1437,7 @@ class DaFeiYuBotCore:
         if not settings.ENABLE_TOOL_ROUTER:
             return ""
         body = (text or "").strip()
-        if len(body) < settings.TOOL_ROUTER_MIN_CHARS:
+        if len(body) < tuning.get_int("TOOL_ROUTER_MIN_CHARS", settings.TOOL_ROUTER_MIN_CHARS):
             return ""
         ok_dsh, _detail = is_dsh_available()
         if not ok_dsh:
@@ -1452,6 +1452,8 @@ class DaFeiYuBotCore:
         except Exception as exc:
             logger.warning("[%s] 工具路由判定异常: %s", group_id, exc)
             return ""
+        # 夜间复盘要靠这个看派活率：真发给模型才算一次，被闸门挡掉的不计
+        metrics.record("tool_router", group_id, bool(decision.get("need")))
         if not decision.get("need"):
             return ""
 

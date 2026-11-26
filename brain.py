@@ -30,6 +30,7 @@ from dsh_bridge import is_dsh_available
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
 import l3_inject
+import metrics
 from memory import estimate_tokens, memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
@@ -700,6 +701,8 @@ class DaFeiYuBrain:
         # 只用这句话本身去召回：把 sender 也拼进查询会让「这条记忆的 tags 里有这个人」
         # 变成命中条件，于是这个人以后说的每一句（哪怕只有一个「行」）都会把它召回。
         recalled_memory = memory_store.render_context(text, group_id=group_id)
+        # 夜间复盘要靠这个看「L1 有没有把无关旧事塞进每轮上下文」
+        metrics.record("l1_recall", group_id, hit=bool(recalled_memory))
         diary_note = (
             memory_store.render_diary_context(group_id) if settings.MEMORY_DIARY_INJECT else ""
         )
@@ -1418,6 +1421,16 @@ class DaFeiYuBrain:
         ctx = "\n".join(ctx_lines) if ctx_lines else "（群里之前没人说话）"
         probe = body if len(body) <= 300 else body[:300] + "…"
 
+        # 夜间复盘沉淀下来的临时偏好（roles/judges/tool_router.md）。
+        # 只能收「什么场景该派/不该派」的具体补充，不许改输出格式、更不许一刀切关掉路由。
+        extra = tuning.judge_extra("tool_router")
+        extra_block = (
+            "\n另外，昨天群里复盘出这几条，判的时候一并考虑（和上面冲突时以这里为准）：\n"
+            f"{extra}\n"
+            if extra
+            else ""
+        )
+
         prompt = (
             "你是群聊机器人的「派活判断器」。只判断群友这句话要不要机器人动手去干活，"
             "不负责真的干活，也不负责聊天。\n\n"
@@ -1430,7 +1443,8 @@ class DaFeiYuBrain:
             "- need=false（不干活）：闲聊、吐槽、开玩笑、问知识、问观点、问建议、问天气时间、"
             "约人打游戏、发表情、问机器人自己（“你在干嘛”）、要表情包、让它记住某件事、"
             "单纯复述或抱怨。\n"
-            "拿不准时一律 need=false —— 宁可漏派，也不要给群里派一堆空任务。\n\n"
+            "拿不准时一律 need=false —— 宁可漏派，也不要给群里派一堆空任务。\n"
+            f"{extra_block}\n"
             "need=true 时，把这件事改写成一段可以直接交给执行助手的任务说明：\n"
             "- 不带人称、不带寒暄、不要写“请帮我”，直接写要做什么；\n"
             "- 保留原话里的所有细节（文件路径、人名、数字、时间、格式要求）；\n"
