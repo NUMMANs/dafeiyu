@@ -164,6 +164,22 @@ class Settings:
     # 无人值守必须跳过权限确认，否则工具调用会被挂起
     CBC_PERMISSION_MODE: str = os.getenv("CBC_PERMISSION_MODE", "bypassPermissions").strip()
 
+    # ---- 工具 LLM 的写权限边界（2026-11-26）----
+    # 派出去干活的工具只许在沙箱里生成文件，外加一个受控通道：写 l3_inject.json 给
+    # 大肥鱼的上下文补几句话。项目代码 / .env / roles 人格文件 / data 记忆库一律不许碰。
+    # 沙箱默认放在家目录（项目外面），工具从 cwd 出发根本看不到项目。
+    TOOL_SANDBOX_ROOT: str = os.getenv("TOOL_SANDBOX_ROOT", "").strip()
+    # 家目录下最多留多少个历史沙箱（任务产物投递完就没用了，留着只方便事后查）
+    TOOL_SANDBOX_KEEP: int = max(3, int(os.getenv("TOOL_SANDBOX_KEEP", "30")))
+    # 任务前后比对项目文件：被改/被删的原样还原，新建的挪进 quarantine 并记账
+    TOOL_GUARD_ENABLED: bool = _parse_bool(os.getenv("TOOL_GUARD_ENABLED"), True)
+    # 发现越界时是否自动还原。关掉就只告警不动手（排查误报时用）
+    TOOL_GUARD_RESTORE: bool = _parse_bool(os.getenv("TOOL_GUARD_RESTORE"), True)
+    # 一次任务最多往 L3 注入几条（0 = 关闭这条通道）
+    TOOL_L3_INJECT_MAX: int = max(0, int(os.getenv("TOOL_L3_INJECT_MAX", "5")))
+    # 注入内容的存活时间（小时），过期自动失效，不污染上下文
+    TOOL_L3_INJECT_TTL_HOURS: float = max(0.5, float(os.getenv("TOOL_L3_INJECT_TTL_HOURS", "6")))
+
     # 高危操作群内二次确认保险
     ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)
     DANGER_CONFIRM_TTL_SEC: int = max(30, int(os.getenv("DANGER_CONFIRM_TTL_SEC", "180")))

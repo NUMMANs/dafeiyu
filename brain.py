@@ -29,6 +29,7 @@ from config import settings
 from dsh_bridge import is_dsh_available
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
+import l3_inject
 from memory import estimate_tokens, memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
@@ -410,6 +411,7 @@ def _build_turn_context(
     diary_note: str = "",
     bg_note: str = "",
     job_report: str = "",
+    l3_notes: list[str] | None = None,
 ) -> str:
     """本轮动态上下文（时间/后台任务/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -420,6 +422,15 @@ def _build_turn_context(
     extra_blocks = []
     if job_report:
         extra_blocks.append(job_report)
+    if l3_notes:
+        # 后台工具唯一被允许留下的「话」：写进 l3_inject.json 的几句话，带过期时间。
+        # 明确告诉她这是自己知道的、不是别人刚说的，避免她当成新消息接话。
+        bullets = "\n".join(f"- {n}" for n in l3_notes)
+        extra_blocks.append(
+            "【你自己知道的事】这些是你派活出去干活时记下的，不是群里刚有人说的：\n"
+            f"{bullets}\n"
+            "（知道就行。没人问到就别主动提，别人正好聊到就直接用，别念成清单。）"
+        )
     if bg_note:
         extra_blocks.append(bg_note)
     if recalled_memory:
@@ -694,6 +705,8 @@ class DaFeiYuBrain:
         )
         matched_slang = slang_book.render_matched(group_id, text)
         emotion_desc = emotion_sm.describe(group_id)
+        # L3 注入：后台工具干完活留下的几句话（带 TTL，过期自动消失）
+        l3_notes = l3_inject.load_notes(group_id, limit=5) if group_id else []
         turn_context = _build_turn_context(
             status,
             sender,
@@ -704,6 +717,7 @@ class DaFeiYuBrain:
             diary_note=diary_note,
             bg_note=bg_note,
             job_report=job_report,
+            l3_notes=l3_notes,
         )
         # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效
         messages: list[dict] = [

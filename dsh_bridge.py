@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from config import BASE_DIR, DATA_DIR, settings
+import tool_guard
 
 logger = logging.getLogger("dafeiyu.dsh")
 
@@ -168,15 +169,6 @@ def get_last_job_context(group_id: str = "") -> dict[str, Any] | None:
     return None
 
 
-def _resolve_workdir(workdir: str = "") -> Path:
-    raw = (workdir or settings.DSH_WORKDIR or "").strip()
-    if raw:
-        candidate = Path(raw).expanduser()
-        if candidate.is_dir():
-            return candidate.resolve()
-    return BASE_DIR.resolve()
-
-
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -260,9 +252,40 @@ def submit_dsh_job(
         # 新建会话必须省略 --session-id，由 DSH 自行创建会话
         resolved_sid = ""
 
-    resolved_workdir = _resolve_workdir(workdir)
     resolved_mode = (mode or settings.DSH_MODE or "danger-full-access").strip()
     job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+    # 写权限边界：默认在项目外面给这个任务开一个独立工作区（沙箱），工具只能在那里生成
+    # 文件；项目目录连只读都算越界。DSH_WORKDIR 显式指定时仍然尊重——那是给人排查用的后门。
+    explicit_workdir = (workdir or settings.DSH_WORKDIR or "").strip()
+    sandbox = ""
+    if explicit_workdir:
+        cand = Path(explicit_workdir).expanduser()
+        if cand.is_dir():
+            resolved_workdir = cand.resolve()
+        else:
+            resolved_workdir = tool_guard.make_sandbox(job_id)
+            sandbox = str(resolved_workdir)
+    else:
+        try:
+            tool_guard.prune_sandboxes(keep=settings.TOOL_SANDBOX_KEEP)
+        except Exception as exc:
+            logger.debug("清理旧沙箱失败（不影响本次任务）: %s", exc)
+        resolved_workdir = tool_guard.make_sandbox(job_id)
+        sandbox = str(resolved_workdir)
+    if not sandbox:
+        sandbox = str(resolved_workdir)
+
+    prompt_text = (
+        tool_guard.build_boundary_prompt(
+            str(resolved_workdir),
+            str(BASE_DIR.resolve()),
+            settings.TOOL_L3_INJECT_MAX,
+            settings.TOOL_L3_INJECT_TTL_HOURS,
+        )
+        + prompt_text
+    )
+
     job_dir = DSH_JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -283,6 +306,11 @@ def submit_dsh_job(
         "approval_policy": settings.DSH_APPROVAL_POLICY,
         "model": settings.DSH_MODEL,
         "workdir": str(resolved_workdir),
+        "sandbox": sandbox,
+        "guard_enabled": settings.TOOL_GUARD_ENABLED,
+        "guard_restore": settings.TOOL_GUARD_RESTORE,
+        "l3_inject_max": settings.TOOL_L3_INJECT_MAX,
+        "l3_inject_ttl_hours": settings.TOOL_L3_INJECT_TTL_HOURS,
         "timeout_sec": settings.DSH_TIMEOUT_SEC,
         "created_at": time.time(),
     }
@@ -582,6 +610,19 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
     started_at = float(done_data.get("started_at") or job_meta.get("created_at") or 0.0)
     finished_at = float(done_data.get("finished_at") or 0.0)
 
+    # 写权限护栏的结论放在抬头，出问题时第一眼就能看到
+    guard_info = done_data.get("guard") if isinstance(done_data.get("guard"), dict) else {}
+    guard_violations = guard_info.get("violations") or []
+    if not job_meta.get("guard_enabled", True):
+        guard_line = "已关闭（TOOL_GUARD_ENABLED=0）"
+    elif guard_violations:
+        guard_line = (
+            f"越界 {len(guard_violations)} 处，已处理 {int(guard_info.get('restored') or 0)} 处"
+            + (f"（{guard_info.get('reason')}）" if guard_info.get("reason") else "")
+        )
+    else:
+        guard_line = "通过（项目文件未被改动）"
+
     def _fmt_ts(ts: float) -> str:
         if ts <= 0:
             return "-"
@@ -614,7 +655,10 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
         f"结束时间：{_fmt_ts(finished_at)}",
         f"耗时：{done_data.get('duration_sec', 0)} 秒",
         f"工作目录：{job_meta.get('workdir') or '-'}",
+        f"沙箱（唯一可写区）：{job_meta.get('sandbox') or job_meta.get('workdir') or '-'}",
         f"权限模式：{job_meta.get('mode') or '-'}",
+        f"写权限护栏：{guard_line}",
+        f"L3 注入：{int(done_data.get('l3_inject') or 0)} 条",
         "",
         "-" * 64,
         "【任务原文】",
@@ -632,6 +676,17 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
         lines.extend(
             ["-" * 64, "【本次回传的产出文件】", "-" * 64]
             + [f"- {p}" for p in artifacts]
+            + [""]
+        )
+
+    if guard_violations:
+        lines.extend(
+            ["-" * 64, "【写权限越界记录】", "-" * 64]
+            + [
+                f"- {v.get('action')}：{v.get('path')}"
+                + (f"（{v.get('error')}）" if v.get("error") else "")
+                for v in guard_violations
+            ]
             + [""]
         )
 

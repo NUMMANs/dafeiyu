@@ -614,6 +614,22 @@ class WxAutoAdapter:
                             mechanical_text, _legacy_attach = format_job_delivery(done_job)
                             if not spoken:
                                 spoken = mechanical_text
+                            # 写权限护栏有结论就带一句：越界改动已经还原，别让它悄悄过去
+                            guard_info = (
+                                done_job.get("guard") if isinstance(done_job.get("guard"), dict) else {}
+                            )
+                            guard_violations = guard_info.get("violations") or []
+                            if guard_violations:
+                                restored = int(guard_info.get("restored") or 0)
+                                handled = (
+                                    "已经按干活前的内容还原了"
+                                    if restored >= len(guard_violations)
+                                    else f"还原了 {restored} 个，其余的记在报告里等你看"
+                                )
+                                spoken += (
+                                    f"\n\n（另外：这次干活越界动了项目里 {len(guard_violations)} 个文件，"
+                                    f"{handled}。）"
+                                )
                             if not self._safe_send(wx, spoken, target_group, "DSH 任务投递"):
                                 continue
                             logger.info(

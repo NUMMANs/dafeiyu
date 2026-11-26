@@ -13,6 +13,9 @@ import time
 import uuid
 from pathlib import Path
 
+import l3_inject
+import tool_guard
+
 _CONFLICTING_ENV_KEY_RE = re.compile(
     r"(?m)^\s*(?:DEEPSEEK_BASE_URL|DSH_[A-Z0-9_]*|OPENAI_BASE_URL|ANTHROPIC_BASE_URL)\s*="
 )
@@ -256,7 +259,52 @@ def _log_backend_fallback(reason: str, job: dict, job_dir: Path) -> None:
         pass
 
 
-def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float):
+def _finalize_boundaries(job: dict, job_dir: Path, done_payload: dict, guard) -> None:
+    """任务收尾的两件事：校验写权限边界 + 收工具留下的 L3 注入。
+
+    两个后端共用这一段——CodeBuddy 回退到 DSH 时是同一次任务，不能各记一遍。
+    """
+    # 1) 写权限校验：项目里被改/被删的文件还原，新建的隔离，记账写 violations.json
+    if guard is not None:
+        try:
+            violations = guard.verify(restore=bool(job.get("guard_restore", True)))
+        except Exception as exc:
+            violations = []
+            print(f"[guard] 校验异常: {exc}", file=sys.stderr)
+        done_payload["guard"] = {
+            "violations": violations,
+            "restored": sum(
+                1 for v in violations if str(v.get("action")) in ("restored", "quarantined")
+            ),
+            "reason": str(getattr(guard, "last_reason", "") or ""),
+        }
+
+    # 2) L3 注入：工具唯一被允许「给大肥鱼留话」的通道
+    max_notes = int(job.get("l3_inject_max") or 0)
+    done_payload["l3_inject"] = 0
+    if max_notes <= 0:
+        return
+    sandbox = Path(str(job.get("sandbox") or job.get("workdir") or job_dir))
+    try:
+        notes = l3_inject.read_from_sandbox(sandbox, max_notes=max_notes)
+    except Exception as exc:
+        print(f"[l3] 读取注入内容失败: {exc}", file=sys.stderr)
+        return
+    if not notes:
+        return
+    try:
+        done_payload["l3_inject"] = l3_inject.record_notes(
+            group_id=str(job.get("group_id") or ""),
+            notes=notes,
+            job_id=str(job.get("job_id") or job_dir.name),
+            ttl_hours=float(job.get("l3_inject_ttl_hours") or 6),
+            max_notes=max_notes,
+        )
+    except Exception as exc:
+        print(f"[l3] 写入注入内容失败: {exc}", file=sys.stderr)
+
+
+def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float, guard=None):
     """CodeBuddy CLI 版执行路径。
 
     返回 (done_payload, "") 表示跑完了（成功或业务失败都算跑完）；
@@ -386,6 +434,7 @@ def _run_codebuddy(job: dict, prompt_text: str, job_dir: Path, started_at: float
         "backend": "codebuddy",
         "delivered": False,
     }
+    _finalize_boundaries(job, job_dir, done_payload, guard)
     _atomic_write_text(done_path, json.dumps(done_payload, ensure_ascii=False, indent=2))
     running_path.unlink(missing_ok=True)
     return done_payload, ""
@@ -566,11 +615,21 @@ def main() -> int:
         json.dumps({"pid": os.getpid(), "started_at": started_at}, ensure_ascii=False, indent=2),
     )
 
+    # 写权限护栏：开工前给项目受保护文件拍快照，跑完逐字节比对（改了还原、新建的隔离）
+    guard = None
+    if bool(job.get("guard_enabled", True)):
+        try:
+            guard = tool_guard.ProjectGuard(Path(__file__).resolve().parent, job_dir)
+            guard.snapshot()
+        except Exception as exc:
+            guard = None
+            print(f"[guard] 快照失败，本次跳过校验: {exc}", file=sys.stderr)
+
     backend = str(job.get("backend") or os.environ.get("TOOL_BACKEND") or "dsh").strip().lower()
     fallback_from = ""
     fallback_reason = ""
     if backend == "codebuddy":
-        payload, reason = _run_codebuddy(job, prompt_text, job_dir, started_at)
+        payload, reason = _run_codebuddy(job, prompt_text, job_dir, started_at, guard)
         if payload is not None:
             return 0
         # CodeBuddy 这层不可用（没登录 / CLI 崩了 / 找不到）——同一进程直接改用 DSH 重跑，
@@ -595,13 +654,15 @@ def main() -> int:
 
     launch_cwd = workdir
     if _has_conflicting_dotenv(Path(workdir)):
+        # 工作区里有 DSH_* / DEEPSEEK_BASE_URL 这类键时，DSH 会读到并顶掉它自己的配置，
+        # 所以启动目录挪去临时目录，真正的工作区在提示词里指明（不是拿项目根当工作区了）。
         launch_dir = Path(tempfile.gettempdir()) / "dafeiyu_dsh_launch"
         launch_dir.mkdir(parents=True, exist_ok=True)
         launch_cwd = str(launch_dir)
         mode = "danger-full-access"
         prompt_text = (
-            f"[目标项目根目录]：{workdir}\n"
-            "请直接在上述目标项目根目录中读取、修改文件与执行命令，不要把项目产物写到当前临时启动目录。\n\n"
+            f"[你的工作区目录]：{workdir}\n"
+            "启动目录只是临时的，所有新建文件都写进上面这个工作区目录。\n\n"
             f"{prompt_text}"
         )
 
@@ -724,6 +785,7 @@ def main() -> int:
         "fallback_reason": fallback_reason,
         "delivered": False,
     }
+    _finalize_boundaries(job, job_dir, done_payload, guard)
     _atomic_write_text(done_path, json.dumps(done_payload, ensure_ascii=False, indent=2))
     running_path.unlink(missing_ok=True)
     return 0
