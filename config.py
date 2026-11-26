@@ -42,7 +42,8 @@ class Settings:
     VISION_BASE_URL: str = os.getenv("VISION_BASE_URL", "").strip()
 
     BOT_NAME: str = os.getenv("BOT_NAME", "大肥鱼").strip()
-    DEFAULT_PERSONA: str = os.getenv("DEFAULT_PERSONA", "fengge").strip().lower() or "fengge"
+    # 人设只剩大肥鱼一个（峰哥已于 2026-11-26 删除），此项保留只为兼容旧 .env
+    DEFAULT_PERSONA: str = os.getenv("DEFAULT_PERSONA", "dafeiyu").strip().lower() or "dafeiyu"
     # 群聊唤醒词：L1 硬触发只认 @ 唤名（2026-11-25 收紧，原为 ["@大肥鱼","大肥鱼","肥鱼"]）
     # 如需恢复"不 @ 也叫得醒"，在 .env 里显式配置 TRIGGER_KEYWORDS=@大肥鱼,大肥鱼,肥鱼
     TRIGGER_KEYWORDS: list[str] = _parse_list(

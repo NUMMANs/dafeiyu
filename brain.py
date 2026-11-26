@@ -31,7 +31,7 @@ from image_fetcher import download_image_url, search_and_download_image
 from memory import estimate_tokens, memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
-from roles.build_card import evolve_persona, get_active_persona, load_card
+from roles.build_card import evolve_persona, load_card
 from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
@@ -343,26 +343,20 @@ def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | Non
 
 
 def _persona_voice_profile() -> tuple[str, str, str]:
-    """返回 (角色简称, 回复口吻指引, 语气尾词)，避免切到峰哥人设时串出塔菲/喵。"""
-    if get_active_persona() == "fengge":
-        return (
-            "峰哥",
-            "峰哥松弛直白的短气泡老哥口吻（严禁使用“喵”“人家”“塔菲”等卖萌词）",
-            "",
-        )
-    return ("塔菲", "塔菲真人群友的短气泡口吻", "喵")
+    """返回 (角色简称, 回复口吻指引, 语气尾词)。只剩大肥鱼一个人设，不带卖萌尾字。"""
+    return ("大肥鱼", "大肥鱼真人群友的短气泡口吻", "")
 
 
-# 峰哥人设下要从模型输出里硬抠掉的卖萌残留。卡片里只写了「严禁喵/塔菲」，
-# 但 L3 整层注入后会看到它自己以前说过的「大脑断网了喵」「晚上好喵」，
-# 偶发就会顺着旧口吻补一个尾字——靠提示词压不住，只能在出口兜一层。
+# 出口要硬抠掉的串戏词。人设卡里是「真人短气泡、不卖萌」的路子，但 L3 整层注入会把
+# 它自己更早（塔菲时代）说过的「…喵」「塔菲」当成自己的口吻喂回来，光靠提示词压不住，
+# 偶发就会顺着旧口吻补一个尾字——所以在出口兜一层，保证发出去的一定干净。
 _PERSONA_LEAK_WORDS = ("塔菲", "喵")
 _DUP_PUNCT_RE = re.compile(r"([，。！？、~～]{1})\1+")
 
 
 def _strip_persona_leaks(text: str) -> str:
-    """峰哥人设下把「喵／塔菲」这类串戏词从最终回复里删掉（幂等，不动塔菲人设）。"""
-    if not text or get_active_persona() != "fengge":
+    """把「喵／塔菲」这类串戏词从最终回复里删掉（幂等）。"""
+    if not text:
         return text
     out = text
     for word in _PERSONA_LEAK_WORDS:
