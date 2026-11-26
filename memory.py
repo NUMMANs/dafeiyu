@@ -550,17 +550,25 @@ class FourLayerMemory:
         把最近 1~2 条日记拼成一小块「心情底色」注入系统提示词。
 
         日记以前只被 /日记 命令读到，写完就躺在磁盘里从不进 prompt，等于白写。
-        这里只取本群最近 3 天、最多 2 条、合计 ≤120 字，并且明确告诉她别复述。
+        只取本群近几天、最多 2 条、每条截 52 字、合计 ≤120 字，并明确告诉她别复述。
         （system 段命中缓存，实测这点开销基本为 0；关掉用 MEMORY_DIARY_INJECT=0）
+        2026-11-26：条数/天数/字数/开关全部下沉到 data/tuning.json，夜间「记忆与人格」
+        任务可以热调注入方式，不用改代码、不用重启。
         """
-        diaries = self.read_recent_diaries(limit=2, group_id=group_id, days=days)
+        if not tuning.get_int("DIARY_INJECT_ON", 1):
+            return ""
+        days = tuning.get_int("DIARY_DAYS", days)
+        max_items = tuning.get_int("DIARY_MAX_ITEMS", 2)
+        item_chars = tuning.get_int("DIARY_ITEM_CHARS", 52)
+        limit = tuning.get_int("DIARY_MAX_CHARS", max_chars)
+        diaries = self.read_recent_diaries(limit=max_items, group_id=group_id, days=days)
         if not diaries:
             return ""
         lines = ["【你前两天写的日记（只作心情底色，别主动复述细节）】"]
         total = len(lines[0])
         for d in diaries:
-            line = f"- {d.get('时间', '')[5:10]} {d.get('心情', '平常')}：{d.get('内容', '')[:52]}"
-            if total + len(line) + 1 > max_chars:
+            line = f"- {d.get('时间', '')[5:10]} {d.get('心情', '平常')}：{d.get('内容', '')[:item_chars]}"
+            if total + len(line) + 1 > limit:
                 break
             lines.append(line)
             total += len(line) + 1

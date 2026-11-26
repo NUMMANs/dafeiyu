@@ -1,17 +1,21 @@
 """运行期调参层：夜间复盘写这两个地方，机器人不用重启就生效。
 
-- ``data/tuning.json``      数值闸门（L2 时间窗、L2.5 冷场间隔、吐槽阈值、
-                            L1 识海召回、工具路由判定）
+- ``data/tuning.json``      数值闸门（唤醒灵敏度、感官、注入方式、L1 召回、工具路由）
 - ``roles/judges/*.md``     判定器补充规则（L2 / L2.5 / 工具路由的提示词加临时偏好）
 
 为什么单独做一层：
 配置项都写在 ``config.Settings`` 的类属性里，进程启动时求值一次，之后改 ``.env``
-必须重启才生效。夜间复盘在 0:30 跑，那时候重启会把正在冒泡/正在接话的状态打断，
-而且看门狗会重新走一遍「重启播报」，群里平白多一条消息。
-所以把「可以随时微调」的几个值下沉到这里，按文件 mtime 热加载，改完下一句就生效。
+必须重启才生效。夜间复盘在凌晨跑，那时候重启会把正在冒泡/正在接话的状态打断。
+所以把「可以随时微调」的值下沉到这里，按文件 mtime 热加载，改完下一句就生效。
 
 数值都有硬边界（``BOUNDS``）。模型可以建议，但不许把阈值调到离谱区间，
 比如把 L2.5 阈值压到 0.3，那样群里每句废话它都会接。
+
+2026-11-26 扩展：两个夜间定时任务分了工，也把各自的调参面写进 ``GROUPS``：
+- ``sense``（感官与工具助手）：图片认知、主动冒泡、去抖合并等唤醒灵敏度；
+- ``mind``（记忆与人格）：L2 日记 / L3 注文 / L1 旧事怎么拼进上下文；
+- ``core``（原人格复盘脚本）：L2/L2.5 阈值与 L1 召回、工具路由。
+写 ``data/tuning.json`` 时请遵守 ``STEP_LIMITS`` 的单晚步长，别一夜把行为掰弯。
 """
 
 from __future__ import annotations
@@ -52,6 +56,75 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # ---- 工具路由小模型（判断「这句要不要派活」）----
     # 短于这么多字的消息不送判定器，省一次调用（也可用来压误派率）
     "TOOL_ROUTER_MIN_CHARS": (4, 20),
+
+    # ---- 感官 / 唤醒层（夜间「感官与工具助手」任务负责）----
+    # 群里只发一张图、没带文字时，当场接话的概率。调高 = 更爱接图，调低 = 只默默看懂。
+    "IMAGE_REPLY_PROB": (0.0, 0.8),
+    # HeartFlow 氛围热力到多少才允许主动冒泡。调低 = 更爱主动开口，调高 = 更沉得住气。
+    "PROACTIVE_ENERGY_MIN": (40.0, 90.0),
+    # 连发合并：等群里停顿几秒才判定，一波最多攒几句。
+    "TRIGGER_DEBOUNCE_SEC": (2.0, 10.0),
+    "TRIGGER_BURST_MAX_ITEMS": (2, 10),
+    # 智谱看图成功后写进历史的描述字数；太短丢细节，太长会把 L3 历史撑肥。
+    "VISION_SUMMARY_CHARS": (80, 400),
+
+    # ---- 注入方式（夜间「记忆与人格」任务负责）----
+    # L3 注文：后台工具读懂链接/图片后留下的话，每轮最多几条、每条多少字、总开关。
+    "L3_NOTE_MAX_ITEMS": (1, 8),
+    "L3_NOTE_MAX_CHARS": (40, 300),
+    "L3_INJECT_ON": (0, 1),
+    # L1 旧事 / L2 日记是否注入本轮上下文（0 关 1 开）
+    "RECALL_INJECT_ON": (0, 1),
+    "DIARY_INJECT_ON": (0, 1),
+    # L2 日记注入方式：看最近几天、最多几条、每条截多少字、整块最多多少字。
+    "DIARY_DAYS": (1, 7),
+    "DIARY_MAX_ITEMS": (1, 3),
+    "DIARY_ITEM_CHARS": (30, 100),
+    "DIARY_MAX_CHARS": (60, 240),
+}
+
+# 两个夜间任务各自的调参面，写进 prompt 与护栏报告，避免互相踩。
+GROUPS: dict[str, tuple[str, ...]] = {
+    "sense": (
+        "IMAGE_REPLY_PROB", "PROACTIVE_ENERGY_MIN", "TRIGGER_DEBOUNCE_SEC",
+        "TRIGGER_BURST_MAX_ITEMS", "VISION_SUMMARY_CHARS",
+    ),
+    "mind": (
+        "RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS",
+        "L3_NOTE_MAX_ITEMS", "L3_NOTE_MAX_CHARS", "L3_INJECT_ON",
+        "RECALL_INJECT_ON", "DIARY_INJECT_ON", "DIARY_DAYS", "DIARY_MAX_ITEMS",
+        "DIARY_ITEM_CHARS", "DIARY_MAX_CHARS",
+    ),
+    "core": (
+        "TOPIC_ROAST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC",
+        "TOOL_ROUTER_MIN_CHARS",
+    ),
+}
+
+# 单晚允许的最大变动幅度。守门在 tools/nightly_guard.py 里；手写 tuning.json 也请照这个来。
+STEP_LIMITS: dict[str, float] = {
+    "IMAGE_REPLY_PROB": 0.1,
+    "PROACTIVE_ENERGY_MIN": 8.0,
+    "TRIGGER_DEBOUNCE_SEC": 1.0,
+    "TRIGGER_BURST_MAX_ITEMS": 1,
+    "VISION_SUMMARY_CHARS": 60,
+    "L3_NOTE_MAX_ITEMS": 1,
+    "L3_NOTE_MAX_CHARS": 60,
+    "L3_INJECT_ON": 1,
+    "RECALL_INJECT_ON": 1,
+    "DIARY_INJECT_ON": 1,
+    "DIARY_DAYS": 1,
+    "DIARY_MAX_ITEMS": 1,
+    "DIARY_ITEM_CHARS": 20,
+    "DIARY_MAX_CHARS": 40,
+    "RECALL_SCORE_THRESHOLD": 0.03,
+    "MIN_LITERAL_HITS": 1,
+    "RECALL_TOP_N": 1,
+    "RECALL_MAX_CHARS": 100,
+    "TOPIC_ROAST_MIN_SCORE": 0.05,
+    "FOLLOWUP_WINDOW_SEC": 150,
+    "TOPIC_GAP_SEC": 300,
+    "TOOL_ROUTER_MIN_CHARS": 2,
 }
 
 _cache_lock = threading.Lock()
@@ -144,6 +217,8 @@ def snapshot() -> dict[str, Any]:
         "tuning_path": str(TUNING_PATH),
         "knobs": current_knobs(),
         "bounds": {k: list(v) for k, v in BOUNDS.items()},
+        "groups": {k: list(v) for k, v in GROUPS.items()},
+        "step_limits": dict(STEP_LIMITS),
         "judges": {
             kind: judge_extra(kind)
             for kind in ("l2", "l2_5", "tool_router")

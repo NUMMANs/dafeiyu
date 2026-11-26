@@ -497,7 +497,7 @@ class DaFeiYuBotCore:
         if not body or not self._burst_item_ok(body):
             return
         burst = item.setdefault("burst", [])
-        cap = max(1, settings.TRIGGER_BURST_MAX_ITEMS)
+        cap = max(1, tuning.get_int("TRIGGER_BURST_MAX_ITEMS", settings.TRIGGER_BURST_MAX_ITEMS))
         if len(burst) >= cap:
             item["flushed"] = True
             item["due"] = 0.0
@@ -534,7 +534,7 @@ class DaFeiYuBotCore:
                 if kind == "l2" and existing.get("kind") != "l2":
                     existing["kind"] = "l2"
                 # 同一波对话里的后续发言：保留已有 burst，只续期
-                existing["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
+                existing["due"] = now + tuning.get_float("TRIGGER_DEBOUNCE_SEC", settings.TRIGGER_DEBOUNCE_SEC)
                 if quoted_sender:
                     existing["quoted"] = quoted_sender
                 self._append_burst_locked(existing, sender, body)
@@ -549,10 +549,10 @@ class DaFeiYuBotCore:
                 "gap_desc": gap_desc,
                 # 记下这一波开口时的冷场间隔：L2 判 NO 后要靠它决定能不能兜底走 L2.5
                 "gap_sec": float(gap_sec or 0.0),
-                "due": now + settings.TRIGGER_DEBOUNCE_SEC,
+                "due": now + tuning.get_float("TRIGGER_DEBOUNCE_SEC", settings.TRIGGER_DEBOUNCE_SEC),
                 "start": now,
             }
-        logger.debug("⏳ 去抖挂起 [%s/%s] due=+%.1fs: %s", group_id, kind, settings.TRIGGER_DEBOUNCE_SEC, body[:30])
+        logger.debug("⏳ 去抖挂起 [%s/%s] due=+%.1fs: %s", group_id, kind, tuning.get_float("TRIGGER_DEBOUNCE_SEC", settings.TRIGGER_DEBOUNCE_SEC), body[:30])
 
     def _touch_pending(self, group_id: str, now: float, text: str = "", sender: str = "") -> None:
         """
@@ -566,7 +566,7 @@ class DaFeiYuBotCore:
             item = self._pending_trigger.get(group_id)
             if item is None or item.get("flushed"):
                 return
-            item["due"] = now + settings.TRIGGER_DEBOUNCE_SEC
+            item["due"] = now + tuning.get_float("TRIGGER_DEBOUNCE_SEC", settings.TRIGGER_DEBOUNCE_SEC)
             self._append_burst_locked(item, sender, body)
 
     def _cancel_pending(self, group_id: str) -> None:
@@ -1259,7 +1259,8 @@ class DaFeiYuBotCore:
             sticker_manager.maybe_steal_meme(image_path)
             # 若群里单纯发了张图没带文字：根据 force_trigger 或随机看图吐槽概率决定是否立刻回复
             if not clean_text:
-                should_auto_roast = force_trigger or (random.random() < settings.AUTO_ROAST_IMAGE_PROB)
+                image_reply_prob = tuning.get_float("IMAGE_REPLY_PROB", settings.AUTO_ROAST_IMAGE_PROB)
+                should_auto_roast = force_trigger or (random.random() < image_reply_prob)
                 if not should_auto_roast:
                     self._caption_image_async(group_id, image_path)
                     return BotResponse(should_reply=False)
@@ -1802,7 +1803,7 @@ class DaFeiYuBotCore:
             return BotResponse(should_reply=False)
 
         energy = heartflow.record_group_pulse(group_id, sender, text)
-        if energy < 65.0:
+        if energy < tuning.get_float("PROACTIVE_ENERGY_MIN", 65.0):
             return BotResponse(should_reply=False)
 
         last_ts = self._last_proactive_ts.get(group_id, 0.0)

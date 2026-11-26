@@ -426,7 +426,9 @@ def _build_turn_context(
     if l3_notes:
         # 后台工具唯一被允许留下的「话」：写进 l3_inject.json 的几句话，带过期时间。
         # 明确告诉她这是自己知道的、不是别人刚说的，避免她当成新消息接话。
-        bullets = "\n".join(f"- {n}" for n in l3_notes)
+        # 条数与每条字数由 data/tuning.json 热调（夜间「记忆与人格」任务管注入方式）。
+        note_chars = tuning.get_int("L3_NOTE_MAX_CHARS", 200)
+        bullets = "\n".join(f"- {n[:note_chars]}" for n in l3_notes)
         extra_blocks.append(
             "【你自己知道的事】这些是你自己私下看过、查过的，不是群里刚有人说的：\n"
             f"{bullets}\n"
@@ -700,16 +702,21 @@ class DaFeiYuBrain:
         role_name, voice_hint, tail_word = _persona_voice_profile()
         # 只用这句话本身去召回：把 sender 也拼进查询会让「这条记忆的 tags 里有这个人」
         # 变成命中条件，于是这个人以后说的每一句（哪怕只有一个「行」）都会把它召回。
-        recalled_memory = memory_store.render_context(text, group_id=group_id)
+        recalled = memory_store.render_context(text, group_id=group_id)
         # 夜间复盘要靠这个看「L1 有没有把无关旧事塞进每轮上下文」
-        metrics.record("l1_recall", group_id, hit=bool(recalled_memory))
+        metrics.record("l1_recall", group_id, hit=bool(recalled))
+        recalled_memory = recalled if tuning.get_int("RECALL_INJECT_ON", 1) else ""
         diary_note = (
             memory_store.render_diary_context(group_id) if settings.MEMORY_DIARY_INJECT else ""
         )
         matched_slang = slang_book.render_matched(group_id, text)
         emotion_desc = emotion_sm.describe(group_id)
         # L3 注入：后台工具干完活留下的几句话（带 TTL，过期自动消失）
-        l3_notes = l3_inject.load_notes(group_id, limit=5) if group_id else []
+        l3_notes = (
+            l3_inject.load_notes(group_id, limit=tuning.get_int("L3_NOTE_MAX_ITEMS", 5))
+            if group_id and tuning.get_int("L3_INJECT_ON", 1)
+            else []
+        )
         turn_context = _build_turn_context(
             status,
             sender,
@@ -747,7 +754,9 @@ class DaFeiYuBrain:
             # 优先使用智谱免费深度思考视觉模型 glm-4.1v-thinking-flash 高精看图，再交给 DeepSeek 塔菲大脑自然回复
             zhipu_vision_desc = _inspect_image_with_zhipu(image_path, text)
             if zhipu_vision_desc:
-                vision_summary = re.sub(r"\s+", " ", zhipu_vision_desc).strip()[:220]
+                vision_summary = re.sub(r"\s+", " ", zhipu_vision_desc).strip()[
+                    : tuning.get_int("VISION_SUMMARY_CHARS", 220)
+                ]
                 user_msg = (
                     f"{owner_desc}"
                     + (f"并说：{text}" if text.strip() else "")
