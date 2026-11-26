@@ -897,8 +897,19 @@ def main() -> int:
 
         try:
             persona_items = plan.get("persona_evolution") or []
+            today_tag = f"[{day.isoformat()}]"
+            used = sum(
+                1 for old in card_mod._load_evolutions_list() if old.startswith(today_tag)
+            )
             changes["persona"] = apply_persona(persona_items, day)
-            _diff(persona_items, changes["persona"], "人格")
+            if used >= MAX_PERSONA_ITEMS:
+                # 额度用完时不要说成「被守门规则拦下」，那会让人以为是规则太严
+                changes["skipped"].append(
+                    f"人格：今天已经长了 {used} 条（上限 {MAX_PERSONA_ITEMS}），"
+                    f"本次 {len(persona_items)} 条建议未采用"
+                )
+            else:
+                _diff(persona_items, changes["persona"], "人格")
 
             l2_items = plan.get("judge_l2") or []
             changes["judge_l2"] = apply_judge("l2", l2_items, day)
