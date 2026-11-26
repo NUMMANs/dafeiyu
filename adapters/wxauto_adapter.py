@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 
 from bot_core import bot_core
@@ -432,6 +433,13 @@ class WxAutoAdapter:
                 wx.StartListening()
 
             notice = consume_restart_notice()
+            # 深夜不播报重启：夜间人格复盘 0:30 会推一次代码，自动更新随即拉取重启，
+            # 凌晨往群里甩一句「鱼重启回来啦」比不说话还假。白天照旧。
+            if notice and notice.get("msg"):
+                _hour = datetime.now().hour
+                if _hour >= 23 or _hour < settings.QUIET_END_HOUR:
+                    logger.info("🌙 深夜启动，跳过重启播报: %s", notice["msg"][:40])
+                    notice = None
             if notice and notice.get("msg"):
                 time.sleep(0.6)
                 target_group = (notice.get("group_id") or "").strip()
