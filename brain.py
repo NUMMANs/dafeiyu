@@ -1571,7 +1571,7 @@ class DaFeiYuBrain:
             msg = (
                 f"饿扁了{tail_word}||谁发个 /投喂 管顿白饭"
                 if kind == "hungry"
-                else f"晚上好{tail_word}||今晚怎么说"
+                else "鱼缸水好像该换了"
             )
             b = split_human_bubbles(msg)
             return BrainReply(text="\n".join(b), bubbles=b, mood="hungry" if kind == "hungry" else "happy", tokens_used=0, used_vision=False)
@@ -1582,9 +1582,16 @@ class DaFeiYuBrain:
                 f"请主动在群里发 1~2 句符合你人设的催饭发言，让群友发 `/投喂` 管顿饭，末尾带 `[MOOD:hungry]`。"
             )
         else:
+            # 2026-11-25 复盘：原来的写法直接教它「问大伙今晚干啥、开不开黑」，
+            # 落地就成了「都在干嘛呢」这种空问句，正是「冷场硬找话」本身。
+            # 现在只许说自己眼下的具体事，不掀新话题、不反问、不报假时间。
             instruction = (
-                f"你是微信群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}），现在晚上 8 点左右，群里有点安静。"
-                f"请主动发 1~2 句符合你人设的冒泡开场白（比如问大伙今晚干啥、开不开黑、是不是都在摸鱼），末尾带 `[MOOD:happy]` 或 `[MOOD:sleepy]`。"
+                f"你是微信群里的「{settings.BOT_NAME}」（当前人设：{role_name}，{voice_hint}），"
+                f"现在是 {datetime.now().strftime('%H:%M')}，群里安静了一阵。"
+                f"请自己嘀咕一句眼下正在干的具体事（在吃什么、在弄什么、卡在哪一步都行），"
+                f"像随手发的一条微信，15~25 字，只发 1 句。"
+                f"严禁问「都在干嘛」「今晚怎么说」「有人吗」这类空问句，也别主动掀话题。"
+                f"末尾带 `[MOOD:happy]` 或 `[MOOD:sleepy]`。"
             )
 
         try:
@@ -1596,7 +1603,8 @@ class DaFeiYuBrain:
             raw = (resp.choices[0].message.content or "").strip()
             tokens_used = getattr(resp.usage, "total_tokens", 0) or 0
             cleaned, mood, sticker_caption = self._parse_mood(raw, "hungry" if kind == "hungry" else "happy")
-            b = split_human_bubbles(cleaned or f"都在干嘛呢{tail_word}")
+            # 兜底也不能是空问句（原来是「都在干嘛呢」）：宁可说一件死板的实事
+            b = split_human_bubbles(cleaned or "盯着鱼缸发了会儿呆")
             return BrainReply(
                 text="\n".join(b),
                 bubbles=b,
@@ -1609,7 +1617,7 @@ class DaFeiYuBrain:
             fallback = (
                 f"饿扁了{tail_word}||谁发个 /投喂 救济一下"
                 if kind == "hungry"
-                else f"晚上好{tail_word}||今晚怎么说"
+                else "鱼缸水好像该换了"
             )
             b = split_human_bubbles(fallback)
             return BrainReply(
