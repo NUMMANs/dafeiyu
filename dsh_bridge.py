@@ -382,6 +382,12 @@ def pop_finished_jobs() -> list[dict[str, Any]]:
             done["delivered"] = True
             _atomic_write_text(done_path, json.dumps(done, ensure_ascii=False, indent=2))
             done["_job_dir"] = str(jdir)
+            if str(done.get("fallback_from") or "").lower() == "codebuddy":
+                logger.warning(
+                    "⚠️ 任务 %s 由 CodeBuddy 回退到 DSH 执行：%s",
+                    done.get("job_id") or jdir.name,
+                    done.get("fallback_reason") or "原因未知",
+                )
             finished.append(done)
 
     finished.sort(key=lambda item: float(item.get("finished_at") or 0.0))
