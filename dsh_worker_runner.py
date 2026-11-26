@@ -582,6 +582,8 @@ def main() -> int:
         print(f"[fallback] CodeBuddy 不可用（{fallback_reason}），改用 DSH 重跑", file=sys.stderr)
 
     dsh_bin = str(job.get("dsh_bin") or "dsh")
+    if not Path(dsh_bin).is_file():
+        dsh_bin = shutil.which(dsh_bin) or dsh_bin
     session_id = str(job.get("session_id") or "").strip()
     if session_id.startswith("dfy-"):
         session_id = ""
