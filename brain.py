@@ -353,6 +353,33 @@ def _persona_voice_profile() -> tuple[str, str, str]:
     return ("塔菲", "塔菲真人群友的短气泡口吻", "喵")
 
 
+# 峰哥人设下要从模型输出里硬抠掉的卖萌残留。卡片里只写了「严禁喵/塔菲」，
+# 但 L3 整层注入后会看到它自己以前说过的「大脑断网了喵」「晚上好喵」，
+# 偶发就会顺着旧口吻补一个尾字——靠提示词压不住，只能在出口兜一层。
+_PERSONA_LEAK_WORDS = ("塔菲", "喵")
+_DUP_PUNCT_RE = re.compile(r"([，。！？、~～]{1})\1+")
+
+
+def _strip_persona_leaks(text: str) -> str:
+    """峰哥人设下把「喵／塔菲」这类串戏词从最终回复里删掉（幂等，不动塔菲人设）。"""
+    if not text or get_active_persona() != "fengge":
+        return text
+    out = text
+    for word in _PERSONA_LEAK_WORDS:
+        if word in out:
+            logger.info("🧹 清理人设串戏词「%s」：%s", word, out[:60])
+            out = out.replace(word, "")
+    if out == text:
+        return text
+    out = _DUP_PUNCT_RE.sub(r"\1", out)
+    # 删词后可能留下「，，」「～。」这种尾巴，按气泡逐条收个尾
+    bubbles = []
+    for part in out.split("||"):
+        part = part.strip().strip("，、~～ ")
+        bubbles.append(part)
+    return "||".join(b for b in bubbles if b)
+
+
 def _build_system_prompt(
     status: PetStatus,
     sender: str,
@@ -479,6 +506,7 @@ def _select_l3_history(recent_history: list[dict], sender: str, text: str) -> li
     budget = settings.L3_INJECT_MAX_TOKENS
     picked: list[dict] = []
     used = 0
+    hit_budget = False
     for item in reversed(items):
         content = _clean_l3_content(item.get("content") or "")
         if not content and item.get("image_path"):
@@ -487,11 +515,12 @@ def _select_l3_history(recent_history: list[dict], sender: str, text: str) -> li
             continue
         cost = estimate_tokens(content) + 6
         if picked and used + cost > budget:
+            hit_budget = True
             break
         picked.append({**item, "content": content})
         used += cost
     picked.reverse()
-    if len(picked) < len(items):
+    if hit_budget:
         logger.warning(
             "L3 整层注入超预算：共 %d 条，只注入最近 %d 条（约 %d tk / 上限 %d tk）；建议调低 L3_CONTEXT_LIMIT_TOKENS 让压缩早点生效",
             len(items),
@@ -500,7 +529,11 @@ def _select_l3_history(recent_history: list[dict], sender: str, text: str) -> li
             budget,
         )
     else:
-        logger.info("L3 整层注入：%d 条，约 %d tk", len(picked), used)
+        skipped = len(items) - len(picked)
+        if skipped:
+            logger.info("L3 整层注入：%d 条，约 %d tk（另有 %d 条空内容跳过）", len(picked), used, skipped)
+        else:
+            logger.info("L3 整层注入：%d 条，约 %d tk", len(picked), used)
     return picked
 
 
@@ -586,7 +619,7 @@ class DaFeiYuBrain:
         cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
         cleaned = re.sub(r"^#{1,4}\s*", "", cleaned, flags=re.M)
         cleaned = cleaned.replace("`", "")
-        return cleaned.strip(), mood, caption
+        return _strip_persona_leaks(cleaned).strip(), mood, caption
 
     def summarize_image(self, image_path: Path) -> str | None:
         """后台静默概括图片核心内容，仅使用智谱免费视觉模型（不消耗 DeepSeek Token）。"""

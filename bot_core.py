@@ -112,6 +112,15 @@ DISPATCH_ACKS = (
 DSH_DONE_NOTE_TTL_SEC = 1800
 
 
+def _pet_tail() -> str:
+    """命令回复里的卖萌尾字：峰哥人设不带，塔菲人设保留。
+
+    这些是代码里写死的模板文案（不是模型输出），以前不管什么人都设都带「喵」，
+    切到峰哥后群友发 `/日记`、`/投喂` 会直接看到「喵」「塔菲」，等于代码在串戏。
+    """
+    return "" if get_active_persona() == "fengge" else "喵"
+
+
 def _execute_confirmed_action(group_id: str, sender: str, item: dict) -> tuple[str, Path | None]:
     action_type = str(item.get("action_type") or "")
     params = item.get("params") if isinstance(item.get("params"), dict) else {}
@@ -741,11 +750,18 @@ class DaFeiYuBotCore:
                 is_feed=True,
             )
             aff = pet_engine.get_user_affinity(group_id, sender)
-            reply_text = (
-                f"🍚 哇！谢谢 {sender} 好哥哥投喂的大碗白饭喵！关注塔菲谢谢喵～\n"
-                f"饱食度 → {st.hunger}/100｜心情 → {st.mood}/100｜"
-                f"对 {sender} 的好感度涨到 {aff['affinity']}（{aff['title']}）啦喵！"
-            )
+            if get_active_persona() == "fengge":
+                reply_text = (
+                    f"🍚 谢了 {sender} 这碗白饭\n"
+                    f"饱食度 → {st.hunger}/100｜心情 → {st.mood}/100｜"
+                    f"对 {sender} 的好感度涨到 {aff['affinity']}（{aff['title']}）"
+                )
+            else:
+                reply_text = (
+                    f"🍚 哇！谢谢 {sender} 好哥哥投喂的大碗白饭喵！关注塔菲谢谢喵～\n"
+                    f"饱食度 → {st.hunger}/100｜心情 → {st.mood}/100｜"
+                    f"对 {sender} 的好感度涨到 {aff['affinity']}（{aff['title']}）啦喵！"
+                )
             sticker = self._maybe_pick_sticker("happy")
             return BotResponse(
                 should_reply=True,
@@ -767,7 +783,7 @@ class DaFeiYuBotCore:
                     exp_delta=6,
                     affinity_delta=4,
                 )
-                reply_text = f"呼噜呼噜～算 {sender} 会摸喵，本大肥鱼今天心情不错就陪你一起躺平摸鱼吧！心情 → {st.mood}/100"
+                reply_text = f"呼噜呼噜～算 {sender} 会摸，本大肥鱼今天心情不错就陪你一起躺平摸鱼吧！心情 → {st.mood}/100"
                 mood = "sleepy"
             else:
                 st = pet_engine.record_interaction(
@@ -778,7 +794,7 @@ class DaFeiYuBotCore:
                     exp_delta=4,
                     affinity_delta=1,
                 )
-                reply_text = f"杂鱼 {sender} 别光动手动脚不给饭吃喵！快发 `/投喂` 进贡白饭！"
+                reply_text = f"杂鱼 {sender} 别光动手动脚不给饭吃{_pet_tail()}！快发 `/投喂` 进贡白饭！"
                 mood = "hungry"
             sticker = self._maybe_pick_sticker(mood)
             return BotResponse(
@@ -821,7 +837,7 @@ class DaFeiYuBotCore:
                 f"• 发图自动高清识图吐槽，发完图再叫大肥鱼必识别\n"
                 f"• `/投喂` / `/摸鱼` / `/状态` / `/鱼塘榜`：养鱼互动\n"
                 f"• `/记住 内容`：写进 L1 识海长期记忆\n"
-                f"• `/记忆` / `/日记` / `/写日记`：查看四层记忆统计与塔菲日记\n"
+                f"• `/记忆` / `/日记` / `/写日记`：查看四层记忆统计与日记\n"
                 f"• `/统计`：查看 L2/L2.5 子代理调用次数与回复率（每天 0:00 自动出 txt）\n"
                 f"• `/定时` / `/取消定时 ID`：查看或取消定时任务\n"
                 f"• `/搜图 关键词`（或图片链接）：联网搜图并直接发群里\n"
@@ -845,7 +861,7 @@ class DaFeiYuBotCore:
                 group_id=group_id,
                 raw=cmd,
             )
-            reply_text = f"记进小本本里了喵！{msg}" if ok else f"记不了喵：{msg}"
+            reply_text = f"记进小本本里了{_pet_tail()}！{msg}" if ok else f"记不了{_pet_tail()}：{msg}"
             return BotResponse(should_reply=True, text=reply_text, mood="love" if ok else "angry", status=st)
 
         if cmd in ("/记忆", "查记忆"):
@@ -856,7 +872,7 @@ class DaFeiYuBotCore:
                 f"🧠 【大肥鱼四层记忆状态】\n"
                 f"L1 识海节点：{ms['total_nodes']} 条（core {lv['core']} / important {lv['important']} / normal {lv['normal']}）\n"
                 f"标签联想边：{ms['total_edges']} 条｜今日主动记忆：{ms['today_self_writes']}/{ms['daily_limit']}\n"
-                f"L2 塔菲日记：{ms['group_diaries']} 篇（含早期无群标记的）"
+                f"L2 日记：{ms['group_diaries']} 篇（含早期无群标记的）"
             )
             return BotResponse(should_reply=True, text=reply_text, mood="happy", status=st)
 
@@ -864,7 +880,7 @@ class DaFeiYuBotCore:
             st = pet_engine.get_status()
             diaries = memory_store.read_recent_diaries(limit=3, group_id=group_id)
             if not diaries:
-                reply_text = "📔 还没写过日记呢喵，每晚 23:45 之后会自动写一篇今天的群聊日记！"
+                reply_text = f"📔 还没写过日记呢{_pet_tail()}，每晚 23:45 之后会自动写一篇今天的群聊日记！"
             else:
                 lines = ["📔 【大肥鱼最近日记】"]
                 for d in diaries:
@@ -876,7 +892,7 @@ class DaFeiYuBotCore:
             st = pet_engine.get_status()
             recent = pet_engine.get_recent_history(group_id, limit=40)
             if not recent:
-                return BotResponse(should_reply=True, text="📔 这个群还没来得及聊啥，没素材写日记喵", mood="sleepy", status=st)
+                return BotResponse(should_reply=True, text=f"📔 这个群还没来得及聊啥，没素材写日记{_pet_tail()}", mood="sleepy", status=st)
             ok = brain.write_daily_diary(recent, st, group_id=group_id)
             if ok:
                 latest = memory_store.read_recent_diaries(limit=1, group_id=group_id)
@@ -912,13 +928,13 @@ class DaFeiYuBotCore:
             if len(parts) < 2:
                 return BotResponse(should_reply=True, text="格式：/学黑话 词 意思（比如：/学黑话 致竞 群友常去的老地方桌游店）", mood="smug", status=st)
             ok, msg = slang_book.learn(group_id, parts[0], parts[1])
-            return BotResponse(should_reply=True, text=f"懂了喵！{msg}" if ok else msg, mood="happy", status=st)
+            return BotResponse(should_reply=True, text=f"懂了{_pet_tail()}！{msg}" if ok else msg, mood="happy", status=st)
 
         if cmd in ("/黑话", "查黑话"):
             st = pet_engine.get_status()
             terms = slang_book.list_terms(group_id)
             if not terms:
-                return BotResponse(should_reply=True, text="📖 还没学过本群黑话呢喵，发 `/学黑话 词 意思` 教我！", mood="happy", status=st)
+                return BotResponse(should_reply=True, text=f"📖 还没学过本群黑话呢{_pet_tail()}，发 `/学黑话 词 意思` 教我！", mood="happy", status=st)
             lines = ["📖 【本群黑话小本本】"] + [f"• {k}：{v}" for k, v in list(terms.items())[:12]]
             return BotResponse(should_reply=True, text="\n".join(lines), mood="smug", status=st)
 
@@ -963,7 +979,7 @@ class DaFeiYuBotCore:
             if not tasks:
                 return BotResponse(
                     should_reply=True,
-                    text="⏰ 当前群里还没有定时任务喵！直接对我说「10分钟后提醒我xxx」或「每天8点30查一下天气」就行",
+                    text=f"⏰ 当前群里还没有定时任务{_pet_tail()}！直接对我说「10分钟后提醒我xxx」或「每天8点30查一下天气」就行",
                     mood="happy",
                     status=st,
                 )
@@ -979,7 +995,7 @@ class DaFeiYuBotCore:
             if not tid:
                 return BotResponse(should_reply=True, text="格式：/取消定时 任务ID（先发 /定时 看ID）", mood="smug", status=st)
             _, msg = scheduler.delete_task(tid)
-            return BotResponse(should_reply=True, text=f"{msg}喵", mood="happy", status=st)
+            return BotResponse(should_reply=True, text=f"{msg}{_pet_tail()}", mood="happy", status=st)
 
         if cmd in ("/更新", "/拉代码", "/gitpull"):
             st = pet_engine.get_status()
@@ -1031,7 +1047,7 @@ class DaFeiYuBotCore:
                 sid = "last"
                 task_text = body[1:].strip()
                 if not task_text:
-                    return BotResponse(should_reply=True, text="请在 `/dsh 续 ` 后面写明要追加的任务要求喵~", mood="smug", status=st)
+                    return BotResponse(should_reply=True, text=f"请在 `/dsh 续 ` 后面写明要追加的任务要求{_pet_tail()}~", mood="smug", status=st)
             dsh_params = {"task": task_text, "session_id": sid}
             is_danger, reasons = assess_danger("delegate_to_dsh", dsh_params, user_text=task_text)
             if is_danger:
@@ -2037,7 +2053,7 @@ class DaFeiYuBotCore:
             )
 
         msg = f"⏰ 定时提醒（{creator} 设的）：{content}"
-        sticker = self._maybe_pick_sticker("happy", caption="到点啦喵")
+        sticker = self._maybe_pick_sticker("happy", caption="到点啦")
         pet_engine.append_history(
             group_id=group_id,
             sender=settings.BOT_NAME,
