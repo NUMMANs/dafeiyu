@@ -89,6 +89,21 @@ class Settings:
     MEMORY_DIARY_INJECT: bool = _parse_bool(os.getenv("MEMORY_DIARY_INJECT"), True)
     # 四层记忆：夜间是否用一次轻量调用从当天群里提炼 L1 事实（否则只靠模型自己想起来记）
     MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
+    # 夜间 L1/L2 的内容由谁生成：
+    #   bot      = 机器人自己调 DeepSeek 提炼/写日记（原来的做法）
+    #   external = 交给外部（WorkBuddy 定时任务）写，机器人只做巩固+备份；
+    #              凌晨 0~4 点若发现这一天什么都没写，机器人再用全天素材兜底补一次
+    MEMORY_NIGHTLY_WRITER: str = (os.getenv("MEMORY_NIGHTLY_WRITER", "bot").strip().lower() or "bot")
+    # 夜间提炼：一天最多落几条 L1（写库还要过 memory.remember 的每日 8 条上限）
+    NIGHTLY_FACT_MAX: int = max(1, int(os.getenv("NIGHTLY_FACT_MAX", "6")))
+    # 夜间提炼：每段多少条消息（全天切成多段逐段提炼，避免只看到睡前 40 条）
+    NIGHTLY_EXTRACT_CHUNK: int = max(20, int(os.getenv("NIGHTLY_EXTRACT_CHUNK", "60")))
+    # 夜间提炼：最多切几段（极端长的一天按均匀抽样降段，防止一晚上调几十遍模型）
+    NIGHTLY_EXTRACT_MAX_CHUNKS: int = max(1, int(os.getenv("NIGHTLY_EXTRACT_MAX_CHUNKS", "12")))
+    # 夜间日记：全天消息按时间均匀抽样到这个条数再喂给模型（保证上午下午晚上都有代表）
+    NIGHTLY_DIARY_LINES: int = max(20, int(os.getenv("NIGHTLY_DIARY_LINES", "90")))
+    # 夜间素材：单群单日最多取多少条消息进视野（防一次性拉爆内存/SQL）
+    NIGHTLY_MATERIAL_MAX: int = max(100, int(os.getenv("NIGHTLY_MATERIAL_MAX", "1500")))
 
     # L2 追认窗口：我在群里说完话后，多少秒内的群友发言才算「可能是在接我的话」。
     # 超过这个时间窗口，L2 让位给 L2.5 冷场吐槽雷达（否则 L2 会长期霸占判定机会）

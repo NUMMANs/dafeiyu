@@ -442,6 +442,16 @@ class FourLayerMemory:
     # ========================
     # L2 日记与周结
     # ========================
+    def count_writes_between(self, start_ts: float, end_ts: float) -> int:
+        """统计某时间段内新写入的 L1 节点数（夜间兜底用它判断「这一天有没有人写过」）。"""
+        cnt = 0
+        with self._lock:
+            for n in self._graph["nodes"]:
+                ts = float(n.get("created", 0) or 0)
+                if start_ts <= ts < end_ts:
+                    cnt += 1
+        return cnt
+
     def write_diary(
         self,
         mood: str,
@@ -449,6 +459,7 @@ class FourLayerMemory:
         group_id: str = "",
         max_per_day: int = 3,
         dedupe_ratio: float = 0.7,
+        day: str = "",
     ) -> bool:
         """
         写一条 L2 日记（≤300 字）。
@@ -457,11 +468,16 @@ class FourLayerMemory:
         1. 每群每天最多 max_per_day 条；
         2. 和今天已有日记相似度 ≥ dedupe_ratio 就丢弃（实测两次触发会写出
            「那坨草稿糊屏幕上」和「最烦的是那破页面全是JS拼的」这种近重复）。
+
+        day 用于补跑：凌晨 0~4 点写的是「昨天」的日记，条目日期得落回逻辑日，
+        否则同一天会被写成两条（一条 23:45、一条 00:0x）。
         """
         clean = (content or "").strip()[:300]
         if not clean:
             return False
-        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        today = day or now.strftime("%Y-%m-%d")
+        stamp = f"{today} {now.strftime('%H:%M')}"
         with self._lock:
             same_day = [
                 d
@@ -476,7 +492,7 @@ class FourLayerMemory:
                     logger.info("📔 L2 日记跳过：与今天已有日记高度重复 -> %s", clean[:40])
                     return False
             entry = {
-                "时间": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "时间": stamp,
                 "心情": mood or "开心",
                 "内容": clean,
                 "群": group_id,

@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -376,6 +377,57 @@ class PetEngine:
                 (group_id, limit),
             ).fetchall()
             return [dict(r) for r in reversed(rows)]
+
+    def get_history_between(
+        self,
+        group_id: str,
+        start_ts: float,
+        end_ts: float,
+        limit: int = 3000,
+    ) -> list[dict[str, Any]]:
+        """取某时间段内的完整群聊记录（按时间正序），供夜间 L1/L2 用全天素材。
+
+        以前夜间养护只取「最近 40 条」，实测 11-25 当天 266 条里只看到 15%，
+        上午和下午的内容完全没进提炼视野。这里按逻辑日整段取出来。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT sender, role, content, image_path, sticker_url, created_ts
+                FROM chat_history
+                WHERE group_id = ? AND created_ts >= ? AND created_ts < ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (group_id, start_ts, end_ts, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_groups_with_history(self) -> list[dict[str, Any]]:
+        """列出库里有聊天记录的群（群号 / 条数 / 最近一条时间），供夜间外部写入遍历。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT group_id, COUNT(*) AS cnt, MAX(created_ts) AS last_ts
+                FROM chat_history
+                WHERE group_id != ''
+                GROUP BY group_id
+                ORDER BY cnt DESC
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            last_ts = float(r["last_ts"] or 0)
+            out.append(
+                {
+                    "group_id": r["group_id"],
+                    "cnt": int(r["cnt"]),
+                    "last": datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M")
+                    if last_ts
+                    else "",
+                }
+            )
+        return out
 
     def count_history_between(self, start_ts: float, end_ts: float) -> int:
         """统计某时间段内的群聊消息条数（含机器人自己说的），供每日统计报告引用。"""

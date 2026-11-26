@@ -6,6 +6,7 @@ import re
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from openai import OpenAI
@@ -1630,43 +1631,45 @@ class DaFeiYuBrain:
             logger.warning("L3 会话压缩摘要失败: %s", exc)
             return ""
 
-    def extract_daily_facts(self, recent_history: list[dict], group_id: str = "", max_items: int = 3) -> list[dict]:
-        """
-        夜间批量提炼 L1：从当天聊天里挑出最多 3 条「以后还用得上」的事实。
+    def _material_lines(self, history: list[dict], max_chars: int = 120) -> list[str]:
+        """把一天的消息摊成「[说话人]: 内容」的行，供夜间提炼/写日记用。"""
+        lines: list[str] = []
+        for m in history or []:
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            content = " ".join(content.split())
+            lines.append(f"[{m.get('sender') or '群友'}]: {content[:max_chars]}")
+        return lines
 
-        为什么需要这一步：这套四层框架原本假设模型在对话里自己调 remember_fact，
-        但群里每轮都是独立的一问一答，实测 3 天 980 条消息只写进去 3 条节点（0.3%），
-        识海等于空的。夜间用一次轻量调用把当天值得留的东西补录，是最省 token 的补法。
-        写入仍走 memory_store.remember（去重 + 每日 8 条上限 + 隐私过滤）。
-        """
-        if not settings.has_valid_api_key or not recent_history:
-            return []
-        lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-40:] if m.get("content")]
-        if not lines:
-            return []
+    def _extract_facts_chunk(self, lines: list[str], idx: int, total: int) -> list[dict]:
+        """对一段聊天提炼最多 2 条事实，返回 [{text, tags}]。"""
         prompt = (
-            "下面是群聊片段。请挑出最多 3 条「以后还会用到」的长期记忆，只挑真正有用的：\n"
-            "- 群友的固定特征/身份/习惯（谁在玩什么游戏、谁做什么工作、谁有什么梗）\n"
+            "下面是群聊片段。请挑出最多 2 条「以后还会用到」的长期记忆，只挑真正有用的：\n"
+            "- 群友的固定特征/身份/职业/习惯（谁在玩什么游戏、谁做什么工作、谁有什么梗）\n"
             "- 群里新出现的梗、外号、黑话\n"
             "- 明确的约定或要求（时间、规则、让机器人怎么做）\n"
-            "不要记：一次性的闲聊和情绪、天气、你（机器人）自己说过的话、密码证件银行卡。\n"
+            "- 群友自己的计划、进展、一直在做的项目\n"
+            "不要记：一次性的闲聊和情绪、天气、新闻、密码证件银行卡，"
+            "也不要记大肥鱼（机器人）自己是什么、能做什么、说过什么、有什么脾气——"
+            "它是谁跟群友无关。\n"
             "同一个人/同一件事只写一条，把零散信息并进那一句，别重复。\n"
             "每条一行，格式：内容（≤40字）|标签1,标签2\n"
-            "如果一条都不值得记，就只输出：无\n\n" + "\n".join(lines)
+            "如果这段里一条都不值得记，就只输出：无\n\n" + "\n".join(lines)
         )
         try:
             resp = self._create(
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=400,
+                max_tokens=200,
             )
             raw = strip_think(resp.choices[0].message.content or "").strip()
         except Exception as exc:
-            logger.warning("夜间 L1 提炼失败: %s", exc)
+            logger.warning("夜间 L1 提炼失败（第 %d/%d 段）: %s", idx, total, exc)
             return []
         if not raw or raw.startswith("无"):
             return []
-        facts: list[dict] = []
+        out: list[dict] = []
         for line in raw.splitlines():
             line = line.strip().lstrip("-•* \t")
             if not line or "|" not in line:
@@ -1676,25 +1679,86 @@ class DaFeiYuBrain:
             if len(text) < 4:
                 continue
             tags = [t.strip()[:16] for t in re.split(r"[,，、\s]+", tags_raw) if t.strip()][:4]
-            facts.append({"text": text, "tags": tags})
-            if len(facts) >= max_items:
-                break
-        return facts
+            out.append({"text": text, "tags": tags})
+        return out
 
-    def write_daily_diary(self, recent_history: list[dict], status: PetStatus, group_id: str = "") -> bool:
+    def extract_daily_facts(
+        self,
+        recent_history: list[dict],
+        group_id: str = "",
+        max_items: int = 0,
+    ) -> list[dict]:
+        """
+        夜间批量提炼 L1：从「当天全部聊天」里挑出最多 N 条「以后还用得上」的事实。
+
+        为什么需要这一步：这套四层框架原本假设模型在对话里自己调 remember_fact，
+        但群里每轮都是独立的一问一答，实测 3 天 980 条消息只写进去 3 条节点（0.3%），
+        识海等于空的。夜间用一次轻量调用把当天值得留的东西补录，是最省 token 的补法。
+
+        以前只看「最近 40 条」——11-25 当天 266 条，覆盖 15%，上午下午全丢。
+        现在按 60 条一段切分逐段提炼，再合并去重，全天内容都能进视野。
+        写入仍走 memory_store.remember（去重 + 每日 8 条上限 + 隐私过滤）。
+        """
+        if not settings.has_valid_api_key or not recent_history:
+            return []
+        max_items = max_items or settings.NIGHTLY_FACT_MAX
+        lines = self._material_lines(recent_history)
+        if not lines:
+            return []
+        chunk_size = max(20, settings.NIGHTLY_EXTRACT_CHUNK)
+        chunks = [lines[i : i + chunk_size] for i in range(0, len(lines), chunk_size)]
+        if len(chunks) > settings.NIGHTLY_EXTRACT_MAX_CHUNKS:
+            # 极端长的一天：均匀抽样，别一次调几十遍
+            keep = settings.NIGHTLY_EXTRACT_MAX_CHUNKS
+            step = len(chunks) / keep
+            chunks = [chunks[int(i * step)] for i in range(keep)]
+        candidates: list[dict] = []
+        for idx, chunk in enumerate(chunks, 1):
+            for fact in self._extract_facts_chunk(chunk, idx, len(chunks)):
+                dup = any(
+                    SequenceMatcher(None, c["text"], fact["text"]).ratio() >= 0.7 for c in candidates
+                )
+                if not dup:
+                    candidates.append(fact)
+        if len(candidates) > max_items:
+            logger.info(
+                "夜间 L1 提炼：%d 段共 %d 条候选，按上限保留前 %d 条",
+                len(chunks),
+                len(candidates),
+                max_items,
+            )
+            candidates = candidates[:max_items]
+        logger.info("夜间 L1 提炼：素材 %d 条 / %d 段，候选 %d 条", len(lines), len(chunks), len(candidates))
+        return candidates
+
+    def write_daily_diary(
+        self,
+        recent_history: list[dict],
+        status: PetStatus,
+        group_id: str = "",
+        day: str = "",
+    ) -> bool:
         """L2 日记：每晚以当前人设口吻写一条今天群里的细节与心情（≤200字）"""
         if not settings.has_valid_api_key or not recent_history:
             return False
-        lines = [f"[{m['sender']}]: {m['content']}" for m in recent_history[-40:] if m.get("content")]
-        if not lines:
+        all_lines = self._material_lines(recent_history)
+        if not all_lines:
             return False
+        # 日记要覆盖「一整天」，不是只有睡前那 40 条：长的话按时间均匀抽样，
+        # 保证上午、下午、晚上各段都有代表，而不是被晚上刷屏挤掉。
+        cap = settings.NIGHTLY_DIARY_LINES
+        if len(all_lines) > cap:
+            step = len(all_lines) / cap
+            lines = [all_lines[int(i * step)] for i in range(cap)]
+        else:
+            lines = all_lines
         role_name, voice_hint, _ = _persona_voice_profile()
         # 把今天已经写过的日记塞进提示词，否则「/写日记」多按两次就会得到两篇几乎一样的日记
-        today = datetime.now().strftime("%Y-%m-%d")
+        target_day = day or datetime.now().strftime("%Y-%m-%d")
         wrote_today = [
             d.get("内容", "")
-            for d in memory_store.read_recent_diaries(limit=3, group_id=group_id)
-            if d.get("时间", "")[:10] == today
+            for d in memory_store.read_recent_diaries(limit=5, group_id=group_id)
+            if d.get("时间", "")[:10] == target_day
         ]
         avoid = (
             "\n今天已经写过这些，别再重复同样的角度和句子：\n" + "\n".join(f"- {t[:80]}" for t in wrote_today)
@@ -1726,7 +1790,9 @@ class DaFeiYuBrain:
                 mood, body = raw.split("|", 1)
             else:
                 mood, body = "摸鱼", raw
-            return memory_store.write_diary(mood.strip()[:8], body.strip(), group_id=group_id)
+            return memory_store.write_diary(
+                mood.strip()[:8], body.strip(), group_id=group_id, day=target_day
+            )
         except Exception as exc:
             logger.warning("生成 L2 每日日记失败: %s", exc)
             return False
