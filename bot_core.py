@@ -33,6 +33,7 @@ from safety_guard import (
     stage_pending_action,
 )
 from scheduler import scheduler
+import tuning
 from self_ops import git_pull_and_check, request_restart, self_edit_code
 from sticker_manager import sticker_manager
 
@@ -326,7 +327,8 @@ class DaFeiYuBotCore:
         # 冷场后重新起的话题（本该走 L2.5 吐槽雷达）永远轮不到 —— 2026-11-25 实测：
         # 20:52 大肥鱼发言，21:16:59 群友隔 23 分钟开话题，L2 抢走判定返回 NO，L2.5 一次没跑。
         asst_ts = float(recent[last_asst_idx].get("created_ts") or 0.0)
-        if asst_ts and (time.time() - asst_ts) > settings.FOLLOWUP_WINDOW_SEC:
+        followup_window = tuning.get_int("FOLLOWUP_WINDOW_SEC", settings.FOLLOWUP_WINDOW_SEC)
+        if asst_ts and (time.time() - asst_ts) > followup_window:
             return False, False
 
         return True, False
@@ -413,7 +415,7 @@ class DaFeiYuBotCore:
             return False, ""
 
         gap = now - prev_activity_ts
-        if gap < settings.TOPIC_GAP_SEC:
+        if gap < tuning.get_int("TOPIC_GAP_SEC", settings.TOPIC_GAP_SEC):
             return False, ""
 
         gap_desc = f"约 {int(gap // 3600)} 小时" if gap >= 3600 else f"约 {int(gap // 60)} 分钟"
@@ -624,7 +626,7 @@ class DaFeiYuBotCore:
         # 只在冷场间隔真的达标、且不在静默期时才多花这一次判定。
         gap = float(item.get("gap_sec") or 0.0)
         if (
-            gap >= settings.TOPIC_GAP_SEC
+            gap >= tuning.get_int("TOPIC_GAP_SEC", settings.TOPIC_GAP_SEC)
             and settings.ENABLE_TOPIC_ROAST
             and not self.is_quiet_hours()
         ):

@@ -36,6 +36,7 @@ from roles.build_card import evolve_persona, load_card
 from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
+import tuning
 from web_search import web_search
 
 logger = logging.getLogger("dafeiyu.brain")
@@ -1327,6 +1328,16 @@ class DaFeiYuBrain:
         if len(probe) > 300:
             probe = probe[:300] + "…"
 
+        # 夜间复盘沉淀下来的临时偏好（roles/judges/l2.md），没有就是空串。
+        # 只能改「判多严」，不能改输出格式 —— 否则 YES/NO 解析会崩。
+        extra = tuning.judge_extra("l2")
+        extra_block = (
+            "\n另外，昨天群里复盘出这几条，判的时候一并考虑（和上面冲突时以这里为准）：\n"
+            f"{extra}\n"
+            if extra
+            else ""
+        )
+
         prompt = (
             f"你在判断一条群聊消息是不是冲着机器人「{settings.BOT_NAME}」说的。"
             f"下文里的「我」都指这个机器人。\n\n"
@@ -1337,7 +1348,8 @@ class DaFeiYuBrain:
             f"1) 在回应、追问或点评我刚才说的内容；\n"
             f"2) 上下文中只有我刚说过话，这句明显是接着我的话往下说。\n\n"
             f"其余一律输出 NO，例如：跟其他群友互相聊天、明显在 @ 别人、开新话题、"
-            f"自言自语、单纯发感叹或表情、在议论第三个人。\n\n"
+            f"自言自语、单纯发感叹或表情、在议论第三个人。\n"
+            f"{extra_block}\n"
             f"只输出 YES 或 NO，不要解释。"
         )
         try:
@@ -1494,6 +1506,16 @@ class DaFeiYuBrain:
                 f"现在 [{sender}] 重新开口说：{probe}\n"
             )
 
+        # 夜间复盘沉淀下来的临时偏好（roles/judges/l2_5.md）。只调整「什么算有槽点」，
+        # 输出格式必须保持不变，否则 SCORE|槽点 的解析会崩。
+        extra = tuning.judge_extra("l2_5")
+        extra_block = (
+            "\n昨天群里复盘出这几条，评分时一并考虑（和上面冲突时以这里为准）：\n"
+            f"{extra}\n\n"
+            if extra
+            else "\n"
+        )
+
         prompt = (
             "你是群聊里的「吐槽雷达」，只负责判断一段群聊值不值得接梗吐槽，不负责真的吐槽。\n\n"
             + opening
@@ -1511,7 +1533,8 @@ class DaFeiYuBrain:
             "另外，出现以下任一情况直接给 0 分：\n"
             "在问正经求助问题、在讨论别人的隐私或外貌、内容涉及政治/疾病/丧事、纯粹约时间见面的私事。\n"
             "如果这几句其实是几个人在聊各自不相干的事、或者已经变成一对一私聊，也给 0 分。\n\n"
-            "输出格式（只输出一行，不要解释）：\n"
+            + extra_block
+            + "输出格式（只输出一行，不要解释）：\n"
             "分数|可以吐槽的那个点（15 字以内，没槽点就写「无」）\n"
             "例如：9|他居然把鱼缸当显示器"
         )
@@ -1527,7 +1550,9 @@ class DaFeiYuBrain:
             m_score = re.search(r"\d+(?:\.\d+)?", score_part)
             score = float(m_score.group()) if m_score else 0.0
             angle = angle.strip().strip("\"'「」 ")
-            threshold = settings.TOPIC_ROAST_MIN_SCORE * 10
+            threshold = tuning.get_float(
+                "TOPIC_ROAST_MIN_SCORE", settings.TOPIC_ROAST_MIN_SCORE
+            ) * 10
             logger.info(
                 "🔥 吐槽判定 [%s] %.1f/10 (阈值 %.0f) 槽点=%s | %s",
                 sender, score, threshold, angle[:20] or "无", probe[:30],
