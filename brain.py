@@ -312,7 +312,11 @@ def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | Non
                         ],
                     }
                 ],
-                "max_tokens": 1024,
+                # 这个模型是「先思考再给正文」的，思考草稿和正文共用 max_tokens。
+                # 原来给 1024，2026-11-26 实测 16 张图里 7 张（44%）思考没写完就被截断，
+                # 剥掉 think 块后正文为空 → 白白回退 DeepSeek 原生视觉、历史也拿不到摘要。
+                # 给到 2600，让它既有空间思考完，也留得下正文。
+                "max_tokens": 2600,
             }
         ).encode("utf-8")
         req = urllib.request.Request(
@@ -632,13 +636,39 @@ class DaFeiYuBrain:
         return _strip_persona_leaks(cleaned).strip(), mood, caption
 
     def summarize_image(self, image_path: Path) -> str | None:
-        """后台静默概括图片核心内容，仅使用智谱免费视觉模型（不消耗 DeepSeek Token）。"""
-        if not image_path.is_file() or not settings.ZHIPU_API_KEY:
+        """后台静默概括图片核心内容：先走智谱免费视觉，拿不到正文再回退一次原生视觉。
+
+        为什么要有回退：这段摘要会写回 SQLite 历史，是后面所有轮次「她记不记得这张图」
+        的唯一来源。以前智谱一失败这里直接 return None，历史里就永远只剩
+        「[发了一张图片]」，下次有人问起这张图她只能装失忆。
+        回退只花一次便宜的 200tk 描述，比丢一张图的记忆划算。
+        """
+        if not image_path.is_file():
             return None
-        desc = _inspect_image_with_zhipu(
-            image_path,
-            "请用一两句简洁客观的中文概括图片核心内容与关键文字/数据",
-        )
+        ask = "请用一两句简洁客观的中文概括图片核心内容与关键文字/数据"
+        desc = _inspect_image_with_zhipu(image_path, ask) if settings.ZHIPU_API_KEY else None
+        if not desc and settings.has_valid_api_key:
+            try:
+                data_url = _encode_image_data_url(image_path)
+                resp = self._get_vision_client().chat.completions.create(
+                    model=settings.DEEPSEEK_VISION_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": ask + "（只输出描述，不要寒暄）"},
+                                {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                            ],
+                        }
+                    ],
+                    max_tokens=260,
+                )
+                body = " ".join(strip_think(resp.choices[0].message.content or "").split()).strip()
+                if body:
+                    desc = body
+                    logger.info("👁️ 智谱没给正文，改用 DeepSeek 原生视觉补图片摘要 (%d字)", len(body))
+            except Exception as exc:
+                logger.warning("原生视觉补图片摘要也失败: %s", exc)
         if not desc:
             return None
         return re.sub(r"\s+", " ", desc).strip()[:180]

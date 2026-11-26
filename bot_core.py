@@ -1811,6 +1811,14 @@ class DaFeiYuBotCore:
             return BotResponse(should_reply=False)
 
         # 达到氛围阈值，消耗电量并让大脑判断是否神补刀
+        # 留一行日志：2026-11-26 全天 0 次自发冒泡，但离线回放热力有 180 次过 65，
+        # 分不清是「没到阈值」还是「到了被大脑 PASS 掉」，下一晚要靠这行证据定位。
+        logger.info(
+            "🌊 氛围热力 %.0f 达标（阈值 %.0f），让大脑判断要不要补刀: %s",
+            energy,
+            tuning.get_float("PROACTIVE_ENERGY_MIN", 65.0),
+            text[:30],
+        )
         heartflow.drain(group_id, amount=60.0)
         self._last_proactive_ts[group_id] = now
 
@@ -1818,6 +1826,7 @@ class DaFeiYuBotCore:
         recent = pet_engine.get_recent_history(group_id, limit=8)
         chime = brain.judge_and_chime_in(recent, status)
         if chime is None:
+            logger.info("🌊 热力达标但大脑判插不上嘴（PASS），本次热力已耗掉 60")
             return BotResponse(should_reply=False)
 
         new_status = pet_engine.record_interaction(
