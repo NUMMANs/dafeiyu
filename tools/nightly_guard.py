@@ -459,9 +459,21 @@ def health_payload(before_pid: int = 0) -> dict[str, Any]:
         except (ValueError, IndexError):
             pass
     last_good = str(state.get("last_good_commit") or "")
+    # HEAD 领先健康版本不一定有问题：只改 tools/、docs/、.gitignore 这类
+    # 机器人进程不加载的文件时，本就不该重启。只有改到运行模块才必须重启。
+    needs_restart = False
+    changed_since_good: list[str] = []
+    if last_good and not last_good.startswith(head[:7]):
+        diff = _git("diff", "--name-only", f"{last_good[:7]}..{head[:7]}", check=False)
+        changed_since_good = [x for x in diff.splitlines() if x.strip()]
+        needs_restart = any(
+            (p.endswith(".py") and not p.startswith(("tools/", "docs/")))
+            or p in (".env", "config.py")
+            for p in changed_since_good
+        )
     healthy = (
         int(state.get("crash_streak") or 0) == 0
-        and last_good.startswith(head[:7])
+        and (last_good.startswith(head[:7]) or not needs_restart)
         and child_now not in (0, before_pid)
     )
     return {
@@ -471,7 +483,9 @@ def health_payload(before_pid: int = 0) -> dict[str, Any]:
         "crash_streak": state.get("crash_streak"),
         "old_child_pid": before_pid,
         "new_child_pid": child_now,
-        "hint": "ok=false 时先别继续改，跑 rollback 或人工检查日志",
+        "pending_restart": needs_restart,
+        "changed_since_good": changed_since_good,
+        "hint": "ok=false 时先别继续改：改了运行模块却没重启就补 --restart，或跑 rollback / 人工查日志",
     }
 
 
