@@ -795,7 +795,20 @@ def git_commit(paths: list[str], day: date) -> str:
     proc = subprocess.run(
         ["git", "commit", "-m", msg], cwd=str(BASE_DIR), capture_output=True, text=True
     )
-    return (proc.stdout or proc.stderr or "").strip().splitlines()[0] if proc.returncode == 0 else f"commit failed: {proc.stderr[:200]}"
+    if proc.returncode != 0:
+        return f"commit failed: {proc.stderr[:200]}"
+
+    # 必须推回远端：机器人的自动更新每 60 秒跑一次 git pull --ff-only，
+    # 本地领先远端时它会一直失败（还会把工作区 stash 掉），日志里刷满警告。
+    push = subprocess.run(
+        ["git", "push", "--quiet", "origin", "main"],
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    head = (proc.stdout or "").strip().splitlines()[0]
+    return head if push.returncode == 0 else f"{head}（推送失败，待下次补推：{push.stderr[:120]}）"
 
 
 # ----------------------------------------------------------------------
