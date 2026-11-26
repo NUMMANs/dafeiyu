@@ -428,7 +428,7 @@ def _build_turn_context(
         # 明确告诉她这是自己知道的、不是别人刚说的，避免她当成新消息接话。
         bullets = "\n".join(f"- {n}" for n in l3_notes)
         extra_blocks.append(
-            "【你自己知道的事】这些是你派活出去干活时记下的，不是群里刚有人说的：\n"
+            "【你自己知道的事】这些是你自己私下看过、查过的，不是群里刚有人说的：\n"
             f"{bullets}\n"
             "（知道就行。没人问到就别主动提，别人正好聊到就直接用，别念成清单。）"
         )
@@ -1393,23 +1393,35 @@ class DaFeiYuBrain:
         sender: str,
         text: str,
         recent_history: list[dict] | None = None,
+        link_urls: list[str] | None = None,
     ) -> dict:
         """
-        工具路由判定（轻量，只输出一行 JSON）：这句话要不要让执行助手动手干活。
+        工具路由判定（轻量，只输出一行 JSON）：这句话要不要让后台助手动手。
 
-        它只做「派不派活」这一个判断，不聊天、不调用工具、不带人设。
-        判错代价都可控：
-        - 该派没派 → 退回普通聊天，跟以前一样；
-        - 不该派却派了 → 后台跑一个空任务，群里只多一句占位，不会胡说八道。
+        两种模式：
+        - 不传 link_urls：只判「派不派活」，判错代价可控（漏派退回聊天，误派多一句占位）；
+        - 传 link_urls：这条消息带着链接，要区分「分享链接，后台静默读懂」(kind=link)
+          与「基于链接要求产出实物」(kind=work)。链接消息在入口处就判，不等大肥鱼
+          决定回不回话——否则她不回话时链接永远读不到。
 
-        写法上刻意压到极简（不带人设、不带工具 schema、不带长上下文），
-        一次调用约 300 tk 输入、30 tk 输出，属于「每条要回复的消息都跑一次也不心疼」的量级。
-        返回 {"need": bool, "task": str, "reason": str}。
+        写法刻意压到极简（不带人设、不带工具 schema、不带长上下文），一次约 300~500 tk
+        输入、40 tk 输出。返回 {"need", "task", "reason", "kind", "urls"}。
         """
-        empty = {"need": False, "task": "", "reason": ""}
+        is_link_mode = bool(link_urls)
+        urls = list(link_urls or [])
+
+        def pack(need: bool, task: str, reason: str, kind: str = "") -> dict:
+            return {
+                "need": need,
+                "task": task,
+                "reason": reason,
+                "kind": kind or ("link" if is_link_mode else "work"),
+                "urls": urls,
+            }
+
         body = (text or "").strip()
         if not body or not settings.has_valid_api_key:
-            return empty
+            return pack(False, "", "")
 
         ctx_lines: list[str] = []
         for m in (recent_history or [])[-6:]:
@@ -1432,30 +1444,72 @@ class DaFeiYuBrain:
             else ""
         )
 
+        url_block = ""
+        if is_link_mode:
+            url_block = (
+                "【这条消息里的链接】\n"
+                + "\n".join(f"- {u}" for u in urls[:3])
+                + "\n\n"
+            )
+
+        if is_link_mode:
+            criteria = (
+                "判断标准（链接消息专用）：\n"
+                "- kind=link 且 need=true（最常见）：群友分享、转发、顺手甩了个链接，"
+                "没要求产出文件。后台助手会把链接读懂，留一两句话给大肥鱼，"
+                "等后面聊到时她自然接得上。\n"
+                "- kind=work 且 need=true（少数）：明确要求基于这个链接产出文件、"
+                "抓全文存档、整理成表格，或要求操作电脑/代码/系统。\n"
+                "- need=false：链接是图片、表情、安装包之类的直链，纯广告刷屏，"
+                "或群里根本没在聊它。\n"
+                "- 固定不派：要求改大肥鱼自己项目的代码、配置或人格文件。"
+                "后台助手被关在沙箱里，只准生成文件和留话，改不了项目本身，派了也是空跑。\n"
+                "拿不准时优先 kind=link（读一下成本很低），但明显是垃圾链接就 need=false。\n"
+            )
+            task_rule = (
+                "need=true 时写任务说明：\n"
+                "- kind=link：一句话点明读哪个链接、群里在聊什么、大肥鱼该关注什么，"
+                "把上面的 URL 原样带上，不超过 100 字；\n"
+                "- kind=work：不带人称、不带寒暄，直接写要做什么，保留原话所有细节，"
+                "不超过 120 字；\n"
+                "- 不许编造原话里没出现的路径、参数或账号。\n\n"
+                "只输出一行 JSON，不要 markdown、不要代码块、不要解释：\n"
+                '{"need": true 或 false, "kind": "link" 或 "work", '
+                '"task": "任务说明（need=false 时为空字符串）", "reason": "15 字以内理由"}'
+            )
+        else:
+            criteria = (
+                "判断标准（只有两类）：\n"
+                "- need=true（要干活）：明确要求操作电脑/服务器/文件/代码/网页/系统，或要求产出实物结果。"
+                "例如：改代码、跑脚本、看报错、查本机状态、装软件、整理文件、生成表格或文档、"
+                "抓网页内容、排查问题、部署上线。\n"
+                "- need=false（不干活）：闲聊、吐槽、开玩笑、问知识、问观点、问建议、问天气时间、"
+                "约人打游戏、发表情、问机器人自己（“你在干嘛”）、要表情包、让它记住某件事、"
+                "单纯复述或抱怨。\n"
+                "- 还有一类固定不派：要求改大肥鱼自己项目的代码、配置或人格文件。"
+                "后台执行助手被关在沙箱里，只准生成文件和留话，改不了项目本身，派了也是空跑；"
+                "这类活得由外部工具来做。\n"
+                "拿不准时一律 need=false —— 宁可漏派，也不要给群里派一堆空任务。\n"
+            )
+            task_rule = (
+                "need=true 时，把这件事改写成一段可以直接交给执行助手的任务说明：\n"
+                "- 不带人称、不带寒暄、不要写“请帮我”，直接写要做什么；\n"
+                "- 保留原话里的所有细节（文件路径、人名、数字、时间、格式要求）；\n"
+                "- 不超过 120 字，一句话说完；\n"
+                "- 不许编造原话里没出现的路径、参数或账号。\n\n"
+                "只输出一行 JSON，不要 markdown、不要代码块、不要解释：\n"
+                '{"need": true 或 false, "task": "任务说明（need=false 时为空字符串）", "reason": "15 字以内理由"}'
+            )
+
         prompt = (
-            "你是群聊机器人的「派活判断器」。只判断群友这句话要不要机器人动手去干活，"
+            "你是群聊机器人的「派活判断器」。只判断群友这句话要不要让后台助手动手，"
             "不负责真的干活，也不负责聊天。\n\n"
             f"【最近几句群聊】\n{ctx}\n\n"
             f"【现在这句】\n[{sender}]: {probe}\n\n"
-            "判断标准（只有两类）：\n"
-            "- need=true（要干活）：明确要求操作电脑/服务器/文件/代码/网页/系统，或要求产出实物结果。"
-            "例如：改代码、跑脚本、看报错、查本机状态、装软件、整理文件、生成表格或文档、"
-            "抓网页内容、排查问题、部署上线。\n"
-            "- need=false（不干活）：闲聊、吐槽、开玩笑、问知识、问观点、问建议、问天气时间、"
-            "约人打游戏、发表情、问机器人自己（“你在干嘛”）、要表情包、让它记住某件事、"
-            "单纯复述或抱怨。\n"
-            "- 还有一类固定不派：要求改大肥鱼自己项目的代码、配置或人格文件。"
-            "后台执行助手被关在沙箱里，只准生成文件和留话，改不了项目本身，派了也是空跑；"
-            "这类活得由外部工具来做。\n"
-            "拿不准时一律 need=false —— 宁可漏派，也不要给群里派一堆空任务。\n"
+            f"{url_block}"
+            f"{criteria}"
             f"{extra_block}\n"
-            "need=true 时，把这件事改写成一段可以直接交给执行助手的任务说明：\n"
-            "- 不带人称、不带寒暄、不要写“请帮我”，直接写要做什么；\n"
-            "- 保留原话里的所有细节（文件路径、人名、数字、时间、格式要求）；\n"
-            "- 不超过 120 字，一句话说完；\n"
-            "- 不许编造原话里没出现的路径、参数或账号。\n\n"
-            "只输出一行 JSON，不要 markdown、不要代码块、不要解释：\n"
-            '{"need": true 或 false, "task": "任务说明（need=false 时为空字符串）", "reason": "15 字以内理由"}'
+            f"{task_rule}"
         )
 
         try:
@@ -1467,25 +1521,33 @@ class DaFeiYuBrain:
             raw = strip_think(resp.choices[0].message.content or "")
         except Exception as exc:
             logger.warning("工具路由判定调用失败: %s", exc)
-            return {"need": False, "task": "", "reason": "调用失败"}
+            return pack(False, "", "调用失败")
 
         matched = re.search(r"\{.*\}", raw, re.S)
         if not matched:
             logger.info("工具路由判定输出无法解析: %r", raw[:120])
-            return {"need": False, "task": "", "reason": "解析失败"}
+            return pack(False, "", "解析失败")
         try:
             data = json.loads(matched.group(0))
         except json.JSONDecodeError:
             logger.info("工具路由判定输出不是合法 JSON: %r", raw[:120])
-            return {"need": False, "task": "", "reason": "JSON非法"}
+            return pack(False, "", "JSON非法")
 
         task = " ".join(str(data.get("task") or "").split())[:200]
         need = bool(data.get("need")) and bool(task)
         reason = " ".join(str(data.get("reason") or "").split())[:30]
         if not need:
-            return {"need": False, "task": "", "reason": reason}
-        logger.info("🧰 工具路由判定：需要派活 → %s（理由：%s）", task[:60], reason)
-        return {"need": True, "task": task, "reason": reason}
+            return pack(False, "", reason)
+        kind = str(data.get("kind") or "").strip().lower()
+        if kind not in ("link", "work"):
+            kind = "link" if is_link_mode else "work"
+        logger.info(
+            "🧰 工具路由判定：%s → %s（理由：%s）",
+            "读链接" if kind == "link" else "需要派活",
+            task[:60],
+            reason,
+        )
+        return pack(True, task, reason, kind)
 
     def judge_topic_roast(
         self,

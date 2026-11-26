@@ -200,14 +200,22 @@ def submit_dsh_job(
     workdir: str = "",
     mode: str = "",
     dsh_bin_override: str = "",
+    kind: str = "work",
+    urls: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
-    """将耗时编程/重任务异步派发到脱离进程树的 DSH 后台执行，立即返回。"""
+    """将耗时任务异步派发到脱离进程树的后台执行，立即返回。
+
+    kind=work 是原先的「派活」；kind=link 是群里甩了链接、后台静默读懂它，
+    结果只走 L3 注文，不在群里播报。两种活共用沙箱/护栏/回退这套外壳。
+    """
     if not settings.ENABLE_DSH:
         return False, "当前配置已禁用 DSH（ENABLE_DSH=false）"
 
     clean_task = (task or "").strip()
     if not clean_task:
         return False, "任务内容不能为空"
+    clean_kind = "link" if str(kind).strip().lower() == "link" else "work"
+    clean_urls = [str(u).strip() for u in (urls or []) if str(u).strip()][:4]
 
     backend = (settings.TOOL_BACKEND or "dsh").strip().lower()
     dsh_bin = ""
@@ -276,14 +284,25 @@ def submit_dsh_job(
     if not sandbox:
         sandbox = str(resolved_workdir)
 
+    task_text = prompt_text
+    if clean_kind == "link" and clean_urls:
+        # 判定器偶尔会漏写 URL，这里以正则抽出来的为准补一份，并把发链接的人带上，
+        # 方便工具把注文写成「某某发的链接讲的是……」，大肥鱼接话才有头有尾。
+        task_text += (
+            "\n\n【本次要读的链接（以这里为准，原样使用）】\n"
+            + "\n".join(f"- {u}" for u in clean_urls)
+            + f"\n【是谁发的】{sender}"
+        )
     prompt_text = (
         tool_guard.build_boundary_prompt(
             str(resolved_workdir),
             str(BASE_DIR.resolve()),
             settings.TOOL_L3_INJECT_MAX,
             settings.TOOL_L3_INJECT_TTL_HOURS,
+            kind=clean_kind,
+            urls=clean_urls,
         )
-        + prompt_text
+        + task_text
     )
 
     job_dir = DSH_JOBS_DIR / job_id
@@ -295,6 +314,8 @@ def submit_dsh_job(
         "sender": (sender or "").strip(),
         "session_id": resolved_sid,
         "task": clean_task,
+        "kind": clean_kind,
+        "urls": clean_urls,
         "backend": backend,
         "fallback_from": "codebuddy" if fallback_reason else "",
         "fallback_reason": fallback_reason,
@@ -311,7 +332,9 @@ def submit_dsh_job(
         "guard_restore": settings.TOOL_GUARD_RESTORE,
         "l3_inject_max": settings.TOOL_L3_INJECT_MAX,
         "l3_inject_ttl_hours": settings.TOOL_L3_INJECT_TTL_HOURS,
-        "timeout_sec": settings.DSH_TIMEOUT_SEC,
+        "timeout_sec": (
+            settings.TOOL_LINK_TIMEOUT_SEC if clean_kind == "link" else settings.DSH_TIMEOUT_SEC
+        ),
         "created_at": time.time(),
     }
 
@@ -343,8 +366,9 @@ def submit_dsh_job(
         return False, f"启动 DSH 后台进程失败: {exc}"
 
     logger.info(
-        "🚀 已派发 DSH 后台任务 job=%s session=%s sender=%s group=%s",
+        "🚀 已派发后台任务 job=%s kind=%s session=%s sender=%s group=%s",
         job_id,
+        clean_kind,
         resolved_sid,
         sender,
         group_id,

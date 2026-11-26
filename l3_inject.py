@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -38,6 +39,41 @@ def _write(data: dict[str, Any]) -> None:
     tmp = DATA_FILE.with_name(f".{DATA_FILE.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, DATA_FILE)
+
+
+@contextlib.contextmanager
+def _exclusive():
+    """跨进程互斥：链接任务和派活任务可能同时收尾，别互相覆盖注文。
+
+    用临时锁文件而不是 msvcrt/fcntl，Windows / Linux 都能跑；拿不到锁时最多等
+    5 秒就放行（宁可少写一条，也不能让后台任务卡死），陈旧锁超过 30 秒自动清掉。
+    """
+    lock = Path(str(DATA_FILE) + ".lock")
+    fd = None
+    deadline = time.time() + 5.0
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 30:
+                    lock.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.03)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def clean_note(raw: Any) -> str:
@@ -70,22 +106,23 @@ def record_notes(
     if not cleaned:
         return 0
 
-    now = time.time()
-    entries = [
-        e for e in _read().get("entries", [])
-        if isinstance(e, dict) and float(e.get("expire_ts") or 0) > now
-    ]
-    for text in cleaned:
-        entries.append(
-            {
-                "group_id": (group_id or "").strip(),
-                "text": text,
-                "job_id": job_id,
-                "created_ts": now,
-                "expire_ts": now + max(0.5, float(ttl_hours)) * 3600,
-            }
-        )
-    _write({"entries": entries[-MAX_ENTRIES:]})
+    with _exclusive():
+        now = time.time()
+        entries = [
+            e for e in _read().get("entries", [])
+            if isinstance(e, dict) and float(e.get("expire_ts") or 0) > now
+        ]
+        for text in cleaned:
+            entries.append(
+                {
+                    "group_id": (group_id or "").strip(),
+                    "text": text,
+                    "job_id": job_id,
+                    "created_ts": now,
+                    "expire_ts": now + max(0.5, float(ttl_hours)) * 3600,
+                }
+            )
+        _write({"entries": entries[-MAX_ENTRIES:]})
     return len(cleaned)
 
 

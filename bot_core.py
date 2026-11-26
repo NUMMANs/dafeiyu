@@ -20,6 +20,7 @@ from brain import brain
 from config import BASE_DIR, settings, DATA_DIR
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
+import link_reader
 from memory import estimate_tokens, memory_store
 import metrics
 from persona_runtime import emotion_sm, heartflow, slang_book
@@ -202,6 +203,10 @@ class DaFeiYuBotCore:
         self._last_l3_check_day: dict[str, str] = {}
         # 工具路由：正在后台跑 DSH 任务的群（群号 → {job_id, task, sender, since, deadline}）
         self._dsh_running: dict[str, dict] = {}
+        # 链接理解：每群并发 1 个、同 URL 一段时间不重复读、忙时排队；
+        # _link_decision 存「入口那次判定」，供 _compose_reply 复用，避免同一条消息判两次。
+        self._link_limiter = link_reader.LinkLimiter(settings.TOOL_LINK_SEEN_TTL_SEC)
+        self._link_decision: dict[str, tuple[str, dict, float]] = {}
         # 刚干完的后台活（群号 → {job_id, task, status, summary, artifacts, at}）。
         # 用来在后续几轮里给模型一个明确归属：这活是她自己干的，不是群友干的。
         self._dsh_done: dict[str, dict] = {}
@@ -1276,6 +1281,14 @@ class DaFeiYuBotCore:
                 )
                 return cmd_resp
 
+        # 3.5 群里甩了链接：不等她决不决定回话，静默派后台任务去读懂它。
+        #     结果只走 L3 注文，不占回复额度、不回占位、不在群里播报。
+        if clean_text and settings.TOOL_LINK_ENABLED:
+            try:
+                self._handle_group_links(group_id, sender, clean_text)
+            except Exception as exc:
+                logger.warning("[%s] 链接理解调度异常（不影响聊天）: %s", group_id, exc)
+
         # 4. 判断文本消息是否触发大肥鱼（L1：@唤名 或 以名字开头）
         triggered = self._is_triggered(group_id, clean_text, force_trigger=force_trigger)
         roast_angle = ""
@@ -1339,6 +1352,96 @@ class DaFeiYuBotCore:
             roast_angle=roast_angle,
             image_path=image_path,
         )
+
+    # ------------------------------------------------------------------
+    # 链接理解：消息入口静默判定 → 后台读懂 → 只留 L3 注文
+    # ------------------------------------------------------------------
+
+    def _link_decision_for(self, group_id: str, text: str) -> dict | None:
+        """取入口那次判定的结果（用完即删），避免 _compose_reply 再调一次模型。"""
+        cached = self._link_decision.get(group_id)
+        if not cached:
+            return None
+        cached_text, decision, ts = cached
+        self._link_decision.pop(group_id, None)
+        if cached_text != text or time.time() - ts > 90:
+            return None
+        return decision
+
+    def _handle_group_links(self, group_id: str, sender: str, text: str) -> None:
+        """消息里带链接：入口静默判定 + 静默派单，结果走 L3，不打断聊天。"""
+        urls = link_reader.extract_urls(text, settings.TOOL_LINK_MAX_PER_MSG)
+        if not urls:
+            self._flush_queued_links(group_id, sender)
+            return
+        urls = self._link_limiter.fresh(group_id, urls)
+        if not urls:
+            return
+        if not settings.ENABLE_TOOL_ROUTER or not settings.has_valid_api_key:
+            return
+        ok_dsh, _detail = is_dsh_available()
+        if not ok_dsh:
+            return
+
+        recent = pet_engine.get_recent_history(group_id, limit=6)
+        try:
+            decision = brain.judge_tool_need(sender, text, recent, link_urls=urls)
+        except Exception as exc:
+            logger.warning("[%s] 链接判定异常: %s", group_id, exc)
+            return
+        metrics.record("tool_router", group_id, bool(decision.get("need")))
+
+        # 留给 _compose_reply：kind=work 走原派活路径；kind=link 别再判一次、也别回占位
+        self._link_decision[group_id] = (text, decision, time.time())
+        if not decision.get("need"):
+            return
+        if str(decision.get("kind") or "link") == "work":
+            logger.info("[%s] 🔗 链接消息被判成派活，交回 _compose_reply 走原路径", group_id)
+            return
+        if self._link_limiter.is_busy(group_id):
+            logger.info("[%s] 已有链接任务在跑，先排队：%s", group_id, urls)
+            self._link_limiter.queue(group_id, urls)
+            return
+        self._dispatch_link_job(group_id, sender, urls, str(decision.get("task") or ""))
+
+    def _dispatch_link_job(
+        self, group_id: str, sender: str, urls: list[str], task: str
+    ) -> None:
+        if not urls:
+            return
+        clean_task = (task or "").strip() or (
+            "读懂群友发的链接，用一两句话说明它讲了什么：" + "、".join(urls[:2])
+        )
+        ok, payload = submit_dsh_job(
+            group_id=group_id, sender=sender, task=clean_task, kind="link", urls=urls
+        )
+        if not ok:
+            logger.warning("[%s] 派链接理解任务失败: %s", group_id, payload)
+            return
+        self._link_limiter.mark_seen(group_id, urls)
+        self._link_limiter.mark_running(group_id, settings.TOOL_LINK_TIMEOUT_SEC)
+        job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
+        logger.info(
+            "[%s] 🔗 已静默派链接理解任务 job=%s urls=%d（不回占位、不播报）",
+            group_id,
+            job_id,
+            len(urls),
+        )
+
+    def _flush_queued_links(self, group_id: str, sender: str) -> None:
+        """上一条消息时本群正在读链接，攒下的 URL 趁下一条消息补派。"""
+        if self._link_limiter.is_busy(group_id):
+            return
+        queued = self._link_limiter.pop_queued(group_id)
+        fresh = self._link_limiter.fresh(group_id, queued)
+        if fresh:
+            self._dispatch_link_job(
+                group_id, sender, fresh[: settings.TOOL_LINK_MAX_PER_MSG], ""
+            )
+
+    def on_link_job_done(self, group_id: str) -> None:
+        """巡检发现链接任务收尾时放开本群并发（排队链接等下一条消息补派）。"""
+        self._link_limiter.release((group_id or "").strip())
 
     # ------------------------------------------------------------------
     # 工具路由：小模型判「要不要派活」→ DSH 后台干活 → 群里先回一句模板占位
@@ -1426,17 +1529,24 @@ class DaFeiYuBotCore:
 
     def _route_tool_task(self, group_id: str, sender: str, text: str) -> str:
         """
-        让轻量判定器决定这句话要不要派活，需要就异步交给 DSH，返回任务描述。
+        让轻量判定器决定这句话要不要派活，需要就异步交给后台，返回任务描述。
 
-        三道前置条件先挡掉绝大多数无用调用：
-        1. 关掉工具路由 / 没有 API Key / 文字太短 → 不判；
-        2. DSH 不可用 → 不判（此时大肥鱼自己挂着电脑工具，走老路）；
-        3. 本群已有任务在跑 → 不判（避免派一堆重复任务，等上一轮出结果）。
-        返回空字符串表示「不派活」，调用方继续走普通聊天。
+        含链接的消息在 handle_message 入口已判过一次（_handle_group_links），
+        这里直接复用结果：kind=link 的一律不回占位、不派第二单；kind=work 的照旧派活。
+        其余三道前置条件不变：闸门字数 / 后台可用性 / 本群是否已有任务在跑。
         """
         if not settings.ENABLE_TOOL_ROUTER:
             return ""
         body = (text or "").strip()
+
+        cached = self._link_decision_for(group_id, body)
+        if cached is not None:
+            if not cached.get("need") or str(cached.get("kind") or "") == "link":
+                return ""
+            if self._dsh_busy(group_id):
+                return ""
+            return self._dispatch_work_job(group_id, sender, str(cached.get("task") or ""))
+
         if len(body) < tuning.get_int("TOOL_ROUTER_MIN_CHARS", settings.TOOL_ROUTER_MIN_CHARS):
             return ""
         ok_dsh, _detail = is_dsh_available()
@@ -1456,11 +1566,16 @@ class DaFeiYuBotCore:
         metrics.record("tool_router", group_id, bool(decision.get("need")))
         if not decision.get("need"):
             return ""
+        return self._dispatch_work_job(group_id, sender, str(decision.get("task") or ""))
 
-        task = str(decision.get("task") or "")[:400]
+    def _dispatch_work_job(self, group_id: str, sender: str, task: str) -> str:
+        """真正派一单「干活」任务，供两条判定路径共用。"""
+        task = (task or "").strip()[:400]
+        if not task:
+            return ""
         ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task)
         if not ok:
-            logger.warning("[%s] 派活给 DSH 失败: %s", group_id, payload)
+            logger.warning("[%s] 派活给执行助手失败: %s", group_id, payload)
             return ""
         job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
         self._dsh_running[group_id] = {

@@ -579,6 +579,20 @@ class WxAutoAdapter:
                     last_dsh_check = now_loop
                     try:
                         for done_job in pop_finished_jobs():
+                            # 链接理解任务是静默的：结果只走 L3 注文，不回占位、不生成群内报告、
+                            # 不让大肥鱼播报「我读了个链接」。现场仍留在 job 目录备查。
+                            if str(done_job.get("kind") or "").strip().lower() == "link":
+                                try:
+                                    bot_core.on_link_job_done(str(done_job.get("group_id") or ""))
+                                except Exception:
+                                    pass
+                                logger.info(
+                                    "🔗 链接理解任务 #%s 已静默完成（注入 %s 条｜状态 %s）",
+                                    done_job.get("job_id"),
+                                    done_job.get("l3_inject") or 0,
+                                    done_job.get("status"),
+                                )
+                                continue
                             target_group = (done_job.get("group_id") or "").strip() or (
                                 self.groups[0] if self.groups else ""
                             )

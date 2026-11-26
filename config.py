@@ -181,6 +181,17 @@ class Settings:
     # 注入内容的存活时间（小时），过期自动失效，不污染上下文
     TOOL_L3_INJECT_TTL_HOURS: float = max(0.5, float(os.getenv("TOOL_L3_INJECT_TTL_HOURS", "6")))
 
+    # ---- 群内链接理解（2026-11-26）----
+    # 群里甩链接不要求大肥鱼当场回复：入口静默派一个 link 任务让 CodeBuddy 读懂，
+    # 结果写进 L3 注文，等后面聊到自然接得上。关掉就完全退回「只有派活才用工具」。
+    TOOL_LINK_ENABLED: bool = _parse_bool(os.getenv("TOOL_LINK_ENABLED"), True)
+    # 一条消息最多读几个链接（多个会合并进同一个任务，防止一次烧太久）
+    TOOL_LINK_MAX_PER_MSG: int = max(1, int(os.getenv("TOOL_LINK_MAX_PER_MSG", "2")))
+    # 同群 + 同 URL 多久内不重复读（秒）
+    TOOL_LINK_SEEN_TTL_SEC: int = max(60, int(os.getenv("TOOL_LINK_SEEN_TTL_SEC", "7200")))
+    # link 任务单独超时（比干活短，读个网页不该拖很久）
+    TOOL_LINK_TIMEOUT_SEC: int = max(60, int(os.getenv("TOOL_LINK_TIMEOUT_SEC", "180")))
+
     # 高危操作群内二次确认保险
     ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)
     DANGER_CONFIRM_TTL_SEC: int = max(30, int(os.getenv("DANGER_CONFIRM_TTL_SEC", "180")))
