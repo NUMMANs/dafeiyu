@@ -59,9 +59,45 @@ def find_dsh_binary(custom_bin: str = "") -> str | None:
     return None
 
 
+def find_cbc_binary(custom_bin: str = "") -> str | None:
+    """查找可用的 CodeBuddy CLI 入口（TOOL_BACKEND=codebuddy 时用）。"""
+    candidates: list[str] = []
+    for raw in (custom_bin, settings.CBC_BIN):
+        val = (raw or "").strip()
+        if val and val not in candidates:
+            candidates.append(val)
+
+    default_bin = (
+        Path.home()
+        / ".codebuddy-cli"
+        / "node_modules"
+        / "@tencent-ai"
+        / "codebuddy-code"
+        / "bin"
+        / "codebuddy"
+    )
+    candidates.append(str(default_bin))
+
+    for cand in candidates:
+        cand_path = Path(cand).expanduser()
+        if cand_path.is_file():
+            return str(cand_path.resolve())
+    resolved = shutil.which("codebuddy")
+    return resolved or None
+
+
 def is_dsh_available() -> tuple[bool, str]:
     if not settings.ENABLE_DSH:
         return False, "配置已关闭 DSH（ENABLE_DSH=false）"
+    if settings.TOOL_BACKEND == "codebuddy":
+        found = find_cbc_binary()
+        if found:
+            return True, found
+        return (
+            False,
+            "TOOL_BACKEND=codebuddy 但未找到 CodeBuddy CLI（可用 CBC_BIN 指定，或安装 "
+            "@tencent-ai/codebuddy-code 到 ~/.codebuddy-cli）",
+        )
     found = find_dsh_binary()
     if found:
         return True, found
@@ -177,9 +213,18 @@ def submit_dsh_job(
     if not clean_task:
         return False, "任务内容不能为空"
 
-    dsh_bin = find_dsh_binary(dsh_bin_override)
-    if not dsh_bin:
-        return False, "未找到 DSH CLI，请确认已全局安装 @deepseek-ai/dsh 或检查 DSH_BIN 配置"
+    backend = (settings.TOOL_BACKEND or "dsh").strip().lower()
+    dsh_bin = ""
+    cbc_bin = ""
+    if backend == "codebuddy":
+        cbc_bin = find_cbc_binary() or ""
+        if not cbc_bin:
+            return False, "未找到 CodeBuddy CLI，请检查 CBC_BIN 或确认已安装 @tencent-ai/codebuddy-code"
+    else:
+        backend = "dsh"
+        dsh_bin = find_dsh_binary(dsh_bin_override) or ""
+        if not dsh_bin:
+            return False, "未找到 DSH CLI，请确认已全局安装 @deepseek-ai/dsh 或检查 DSH_BIN 配置"
 
     req_sid = (session_id or "").strip()
     prompt_text = clean_task
@@ -214,7 +259,11 @@ def submit_dsh_job(
         "sender": (sender or "").strip(),
         "session_id": resolved_sid,
         "task": clean_task,
+        "backend": backend,
         "dsh_bin": dsh_bin,
+        "cbc_bin": cbc_bin,
+        "cbc_model": settings.CBC_MODEL,
+        "cbc_permission_mode": settings.CBC_PERMISSION_MODE,
         "mode": resolved_mode,
         "approval_policy": settings.DSH_APPROVAL_POLICY,
         "model": settings.DSH_MODEL,
@@ -324,6 +373,11 @@ def pop_finished_jobs() -> list[dict[str, Any]]:
     return finished
 
 
+def _backend_label(done_data: dict[str, Any]) -> str:
+    """给用户看的后端名，别让群友看到「DSH」却在走 CodeBuddy。"""
+    return "CodeBuddy" if str(done_data.get("backend") or "").lower() == "codebuddy" else "DSH"
+
+
 def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
     """格式化适合发到微信群的任务结果文本，长输出额外生成 .txt 附件。"""
     job_id = str(done_data.get("job_id") or "unknown")
@@ -335,11 +389,11 @@ def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
     task_preview = task[:60] + ("..." if len(task) > 60 else "")
 
     if status == "done":
-        header = f"✅ 后台 DSH 任务完成（#{job_id}｜耗时 {duration}s）"
+        header = f"✅ 后台 {_backend_label(done_data)} 任务完成（#{job_id}｜耗时 {duration}s）"
     elif status == "timeout":
-        header = f"⏱️ 后台 DSH 任务超时（#{job_id}｜耗时 {duration}s）"
+        header = f"⏱️ 后台 {_backend_label(done_data)} 任务超时（#{job_id}｜耗时 {duration}s）"
     else:
-        header = f"⚠️ 后台 DSH 任务执行异常（#{job_id}｜退出码 {done_data.get('exit_code')}）"
+        header = f"⚠️ 后台 {_backend_label(done_data)} 任务执行异常（#{job_id}｜退出码 {done_data.get('exit_code')}）"
 
     attach_path: Path | None = None
     job_dir_str = str(done_data.get("_job_dir") or "").strip()
@@ -457,6 +511,19 @@ def job_cost(done_data: dict[str, Any]) -> dict[str, Any] | None:
 
 def format_cost_line(done_data: dict[str, Any]) -> str:
     """一行话把花费和账目说清，放在机械汇报的第一行。"""
+    if str(done_data.get("backend") or "").lower() == "codebuddy":
+        # CodeBuddy 是订阅额度制，CLI 返回的 total_cost_usd 恒为 0，只能报 token 不能报钱
+        usage = done_data.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            return "本次花费：不按次计价（CodeBuddy 订阅额度｜本次没拿到 token 统计）"
+        model = str(done_data.get("model") or "codebuddy")
+        return (
+            f"本次花费：不按次计价（{model} 走 CodeBuddy 订阅额度｜"
+            f"输入命中 {int(usage.get('cacheReadTokens') or 0):,} / "
+            f"未命中 {int(usage.get('uncachedInputTokens') or 0):,} / "
+            f"输出 {int(usage.get('outputTokens') or 0):,} tokens）"
+        )
+
     cost = job_cost(done_data)
     if cost is None:
         return "本次花费：未知（没拿到 DSH 的 token 统计，多半是任务没真正跑起来）"
@@ -507,7 +574,7 @@ def build_job_report_file(done_data: dict[str, Any], artifacts: list[Path] | Non
     lines = [
         format_cost_line(done_data),
         "=" * 64,
-        "大肥鱼 · DSH 后台任务机械汇报（本文件由代码生成，未经模型改写）",
+        f"大肥鱼 · {_backend_label(done_data)} 后台任务机械汇报（本文件由代码生成，未经模型改写）",
         "=" * 64,
         "",
         f"任务编号：{job_id}",

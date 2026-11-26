@@ -155,6 +155,15 @@ class Settings:
     # 单个产出文件大小上限（MB），超过只发报告不发文件
     DSH_ARTIFACT_MAX_MB: int = max(1, int(os.getenv("DSH_ARTIFACT_MAX_MB", "20")))
 
+    # 工具执行后端：dsh（默认，行为不变）| codebuddy（本机 CodeBuddy CLI，走订阅额度）
+    # 只切换「谁来跑活」，派发/播报/回传产出这套外壳完全复用，出问题把值改回 dsh 即可。
+    TOOL_BACKEND: str = (os.getenv("TOOL_BACKEND", "dsh").strip().lower() or "dsh")
+    # CodeBuddy CLI 入口：.js/.mjs 走 node 直跑，.cmd/.bat 走 cmd /c；留空则自动探测
+    CBC_BIN: str = os.getenv("CBC_BIN", "").strip()
+    CBC_MODEL: str = os.getenv("CBC_MODEL", "deepseek-v4.1-flash").strip()
+    # 无人值守必须跳过权限确认，否则工具调用会被挂起
+    CBC_PERMISSION_MODE: str = os.getenv("CBC_PERMISSION_MODE", "bypassPermissions").strip()
+
     # 高危操作群内二次确认保险
     ENABLE_DANGER_CONFIRM: bool = _parse_bool(os.getenv("ENABLE_DANGER_CONFIRM"), True)
     DANGER_CONFIRM_TTL_SEC: int = max(30, int(os.getenv("DANGER_CONFIRM_TTL_SEC", "180")))
