@@ -87,6 +87,90 @@ def find_cbc_binary(custom_bin: str = "") -> str | None:
     return resolved or None
 
 
+def ask_codebuddy(prompt: str, timeout: int = 120, purpose: str = "ask") -> str:
+    """用 CodeBuddy CLI 一次性问一段文字，同步拿回结果（不走任务队列、不播报、不留产物）。
+
+    和 ``submit_dsh_job`` 的区别：那个是「派活」——脱离进程树跑，跑完往群里播报、回收产物；
+    这里是机器人自己内部要一段文字（比如编她今天的生活线），调用方当场就要用，
+    所以同步阻塞、只取 stdout 里的 result。
+
+    返回空串表示这一层不可用（没装 / 没登录 / 超时 / 输出解析不出来），
+    由调用方决定退回 DeepSeek——绝不能因为 CLI 抽风就让她今天没有生活。
+
+    跑在一次性沙箱里：这个目录用完就删，CLI 就算想写文件也碰不到项目。
+    """
+    text = (prompt or "").strip()
+    if not text:
+        return ""
+    if not settings.ENABLE_DSH:
+        logger.info("🤖 CodeBuddy 一次性问答跳过：ENABLE_DSH=false")
+        return ""
+    cbc_bin = find_cbc_binary() or ""
+    if not cbc_bin:
+        logger.warning("🤖 CodeBuddy 一次性问答跳过：找不到 CLI（可用 CBC_BIN 指定）")
+        return ""
+
+    # 懒导入：dsh_worker_runner 是后台任务的入口，只在真要调 CLI 时才把它拉进来
+    from dsh_worker_runner import _CBC_STRIP_ENV_KEYS, _build_cbc_cmd, _parse_cbc_result
+
+    job_id = f"ask_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    try:
+        workdir = tool_guard.make_sandbox(job_id)
+    except Exception as exc:  # noqa: BLE001 - 沙箱建不出来就别跑，别退化成在项目目录里跑
+        logger.warning("🤖 CodeBuddy 一次性问答跳过：建沙箱失败 %s", exc)
+        return ""
+
+    cmd = _build_cbc_cmd(
+        cbc_bin,
+        str(uuid.uuid4()),
+        False,
+        settings.CBC_MODEL,
+        settings.CBC_PERMISSION_MODE,
+    )
+    run_env = os.environ.copy()
+    run_env["PYTHONUTF8"] = "1"
+    run_env["PYTHONIOENCODING"] = "utf-8"
+    for env_key in _CBC_STRIP_ENV_KEYS:
+        run_env.pop(env_key, None)
+
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workdir),
+            input=text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(30, int(timeout)),
+            env=run_env,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("🤖 CodeBuddy 一次性问答超时（%s，%ss）", purpose, timeout)
+        return ""
+    except Exception as exc:  # noqa: BLE001 - CLI 起不来不该把冒泡线程带下去
+        logger.warning("🤖 CodeBuddy 一次性问答启动失败（%s）: %s", purpose, exc)
+        return ""
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    result = _parse_cbc_result(proc.stdout or "")
+    out = str(result.get("result") or "").strip()
+    spent = time.time() - started
+    if not out:
+        logger.warning(
+            "🤖 CodeBuddy 一次性问答没拿到内容（%s，exit=%s，%.1fs）：%s",
+            purpose,
+            proc.returncode,
+            spent,
+            (proc.stderr or "")[:200].replace("\n", " "),
+        )
+        return ""
+    logger.info("🤖 CodeBuddy 一次性问答完成（%s，%.1fs，%d 字）", purpose, spent, len(out))
+    return out
+
+
 def is_dsh_available() -> tuple[bool, str]:
     if not settings.ENABLE_DSH:
         return False, "配置已关闭 DSH（ENABLE_DSH=false）"

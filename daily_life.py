@@ -6,8 +6,11 @@
 今天还在惦记。这一层就是给她一条前后连贯的日常。
 
 怎么做的：
-- 每天第一次真要分享时，才让模型按 ``SLOTS`` 这个作息骨架编出今天 8 件事（懒生成：
+- 每天第一次真要分享时，才按 ``SLOTS`` 这个作息骨架编出今天 8 件事（懒生成：
   一天只花一次调用，整天没机会冒泡就一次都不花）；
+- 写手默认是 CodeBuddy CLI（``LIFE_WRITER=codebuddy``，见 ``dsh_bridge.ask_codebuddy``），
+  提示词里带整块人格卡；CLI 不可用/超时/输出解不出来时自动退回 DeepSeek，两条路共用
+  同一份提示词（``brain.build_daily_life_prompt``），换后端不换文风；
 - 结果落盘 ``state/daily_life.json``，一整天复用，所以上午买的东西晚上还能提起来；
 - 只有「已经到点、还没讲过、且不超过 10 小时」的那条能发出去——不能下午就讲晚上的事，
   也不能半夜把早饭的事翻出来说；
@@ -24,11 +27,14 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from config import BASE_DIR, settings
+from dsh_bridge import ask_codebuddy
 import tuning
 
 logger = logging.getLogger("dafeiyu.life")
@@ -110,6 +116,46 @@ def _save(state: dict) -> None:
         MD_PATH.write_text(_render_md(state), encoding="utf-8")
     except OSError as exc:
         logger.warning("daily_life.json 写入失败: %s", exc)
+
+
+def _norm_text(text: str) -> str:
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+_FRAGMENT_STARTS = tuple("的了是着过地得又还就才也都")
+
+def _looks_standalone(rest: str) -> bool:
+    """削掉开头后剩下的半句还读得通吗。
+
+    「楼下烤红薯的摊子支起来了」如果照标题长度硬削，会剩下「的摊子支起来了」这种东西，
+    比留着重复更难读。剩下太短、或者以一个虚词开头，就宁可保留原文。
+    """
+    text = (rest or "").strip()
+    return len(text) >= 6 and not text.startswith(_FRAGMENT_STARTS)
+
+
+def _dedupe_detail(title: str, detail: str) -> str:
+    """CodeBuddy 爱把 detail 写成「标题 + 补充」，这里把重复的开头削掉。
+
+    不去掉的话，喂给「写这一句话」的模型就是同一个信息说两遍，写出来的分享也会绕回来
+    重复一遍标题（实测会出现「刷到修牛蹄的视频，一个师傅给牛修蹄子…」这种同义反复）。
+    阈值 0.45 是照实测标定的：真正的改写落在 0.48~0.59，同一件事换个说法就在这个区间。
+    """
+    body = (detail or "").strip()
+    if not body:
+        return ""
+    head = re.split(r"[，,。；;：:]", body, maxsplit=1)[0].strip()
+    if head and SequenceMatcher(None, _norm_text(title), _norm_text(head)).ratio() >= 0.45:
+        rest = body[len(head) :].lstrip("，,。；;：: ")
+        if _looks_standalone(rest):
+            return rest
+        return body
+    key = _norm_text(title)
+    if key and _norm_text(body).startswith(key):
+        rest = body[len(title) :].lstrip("，,。；;：: ")
+        if _looks_standalone(rest):
+            return rest
+    return body
 
 
 def _at_minutes(at: str) -> int:
@@ -228,20 +274,39 @@ def _recent_titles(state: dict, limit: int = 24) -> list[str]:
 def _generate(brain, now: datetime, state: dict) -> list[dict]:
     """让模型编出今天这 8 件事。失败返回空列表，由调用方决定这轮不分享。
 
-    提示词在 ``brain.generate_daily_life`` 里（和其它模型调用放一起，人格卡也只在那里加载一次）。
+    主写手是 CodeBuddy（``LIFE_WRITER=codebuddy``，走订阅额度，出来的东西更像人过的日子）；
+    CLI 没装、没登录、超时、输出解不出来时自动退回 DeepSeek——
+    宁可这次是 DeepSeek 写的，也不能让她今天没有生活。
+    两条路共用 ``brain.build_daily_life_prompt`` 同一份提示词（都带人格卡），
+    换后端不会换文风。
     """
     extra = tuning.judge_extra("life").strip()
-    recent = _recent_titles(state)
     date_str = now.strftime("%Y-%m-%d")
-    weekday = _WEEKDAYS[now.weekday()]
-    items = brain.generate_daily_life(
-        date_str=date_str,
-        weekday=weekday,
-        season_hint=_season_hint(now),
-        recent_titles=recent,
-        slots_spec=[(at, kind, hint) for at, kind, hint in SLOTS],
-        extra=extra,
-    )
+    args = {
+        "date_str": date_str,
+        "weekday": _WEEKDAYS[now.weekday()],
+        "season_hint": _season_hint(now),
+        "recent_titles": _recent_titles(state),
+        "slots_spec": [(at, kind, hint) for at, kind, hint in SLOTS],
+        "extra": extra,
+    }
+
+    items: list[dict] = []
+    if (settings.LIFE_WRITER or "").strip().lower() == "codebuddy":
+        try:
+            prompt = brain.build_daily_life_prompt(**args)
+            raw = ask_codebuddy(
+                prompt, timeout=settings.LIFE_WRITER_TIMEOUT, purpose="life-plan"
+            )
+            items = brain.parse_daily_life_json(raw) if raw else []
+        except Exception as exc:  # noqa: BLE001 - CLI 出问题不该让她今天没日子过
+            logger.warning("🗓️ CodeBuddy 编生活线失败: %s", exc)
+        if items:
+            logger.info("🗓️ 今日生活由 CodeBuddy 生成（%d 条）", len(items))
+        else:
+            logger.info("🗓️ CodeBuddy 没编出生活线，退回 DeepSeek")
+    if not items:
+        items = brain.generate_daily_life(**args)
     if not items:
         return []
 
@@ -260,7 +325,7 @@ def _generate(brain, now: datetime, state: dict) -> list[dict]:
         if at in used_at:
             continue
         used_at.add(at)
-        detail = " ".join(str(item.get("detail") or "").split())[:60]
+        detail = _dedupe_detail(title, " ".join(str(item.get("detail") or "").split())[:60])
         try:
             interest = int(item.get("interest") or 3)
         except (TypeError, ValueError):

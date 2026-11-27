@@ -98,6 +98,12 @@ class Settings:
     LIFE_SHARE_PROB: float = float(os.getenv("LIFE_SHARE_PROB", "0.45"))
     # 生活分享正文最多多少字（超出按句截断）
     LIFE_MAX_CHARS: int = int(os.getenv("LIFE_MAX_CHARS", "60"))
+    # 今天的 8 件事由谁来编：
+    #   codebuddy = CodeBuddy CLI（走订阅额度，写出来的人味更足；CLI 不可用会自动退回 deepseek）
+    #   deepseek  = 直接用 DeepSeek 接口（快、稳，但文风偏「AI 编故事」）
+    LIFE_WRITER: str = (os.getenv("LIFE_WRITER", "codebuddy").strip().lower() or "codebuddy")
+    # CodeBuddy 编一次生活线最多等多久（秒）。超时就退回 DeepSeek，别让冒泡线程卡死。
+    LIFE_WRITER_TIMEOUT: int = max(30, int(os.getenv("LIFE_WRITER_TIMEOUT", "120")))
     # 静默期：默认只从凌晨 1 点睡到 8 点，0 点这段留着发每日统计
     QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))

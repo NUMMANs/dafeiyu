@@ -1898,6 +1898,69 @@ class DaFeiYuBrain:
             logger.warning("冷场找话题：分享文本调用失败: %s", exc)
             return {}
 
+    def build_daily_life_prompt(
+        self,
+        date_str: str,
+        weekday: str,
+        season_hint: str,
+        recent_titles: list[str],
+        slots_spec: list[tuple[str, str, str]],
+        extra: str = "",
+    ) -> str:
+        """「编今天这一天」的提示词。CodeBuddy 和 DeepSeek 共用这一份，换后端不改文风。
+
+        人格卡整块给进来（编译卡上限 6000 字，这里只取前 1400）：这一天要像她过的，
+        不是像某个模板套出来的——爱吃、爱打游戏、有点懒、说话短，这些都得从卡里来。
+        """
+        recent = "\n".join(f"- {t}" for t in recent_titles[-24:]) or "（没有记录，这是第一天）"
+        return (
+            f"你在替微信群里的「{settings.BOT_NAME}」编她今天这一天。她是一个普通人，"
+            "不是助手也不是 AI，现在是她的生活，不是任务清单。\n"
+            f"今天是 {date_str} {weekday}，{season_hint}。\n"
+            f"【她的人格卡（语气、爱好、生活习惯都以这张卡为准）】\n{load_card()[:1400]}\n"
+            f"【她前几天干过的事】（别重复；能接着昨天的话头更好）\n{recent}\n"
+            + (f"【额外偏好】{extra}\n" if extra else "")
+            + "请编出她今天这一天，按下面这些时间点各写一件事：\n"
+            + "\n".join(f"- {at} {kind}：{hint}" for at, kind, hint in slots_spec)
+            + "\n要求：\n"
+            "1. 每条都是发生在她自己身上的具体小事，要能说出「在哪儿、是什么、谁说了什么」；\n"
+            "2. 不能是「出去转了转」「看了会儿手机」这种空话，也别写成段子合集——普通的一天，"
+            "有一两件值得说的就够了，其余平淡；\n"
+            "3. 一天之内要连贯：上午买的东西晚上可以吃，出门淋了雨回家就换衣服、鞋还没干，"
+            "熬夜了下午就困；\n"
+            "4. 只写她自己的日常，不碰真实新闻、明星、政事、灾害、他人隐私，也别报价格和型号"
+            "（随手买的便宜零食除外）；\n"
+            "5. 时间要跟时段对得上：早上别在打排位，晚上别在挤地铁；\n"
+            "6. interest 给 1~5 分，表示「这件事值不值得在群里说」，一天里最多两条打 4 分以上；\n"
+            "7. title 不超过 16 字；detail 不超过 45 字，而且必须是说完整的一句话"
+            "（别写到一半断掉，宁可少说点）。\n"
+            "只输出一个 JSON 对象，不要解释、不要用 Markdown 代码块、不要调用任何工具、"
+            "不要读写文件：\n"
+            '{"slots": [{"at": "09:40", "title": "...", "detail": "...", '
+            '"interest": 4, "mood": "happy"}, ...]}'
+        )
+
+    @staticmethod
+    def parse_daily_life_json(raw: str) -> list[dict]:
+        """从返回里抠出 slots 数组。
+
+        CodeBuddy 偶尔会带一段解释或 ```json 围栏再给 JSON，所以只认第一个 { 到最后一个 }；
+        实在解不出来就当没生成，由调用方回退，不猜。
+        """
+        body = strip_think(raw or "")
+        matched = re.search(r"\{.*\}", body, re.S)
+        if not matched:
+            if body.strip():
+                logger.info("今日生活：生成结果无法解析 %r", body[:120])
+            return []
+        try:
+            data = json.loads(matched.group(0))
+        except json.JSONDecodeError:
+            logger.info("今日生活：生成结果不是合法 JSON %r", body[:120])
+            return []
+        items = data.get("slots") if isinstance(data, dict) else None
+        return items if isinstance(items, list) else []
+
     def generate_daily_life(
         self,
         date_str: str,
@@ -1907,7 +1970,7 @@ class DaFeiYuBrain:
         slots_spec: list[tuple[str, str, str]],
         extra: str = "",
     ) -> list[dict]:
-        """编出「今天这一天」：按作息骨架给出 8 件发生在她身上的具体小事。
+        """编出「今天这一天」：按作息骨架给出 8 件发生在她身上的具体小事（DeepSeek 版）。
 
         为什么要一次编一整天，而不是每次现编一段：一天之内要有因果。上午买的东西
         晚上还在吃，出门淋了雨回家鞋还没干——分开编就会互相打架，听起来像两个人在过日子。
@@ -1915,29 +1978,8 @@ class DaFeiYuBrain:
         """
         if not settings.has_valid_api_key:
             return []
-        recent = "\n".join(f"- {t}" for t in recent_titles[-24:]) or "（没有记录，这是第一天）"
-        prompt = (
-            f"你是微信群里的「{settings.BOT_NAME}」，一个普通人，不是助手也不是 AI。"
-            f"今天是 {date_str} {weekday}，{season_hint}。\n"
-            f"【你的人设（只学语气和爱好，不要照抄句子）】\n{load_card()[:900]}\n"
-            f"【前几天你干过的事】（别重复；能接着昨天的话头更好）\n{recent}\n"
-            + (f"【额外偏好】{extra}\n" if extra else "")
-            + "请编出你今天这一天，按下面这些时间点各写一件事：\n"
-            + "\n".join(f"- {at} {kind}：{hint}" for at, kind, hint in slots_spec)
-            + "\n要求：\n"
-            "1. 每条都是发生在你自己身上的具体小事，要能说出「在哪儿、是什么、谁说了什么」；\n"
-            "2. 不能是「出去转了转」「看了会儿手机」这种空话，也别写成段子合集——普通的一天，"
-            "有一两件值得说的就够了，其余平淡；\n"
-            "3. 一天之内要连贯：上午买的东西晚上可以吃，出门淋了雨回家就换衣服、鞋还没干，"
-            "熬夜了下午就困；\n"
-            "4. 只写自己的日常，不碰真实新闻、明星、政事、灾害、他人隐私，也别报价格和型号"
-            "（随手买的便宜零食除外）；\n"
-            "5. 时间要跟时段对得上：早上别在打排位，晚上别在挤地铁；\n"
-            "6. interest 给 1~5 分，表示「这件事值不值得在群里说」，一天里最多两条打 4 分以上；\n"
-            "7. title 不超过 16 字；detail 不超过 45 字，而且必须是说完整的一句话"
-            "（别写到一半断掉，宁可少说点）。\n"
-            '只输出 JSON：{"slots": [{"at": "09:40", "title": "...", "detail": "...", '
-            '"interest": 4, "mood": "happy"}, ...]}'
+        prompt = self.build_daily_life_prompt(
+            date_str, weekday, season_hint, recent_titles, slots_spec, extra
         )
         try:
             resp = self._create(
@@ -1945,14 +1987,7 @@ class DaFeiYuBrain:
                 temperature=1.0,
                 max_tokens=900,
             )
-            raw = strip_think(resp.choices[0].message.content or "")
-            matched = re.search(r"\{.*\}", raw, re.S)
-            if not matched:
-                logger.info("今日生活：生成结果无法解析 %r", raw[:120])
-                return []
-            data = json.loads(matched.group(0))
-            items = data.get("slots") if isinstance(data, dict) else None
-            return items if isinstance(items, list) else []
+            return self.parse_daily_life_json(resp.choices[0].message.content or "")
         except Exception as exc:  # noqa: BLE001 - 编不出今天的生活不该影响冒泡
             logger.warning("今日生活：生成失败: %s", exc)
             return []
@@ -1984,9 +2019,11 @@ class DaFeiYuBrain:
             "不许写成「今天挺有意思」「遇到点好笑的事」这种没有内容的概括；\n"
             f"3. 时间要用「{when_label}」这种说法，别说得像刚发生（除非确实是刚才）；\n"
             "4. 第一人称口语，可以带一句自己的评价或吐槽，像随手发的微信；\n"
-            "5. 不要「今日分享」「跟你们说个事」这种开头，不要列点、不要链接、不要 Markdown，"
+            "5. 只能讲这一件事，可以补自己的感受，但别给她加新的经历（又出门一趟、又买了什么），"
+            "那些她自己也不记得，后面聊起来会前后打架；\n"
+            "6. 不要「今日分享」「跟你们说个事」这种开头，不要列点、不要链接、不要 Markdown，"
             "不要用「你们呢」「有人吗」收尾；\n"
-            "6. 这是你自己的日常，别扯上新闻、明星、别人的隐私。\n"
+            "7. 这是你自己的日常，别扯上新闻、明星、别人的隐私。\n"
             '输出 JSON：{"text": "...", "topic": "不超过10字的主题词", '
             '"mood": "happy|smug|shocked|gaming|hungry|sleepy|love"}'
         )
