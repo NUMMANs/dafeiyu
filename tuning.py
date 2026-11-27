@@ -67,6 +67,12 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "TRIGGER_BURST_MAX_ITEMS": (2, 10),
     # 智谱看图成功后写进历史的描述字数；太短丢细节，太长会把 L3 历史撑肥。
     "VISION_SUMMARY_CHARS": (80, 400),
+    # 冷场找话题：群里安静多少分钟才允许上网找一条分享（调低 = 更容易开口）
+    "TOPIC_SHARE_SILENCE_MIN": (30, 360),
+    # 同一群两次分享的间隔（分钟）。没有每日次数上限，靠这个控频。
+    "TOPIC_SHARE_COOLDOWN_MIN": (20, 480),
+    # 分享正文最多多少字（超出按句截断）。群聊里 50 字上下最像真人。
+    "TOPIC_SHARE_MAX_CHARS": (30, 120),
 
     # ---- 注入方式（夜间「记忆与人格」任务负责）----
     # L3 注文：后台工具读懂链接/图片后留下的话，每轮最多几条、每条多少字、总开关。
@@ -88,6 +94,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "sense": (
         "IMAGE_REPLY_PROB", "PROACTIVE_ENERGY_MIN", "TRIGGER_DEBOUNCE_SEC",
         "TRIGGER_BURST_MAX_ITEMS", "VISION_SUMMARY_CHARS",
+        "TOPIC_SHARE_SILENCE_MIN", "TOPIC_SHARE_COOLDOWN_MIN", "TOPIC_SHARE_MAX_CHARS",
     ),
     "mind": (
         "RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS",
@@ -108,6 +115,9 @@ STEP_LIMITS: dict[str, float] = {
     "TRIGGER_DEBOUNCE_SEC": 1.0,
     "TRIGGER_BURST_MAX_ITEMS": 1,
     "VISION_SUMMARY_CHARS": 60,
+    "TOPIC_SHARE_SILENCE_MIN": 30,
+    "TOPIC_SHARE_COOLDOWN_MIN": 30,
+    "TOPIC_SHARE_MAX_CHARS": 15,
     "L3_NOTE_MAX_ITEMS": 1,
     "L3_NOTE_MAX_CHARS": 60,
     "L3_INJECT_ON": 1,
@@ -221,7 +231,7 @@ def snapshot() -> dict[str, Any]:
         "step_limits": dict(STEP_LIMITS),
         "judges": {
             kind: judge_extra(kind)
-            for kind in ("l2", "l2_5", "tool_router")
+            for kind in ("l2", "l2_5", "tool_router", "topic_share")
         },
     }
 

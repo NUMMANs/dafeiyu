@@ -1761,6 +1761,126 @@ class DaFeiYuBrain:
                 used_vision=False,
             )
 
+    def suggest_share_topics(self, recent_lines: list[str], avoid_topics: list[str]) -> list[str]:
+        """冷场找话题第一步：出 2 条具体、能搜到东西的关键词。
+
+        为什么不直接让它「写一条分享」：那样模型会凭空编一条新闻。必须先去搜，
+        拿到真实材料再让它挑——「分享」的可信度全在这一步。
+        """
+        if not settings.has_valid_api_key:
+            return []
+        extra = tuning.judge_extra("topic_share").strip()
+        recent = "\n".join(recent_lines[-12:]) or "（最近没人说话）"
+        avoid = "、".join(avoid_topics[-10:]) or "（无）"
+        prompt = (
+            f"你是微信群里的「{settings.BOT_NAME}」，是群友不是助手。群里已经安静很久了，"
+            "你想主动分享一个自己刚在网上看到的、真的感兴趣的东西。\n"
+            "【平时感兴趣的方向】游戏（英雄联盟/主机/独立游戏）、吃的东西、数码新品、动漫、"
+            "奇怪的冷知识、生活里的小发现。别的领域偶尔也行，但得像是你随手刷到的。\n"
+            "【最近群里聊过】（只用来避开重复，不要接着聊）\n"
+            f"{recent}\n"
+            f"【最近已经分享过】（必须换方向）\n{avoid}\n"
+            + (f"【额外偏好】{extra}\n" if extra else "")
+            + "请给 2 条可以拿去搜索的具体关键词，例如「2026 新出的独立游戏 推荐」"
+            "「今年流行的奇怪零食」「猫为什么喜欢纸箱」。要求：\n"
+            "1. 必须具体到能搜出东西，不要「最近有什么好玩的」这种空话；\n"
+            "2. 两条方向要不一样；\n"
+            "3. 不碰政治时事、灾害事故、明星绯闻、医疗诊断、投资理财/股票加密货币、"
+            "地域或性别对立；\n"
+            "4. 每条 6~20 个字，尽量带上「2026」，避免搜回几年前的旧闻。\n"
+            '只输出 JSON：{"queries": ["...", "..."]}'
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.9,
+                max_tokens=200,
+            )
+            raw = strip_think(resp.choices[0].message.content or "")
+            matched = re.search(r"\{.*\}", raw, re.S)
+            if not matched:
+                logger.info("冷场找话题：关键词输出无法解析 %r", raw[:120])
+                return []
+            data = json.loads(matched.group(0))
+            items = data.get("queries") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                return []
+            out: list[str] = []
+            for item in items:
+                q = " ".join(str(item or "").split())[:30]
+                if q and q not in out:
+                    out.append(q)
+            return out[:2]
+        except Exception as exc:
+            logger.warning("冷场找话题：关键词调用失败: %s", exc)
+            return []
+
+    def compose_topic_share(self, material: str, recent_lines: list[str], strict: bool = False) -> dict:
+        """冷场找话题第二步：从搜回来的真实材料里挑一个东西，写成一句群聊话。
+
+        返回 ``{"text", "topic", "mood", "evidence"}``；材料不值得分享时返回空 dict。
+        ``evidence`` 是从材料里原样抄回的支撑句，调用方会拿它和原文比对——模型编不出来，
+        这一条就发不出去（实测会把 2021 年的旧闻写成「新出的紫薯椰子味薯片」）。
+        """
+        if not settings.has_valid_api_key or not material.strip():
+            return {}
+        extra = tuning.judge_extra("topic_share").strip()
+        recent = "\n".join(recent_lines[-8:]) or "（最近没人说话）"
+        prompt = (
+            f"你是微信群里的「{settings.BOT_NAME}」。下面是你刚在网上看到的内容。"
+            "群里安静了很久，你想挑一个自己真感兴趣的东西，随手发到群里。\n"
+            f"【你的人设（只学语气，别照抄）】\n{load_card()[:900]}\n"
+            f"【最近群聊】（只用来避免驴唇不对马嘴）\n{recent}\n"
+            + (f"【额外偏好】{extra}\n" if extra else "")
+            + f"【网上看到的内容】\n{material[:2600]}\n"
+            + (
+                "【注意】上一次你写了材料里没有的东西。这次只能写材料里逐字出现的信息，"
+                "evidence 必须是从材料里原样复制的一句话。\n"
+                if strict
+                else ""
+            )
+            + "要求：\n"
+            "1. 只挑一个具体的东西（一个新游戏／一个怪东西／一条冷知识／一个好吃的地方），别罗列；\n"
+            "2. 1~2 句、总共 20~50 字，像随手发的微信，可以带一点自己的评价或吐槽；\n"
+            "3. 只能用材料里真实存在的信息。品牌、口味、价格、日期、数据都不能编，"
+            "材料没写的不要补；写法上不要下结论式科普；\n"
+            "4. 材料里的日期要看：2025 年及更早的东西，不许说成「新出」「刚出」「最近」，"
+            "宁可只说它是什么；\n"
+            "5. 不要写「我搜到」「根据报道」「今日热点」，不要列点、不要放链接、不要 Markdown；\n"
+            "6. 不要用「你们觉得呢」「有人玩吗」这种空问句结尾；\n"
+            "7. 如果材料里没有一条值得分享，text 返回空字符串。\n"
+            "另外必须给 evidence：从材料里原样复制一句支撑这条分享的话（15~40 字），"
+            "一个字都不许改写；找不到这样的话就不要写 text。\n"
+            '输出 JSON：{"text": "...", "topic": "不超过12字的主题词", "evidence": "...", '
+            '"mood": "happy|smug|shocked|gaming|hungry|sleepy|love"}'
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.6 if strict else 0.85,
+                max_tokens=300,
+            )
+            raw = strip_think(resp.choices[0].message.content or "")
+            matched = re.search(r"\{.*\}", raw, re.S)
+            if not matched:
+                logger.info("冷场找话题：分享文本输出无法解析 %r", raw[:120])
+                return {}
+            data = json.loads(matched.group(0))
+            if not isinstance(data, dict):
+                return {}
+            text = " ".join(str(data.get("text") or "").split())[:120]
+            topic = " ".join(str(data.get("topic") or "").split())[:16]
+            evidence = " ".join(str(data.get("evidence") or "").split())[:60]
+            return {
+                "text": text,
+                "topic": topic,
+                "evidence": evidence,
+                "mood": str(data.get("mood") or "happy"),
+            }
+        except Exception as exc:
+            logger.warning("冷场找话题：分享文本调用失败: %s", exc)
+            return {}
+
     def summarize_l3_history(self, rows: list[dict], group_id: str = "") -> str:
         """
         把一段即将从 L3 会话层删掉的旧聊天压成一段摘要（≤200 字）。

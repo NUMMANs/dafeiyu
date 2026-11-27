@@ -81,6 +81,12 @@ class Settings:
     PROACTIVE_MSG_THRESHOLD: int = int(os.getenv("PROACTIVE_MSG_THRESHOLD", "6"))
     PROACTIVE_COOLDOWN_SEC: int = int(os.getenv("PROACTIVE_COOLDOWN_SEC", "480"))
     ENABLE_SCHEDULED_BUBBLE: bool = _parse_bool(os.getenv("ENABLE_SCHEDULED_BUBBLE"), True)
+    # 冷场找话题：群里长时间没人说话时，自己上网找个感兴趣的东西分享到群里。
+    # 不设每日次数上限，只按「安静多久触发」「两次之间隔多久」控频（下面两个值可在
+    # data/tuning.json 里热调，归 0:15 感官任务管）。
+    ENABLE_TOPIC_SHARE: bool = _parse_bool(os.getenv("ENABLE_TOPIC_SHARE"), True)
+    TOPIC_SHARE_SILENCE_MIN: int = int(os.getenv("TOPIC_SHARE_SILENCE_MIN", "90"))
+    TOPIC_SHARE_COOLDOWN_MIN: int = int(os.getenv("TOPIC_SHARE_COOLDOWN_MIN", "120"))
     # 静默期：默认只从凌晨 1 点睡到 8 点，0 点这段留着发每日统计
     QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))

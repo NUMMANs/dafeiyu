@@ -477,6 +477,30 @@ class WxAutoAdapter:
                 except Exception as exc:
                     logger.warning("去抖判定发送异常: %s", exc)
 
+                # 0.5 冷场找话题：后台线程搜好的分享取回来发送（搜索不阻塞这个 1 秒巡检）
+                try:
+                    for t_group, t_resp in bot_core.poll_topic_share():
+                        if not t_resp.should_reply:
+                            continue
+                        if not self._is_allowed_group(t_group):
+                            self._reject_group(t_group, "冷场找话题")
+                            continue
+                        logger.info("[%s] 🌐 冷场分享: %s", t_group, (t_resp.text or "")[:80])
+                        bubbles = t_resp.get_bubbles()
+                        for idx, b in enumerate(bubbles):
+                            self._safe_send(wx, b, t_group, "冷场找话题")
+                            if idx < len(bubbles) - 1:
+                                time.sleep(0.15)
+                        if (
+                            t_resp.sticker_path
+                            and t_resp.sticker_path.is_file()
+                            and t_resp.sticker_path.stat().st_size > 0
+                        ):
+                            time.sleep(0.15)
+                            self._safe_send_file(wx, str(t_resp.sticker_path.resolve()), t_group)
+                except Exception as exc:
+                    logger.warning("冷场找话题发送异常: %s", exc)
+
                 # 1. 每 15 秒检查到点的用户定时任务
                 if (now_loop - last_schedule_check) >= 15:
                     last_schedule_check = now_loop

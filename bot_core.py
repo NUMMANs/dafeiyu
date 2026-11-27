@@ -16,7 +16,7 @@ from agent_tools import (
     send_existing_file,
     write_local_file,
 )
-from brain import brain
+from brain import brain, split_human_bubbles
 from config import BASE_DIR, settings, DATA_DIR
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
@@ -37,6 +37,7 @@ from scheduler import scheduler
 import tuning
 from self_ops import git_pull_and_check, request_restart, self_edit_code
 from sticker_manager import sticker_manager
+import topic_bubble
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,11 @@ class DaFeiYuBotCore:
         # 刚干完的后台活（群号 → {job_id, task, status, summary, artifacts, at}）。
         # 用来在后续几轮里给模型一个明确归属：这活是她自己干的，不是群友干的。
         self._dsh_done: dict[str, dict] = {}
+        # 冷场找话题：后台搜索任务（群号 → {ts, ready, text, topic, mood}）与每群上次尝试时间。
+        # 搜索+两次模型调用要十几秒，放后台线程跑，结果由 poll_topic_share 取回来在主循环里发。
+        self._topic_jobs: dict[str, dict] = {}
+        self._topic_lock = threading.Lock()
+        self._last_topic_attempt_ts: dict[str, float] = {}
 
     def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
         return sticker_manager.pick_sticker(mood, caption=caption)
@@ -2341,6 +2347,9 @@ class DaFeiYuBotCore:
                     content=bubble.text,
                     sticker_url=sticker_url,
                 )
+                # 自己刚冒过泡：把「群里最后的动静」推到现在，避免紧接着又触发冷场找话题
+                self._last_group_activity_ts[group_id] = now
+                self._last_topic_attempt_ts[group_id] = now
                 return BotResponse(
                     should_reply=True,
                     text=bubble.text,
@@ -2367,6 +2376,9 @@ class DaFeiYuBotCore:
                     content=bubble.text,
                     sticker_url=sticker_url,
                 )
+                # 同上：晚间问候之后不要马上又来一条「分享」
+                self._last_group_activity_ts[group_id] = now
+                self._last_topic_attempt_ts[group_id] = now
                 return BotResponse(
                     should_reply=True,
                     text=bubble.text,
@@ -2376,7 +2388,134 @@ class DaFeiYuBotCore:
                     status=status,
                 )
 
+        # 3. 冷场找话题：安静够久就上网找个自己感兴趣的东西分享（后台线程搜索，结果下次巡检前取回）
+        self._maybe_start_topic_share(group_id, status, now)
         return None
+
+    def _maybe_start_topic_share(self, group_id: str, status: PetStatus, now: float) -> None:
+        """判定这一轮要不要「上网找话题」，要就起一个后台线程。
+
+        不设每日次数上限（用户要求），只靠两道闸：群里真的安静够久、离上次尝试够远。
+        失败也记一次尝试时间，否则搜索挂掉时会每 5 分钟重试一遍，把搜索配额打光。
+        """
+        if not settings.ENABLE_TOPIC_SHARE or self.is_quiet_hours():
+            return
+        with self._topic_lock:
+            if group_id in self._topic_jobs:
+                return
+        last_act = self._last_group_activity_ts.get(group_id)
+        if last_act is None:
+            # 进程刚重启时没有基线：以此刻为起点，别一上线就往群里塞话题
+            self._last_group_activity_ts[group_id] = now
+            return
+        silence_sec = tuning.get_int(
+            "TOPIC_SHARE_SILENCE_MIN", settings.TOPIC_SHARE_SILENCE_MIN
+        ) * 60
+        cooldown_sec = tuning.get_int(
+            "TOPIC_SHARE_COOLDOWN_MIN", settings.TOPIC_SHARE_COOLDOWN_MIN
+        ) * 60
+        if (now - last_act) < silence_sec:
+            return
+        if (now - self._last_topic_attempt_ts.get(group_id, 0.0)) < cooldown_sec:
+            return
+        # 自己刚说过话又没人接，就别再补一条——那正是「自说自话」
+        if (now - self._last_bot_reply_ts.get(group_id, 0.0)) < max(1800, silence_sec):
+            return
+        self._last_topic_attempt_ts[group_id] = now
+        with self._topic_lock:
+            self._topic_jobs[group_id] = {"ts": now, "ready": False, "status": status}
+        threading.Thread(
+            target=self._topic_share_worker,
+            args=(group_id, status),
+            daemon=True,
+            name=f"topic-share-{group_id[:8]}",
+        ).start()
+        logger.info("[%s] 🌐 群里安静了 %.0f 分钟，去网上找个话题", group_id, (now - last_act) / 60)
+
+    def _topic_share_worker(self, group_id: str, status: PetStatus) -> None:
+        """后台线程：读最近聊天 → 出关键词 → 搜索 → 写一句话，结果放回 _topic_jobs。"""
+        try:
+            rows = pet_engine.get_recent_history(group_id, limit=24)
+            lines: list[str] = []
+            for r in rows:
+                who = settings.BOT_NAME if r.get("role") == "assistant" else (r.get("sender") or "群友")
+                body = " ".join(str(r.get("content") or "").split())[:80]
+                if body:
+                    lines.append(f"[{who}]: {body}")
+            out = topic_bubble.compose(brain, group_id, lines)
+            with self._topic_lock:
+                job = self._topic_jobs.get(group_id)
+                if job is None:
+                    return  # 已被超时清理，迟到的结果不再发
+                if not out:
+                    self._topic_jobs.pop(group_id, None)
+                    return
+                job.update(
+                    {
+                        "ready": True,
+                        "text": out["text"],
+                        "topic": out["topic"],
+                        "mood": out["mood"],
+                        "source": out.get("source", ""),
+                    }
+                )
+            logger.info(
+                "[%s] 🌐 冷场话题备好了（%s）：%s",
+                group_id,
+                out["topic"],
+                out["text"][:60],
+            )
+        except Exception as exc:  # noqa: BLE001 - 后台线程不能把异常抛给主循环
+            logger.warning("[%s] 冷场找话题后台任务异常: %s", group_id, exc)
+            with self._topic_lock:
+                self._topic_jobs.pop(group_id, None)
+
+    def poll_topic_share(self) -> list[tuple[str, BotResponse]]:
+        """主循环每秒调一次：把后台搜好的话题取回来，组装成要发的消息（发送仍在主线程）。"""
+        now = time.time()
+        ready: list[tuple[str, dict]] = []
+        with self._topic_lock:
+            for gid, job in list(self._topic_jobs.items()):
+                if job.get("ready"):
+                    ready.append((gid, job))
+                    self._topic_jobs.pop(gid, None)
+                elif (now - float(job.get("ts") or now)) > 240:
+                    self._topic_jobs.pop(gid, None)  # 卡死清理，避免这个群永远不再触发
+                    logger.warning("[%s] 冷场找话题超过 4 分钟没结果，放弃这一轮", gid)
+        out: list[tuple[str, BotResponse]] = []
+        for gid, job in ready:
+            text = str(job.get("text") or "").strip()
+            if not text:
+                continue
+            bubbles = split_human_bubbles(text)
+            mood = str(job.get("mood") or "happy")
+            sticker = self._maybe_pick_sticker(mood)
+            sticker_url = sticker_manager.to_web_url(sticker)
+            pet_engine.append_history(
+                group_id=gid,
+                sender=settings.BOT_NAME,
+                role="assistant",
+                content=text,
+                sticker_url=sticker_url,
+            )
+            # 她自己发的这条也算「群里刚有动静」：否则下个心跳可能又判定安静而连着开新话题
+            self._last_group_activity_ts[gid] = now
+            self._last_bot_reply_ts[gid] = now
+            out.append(
+                (
+                    gid,
+                    BotResponse(
+                        should_reply=True,
+                        text=text,
+                        bubbles=bubbles,
+                        sticker_path=sticker,
+                        sticker_url=sticker_url,
+                        mood=mood,
+                        status=job.get("status") or pet_engine.get_status(),
+                    ),
+                )
+            )
+        return out
 
     def execute_scheduled_task(self, task: dict) -> BotResponse:
         """执行一条已到点的定时任务（支持直接提醒或 AI 自主执行联网/电脑任务）"""
