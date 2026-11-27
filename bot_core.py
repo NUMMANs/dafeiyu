@@ -929,7 +929,7 @@ class DaFeiYuBotCore:
             st = pet_engine.get_status()
             diaries = memory_store.read_recent_diaries(limit=3, group_id=group_id)
             if not diaries:
-                reply_text = f"📔 还没写过日记呢，每晚 23:45 之后会自动写一篇今天的群聊日记！"
+                reply_text = f"📔 还没写过日记呢，每晚 0:45 的夜间复盘会写一篇今天的群聊日记！"
             else:
                 lines = ["📔 【大肥鱼最近日记】"]
                 for d in diaries:
@@ -2135,50 +2135,20 @@ class DaFeiYuBotCore:
         phase: str = "main",
     ) -> dict:
         """
-        四层记忆夜间养护：素材=当天全部消息 → L2 日记（按群）→ L1 提炼 → 巩固/周结/备份。
+        四层记忆夜间养护。
 
-        `MEMORY_NIGHTLY_WRITER` 决定内容由谁生成：
-          - bot（默认）：机器人自己调模型写；
-          - external：白天 23:45 这轮不写内容，交给 WorkBuddy 的定时任务写，
-            机器人只在凌晨发现「这一天没人写过」时用全天素材兜底补一次。
-        某群当天没有聊天记录时不占当天名额，留给下一个有内容的群。
+        `MEMORY_NIGHTLY_WRITER` 决定 L1/L2 的内容由谁生成：
+          - external（默认）：内容全部交给 WorkBuddy 的 0:15 / 0:45 夜间复盘任务，
+            机器人一行 L1/L2 内容都不生成，这里只做巩固（权重归一/合并/淘汰）+ 备份；
+          - bot：机器人自己调模型写 L2 日记 + 提炼 L1（旧行为）。
+        `MEMORY_NIGHTLY_FALLBACK=1` 时才在凌晨用全天素材兜底补写（默认关：00:02 的兜底会
+        抢在定时任务前面写掉当天的日记和 L1 额度，任务再写就撞去重和自然日上限）。
         """
         dt = datetime.now()
         logical_day = logical_day or dt.strftime("%Y-%m-%d")
         phase = phase if phase in ("main", "late") else "main"
         status = status or pet_engine.get_status()
-        material = self._collect_day_material(group_id, logical_day)
-        if not material:
-            logger.info(
-                "[%s] 夜间养护跳过：%s 该群没有聊天记录，等有内容的群再跑", group_id, logical_day
-            )
-            return {"skipped": "empty_history"}
-
-        state = self._nightly_state()
-        main_done = bool(state.get(group_id, {}).get(logical_day, {}).get("main"))
-        writer = (settings.MEMORY_NIGHTLY_WRITER or "bot").lower()
-        need_diary = not self._has_diary_on(group_id, logical_day)
-        start_ts, end_ts = self._day_bounds(logical_day)
-        need_facts = memory_store.count_writes_between(start_ts, end_ts) == 0
-
-        if writer == "bot":
-            do_diary = phase == "main" or (phase == "late" and not main_done and need_diary)
-            do_facts = phase == "main" or (phase == "late" and not main_done and need_facts)
-        else:
-            # 外部写入：23:45 不动手，只做巩固/备份；凌晨看有没有人写过，没写才兜底
-            do_diary = phase == "late" and need_diary
-            do_facts = phase == "late" and need_facts
-
-        logger.info(
-            "[%s] 🌙 夜间养护 %s（%s 阶段，全天消息 %d 条，写入方=%s，日记=%s，L1=%s）",
-            group_id,
-            logical_day,
-            phase,
-            len(material),
-            writer,
-            "写" if do_diary else "跳过",
-            "写" if do_facts else "跳过",
-        )
+        writer = (settings.MEMORY_NIGHTLY_WRITER or "external").lower()
         result: dict = {
             "diary": False,
             "facts": 0,
@@ -2188,6 +2158,51 @@ class DaFeiYuBotCore:
             "phase": phase,
             "writer": writer,
         }
+
+        if writer != "bot" and not settings.MEMORY_NIGHTLY_FALLBACK:
+            # 只维护不产内容：不取素材、不调模型，L1/L2 全部归夜间定时任务
+            logger.info(
+                "[%s] 🌙 夜间维护 %s（%s 阶段，写入方=external：L1/L2 交给夜间定时任务，这里只巩固+备份）",
+                group_id,
+                logical_day,
+                phase,
+            )
+            self._nightly_housekeeping(logical_day, result)
+            self._mark_nightly_done(group_id, logical_day, phase)
+            return result
+
+        material = self._collect_day_material(group_id, logical_day)
+        if not material:
+            logger.info(
+                "[%s] 夜间养护跳过：%s 该群没有聊天记录，等有内容的群再跑", group_id, logical_day
+            )
+            return {"skipped": "empty_history"}
+
+        state = self._nightly_state()
+        main_done = bool(state.get(group_id, {}).get(logical_day, {}).get("main"))
+        need_diary = not self._has_diary_on(group_id, logical_day)
+        start_ts, end_ts = self._day_bounds(logical_day)
+        need_facts = memory_store.count_writes_between(start_ts, end_ts) == 0
+
+        if writer == "bot":
+            do_diary = phase == "main" or (phase == "late" and not main_done and need_diary)
+            do_facts = phase == "main" or (phase == "late" and not main_done and need_facts)
+        else:
+            # external + 显式打开兜底：只有凌晨发现这一天什么都没写时才补一次
+            do_diary = phase == "late" and need_diary
+            do_facts = phase == "late" and need_facts
+
+        logger.info(
+            "[%s] 🌙 夜间养护 %s（%s 阶段，全天消息 %d 条，写入方=%s%s，日记=%s，L1=%s）",
+            group_id,
+            logical_day,
+            phase,
+            len(material),
+            writer,
+            "（兜底已开）" if writer != "bot" else "",
+            "写" if do_diary else "跳过",
+            "写" if do_facts else "跳过",
+        )
         if do_diary:
             try:
                 result["diary"] = brain.write_daily_diary(
@@ -2223,22 +2238,35 @@ class DaFeiYuBotCore:
         except Exception as exc:
             logger.warning("[%s] 周结生成异常: %s", group_id, exc)
         # 巩固 + 备份跟群无关，全局每天只做一次（否则两个群会重复备份、互相覆盖）
-        if self._last_nightly_date != logical_day:
-            self._last_nightly_date = logical_day
-            try:
-                result["consolidate"] = memory_store.consolidate()
-            except Exception as exc:
-                logger.warning("L1 夜间巩固异常: %s", exc)
-            try:
-                result["backup"] = str(memory_store.backup_memory(keep_last=7) or "")
-            except Exception as exc:
-                logger.warning("记忆备份异常: %s", exc)
+        self._nightly_housekeeping(logical_day, result)
 
         # 记进度：同一个群同一个逻辑日同一阶段只跑一次（进程重启也不重跑）
+        self._mark_nightly_done(group_id, logical_day, phase)
+        return result
+
+    def _nightly_housekeeping(self, logical_day: str, result: dict) -> None:
+        """夜间巩固 + 备份：全局每个逻辑日只跑一次，两个群不重复做。
+
+        只做「合并/淘汰/压权重」和打包备份，不新增任何 L1/L2 内容——
+        内容由夜间定时任务负责，这里碰了就会和任务抢额度。
+        """
+        if self._last_nightly_date == logical_day:
+            return
+        self._last_nightly_date = logical_day
+        try:
+            result["consolidate"] = memory_store.consolidate()
+        except Exception as exc:
+            logger.warning("L1 夜间巩固异常: %s", exc)
+        try:
+            result["backup"] = str(memory_store.backup_memory(keep_last=7) or "")
+        except Exception as exc:
+            logger.warning("记忆备份异常: %s", exc)
+
+    def _mark_nightly_done(self, group_id: str, logical_day: str, phase: str) -> None:
+        state = self._nightly_state()
         state.setdefault(group_id, {}).setdefault(logical_day, {})[phase] = time.time()
         self._save_nightly_state(state)
         self._last_nightly_group_day[group_id] = f"{logical_day}:{phase}"
-        return result
 
     def check_autonomous_heartbeat(self, group_id: str) -> BotResponse | None:
         """

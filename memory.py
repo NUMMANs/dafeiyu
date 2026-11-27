@@ -191,9 +191,9 @@ class FourLayerMemory:
     ) -> tuple[bool, str]:
         """写入一条记忆节点到 L1 识海（带隐私过滤、权限检查、每日 8 条上限、去重）
 
-        ignore_daily_limit 只给夜间提炼用：00:02 的自动养护会先写掉几条，
-        0:45 的复盘再按自然日数就被挤到没额度了。夜间任务本身有 6 条/晚的
-        提示词约束和 8 条代码上限，不属于「日常自发膨胀」。
+        ignore_daily_limit 只给夜间提炼用：L1 现在只由夜间复盘任务（0:45）写，
+        任务本身有 6 条/晚的提示词约束和 8 条代码上限，不属于「日常自发膨胀」，
+        不该被自然日额度挡住。
         """
         clean_text = (text or "").strip()[:200]
         if len(clean_text) < 3:
@@ -466,7 +466,8 @@ class FourLayerMemory:
     # L2 日记与周结
     # ========================
     def count_writes_between(self, start_ts: float, end_ts: float) -> int:
-        """统计某时间段内新写入的 L1 节点数（夜间兜底用它判断「这一天有没有人写过」）。"""
+        """统计某时间段内新写入的 L1 节点数（凌晨兜底用它判断「这一天有没有人写过」，
+        兜底默认关，只有 MEMORY_NIGHTLY_FALLBACK=1 时才会用到）。"""
         cnt = 0
         with self._lock:
             for n in self._graph["nodes"]:

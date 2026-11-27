@@ -91,9 +91,13 @@ class Settings:
     MEMORY_NIGHTLY_EXTRACT: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_EXTRACT"), True)
     # 夜间 L1/L2 的内容由谁生成：
     #   bot      = 机器人自己调 DeepSeek 提炼/写日记（原来的做法）
-    #   external = 交给外部（WorkBuddy 定时任务）写，机器人只做巩固+备份；
-    #              凌晨 0~4 点若发现这一天什么都没写，机器人再用全天素材兜底补一次
-    MEMORY_NIGHTLY_WRITER: str = (os.getenv("MEMORY_NIGHTLY_WRITER", "bot").strip().lower() or "bot")
+    #   external = 只由 WorkBuddy 夜间定时任务写，机器人一行 L1/L2 内容都不生成，
+    #              夜间只做巩固（合并/淘汰）+ 备份（2026-11-27 起默认）
+    MEMORY_NIGHTLY_WRITER: str = (os.getenv("MEMORY_NIGHTLY_WRITER", "external").strip().lower() or "external")
+    # 外部写作为主时，机器人是否还在凌晨兜底补写 L1/L2。
+    # 默认关：00:02 的兜底会抢在 0:15/0:45 两个任务之前写掉一条日记和 6 条 L1，
+    # 导致任务再写就撞去重和自然日上限，写出来的东西也不如任务复盘过的。要兜底设 true。
+    MEMORY_NIGHTLY_FALLBACK: bool = _parse_bool(os.getenv("MEMORY_NIGHTLY_FALLBACK"), False)
     # 夜间提炼：一天最多落几条 L1（写库还要过 memory.remember 的每日 8 条上限）
     NIGHTLY_FACT_MAX: int = max(1, int(os.getenv("NIGHTLY_FACT_MAX", "6")))
     # 夜间提炼：每段多少条消息（全天切成多段逐段提炼，避免只看到睡前 40 条）
