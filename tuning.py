@@ -81,6 +81,10 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "LIFE_SHARE_PROB": (0.0, 1.0),
     # 生活分享正文最多多少字
     "LIFE_MAX_CHARS": (30, 120),
+    # 气泡：单条最多多少字（超过按句号切）、一次回复最多几条。
+    # 微信里真人一条基本 10~30 字，超了不像打字像贴文；条数太多就是刷屏。
+    "BUBBLE_MAX_CHARS": (12, 60),
+    "BUBBLE_MAX_COUNT": (1, 8),
 
     # ---- 注入方式（夜间「记忆与人格」任务负责）----
     # L3 注文：后台工具读懂链接/图片后留下的话，每轮最多几条、每条多少字、总开关。
@@ -107,6 +111,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "TRIGGER_BURST_MAX_ITEMS", "VISION_SUMMARY_CHARS",
         "TOPIC_SHARE_SILENCE_MIN", "TOPIC_SHARE_COOLDOWN_MIN", "TOPIC_SHARE_MAX_CHARS",
         "TOPIC_SHARE_LINK_PROB", "LIFE_SHARE_PROB", "LIFE_MAX_CHARS",
+        "BUBBLE_MAX_CHARS", "BUBBLE_MAX_COUNT",
     ),
     "mind": (
         "RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS",
@@ -139,6 +144,8 @@ STEP_LIMITS: dict[str, float] = {
     "TOPIC_SHARE_LINK_PROB": 0.2,
     "LIFE_SHARE_PROB": 0.2,
     "LIFE_MAX_CHARS": 15,
+    "BUBBLE_MAX_CHARS": 6,
+    "BUBBLE_MAX_COUNT": 1,
     "L3_NOTE_MAX_ITEMS": 1,
     "L3_NOTE_MAX_CHARS": 60,
     "L3_INJECT_ON": 1,

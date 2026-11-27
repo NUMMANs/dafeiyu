@@ -223,31 +223,96 @@ class BrainReply:
     vision_summary: str = ""
 
 
+# 句末符号后天然可以断一条气泡；太长了再退到逗号处断。
+_SENT_END_RE = re.compile(r"(?<=[。！？!?…])")
+_CLAUSE_END_RE = re.compile(r"(?<=[，,、；;：:])")
+_TRAIL_JUNK = "，,、；;：:。 　"
+
+# 气泡默认值（可在 data/tuning.json 里热调，夜间感官任务管）
+BUBBLE_MAX_CHARS_DEFAULT = 30
+BUBBLE_MAX_COUNT_DEFAULT = 6
+
+
+def _pack_pieces(pieces: list[str], limit: int) -> list[str]:
+    """把若干小片贪心塞进不超过 limit 字的气泡，尽量不把一句话拦腰截断。"""
+    out: list[str] = []
+    cur = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if not cur:
+            cur = piece
+        elif len(cur) + len(piece) <= limit:
+            cur += piece
+        else:
+            out.append(cur)
+            cur = piece
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _split_long_bubble(text: str, limit: int) -> list[str]:
+    """超长的一条按「句末 → 逗号 → 硬切」三层降级拆开。"""
+    if limit <= 0 or len(text) <= limit:
+        return [text]
+    chunks = _pack_pieces([x for x in _SENT_END_RE.split(text) if x.strip()], limit)
+    out: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= limit:
+            out.append(chunk)
+            continue
+        out.extend(_pack_pieces([x for x in _CLAUSE_END_RE.split(chunk) if x.strip()], limit))
+    # 整句一个标点都没有（比如连着一串字/链接）：只能硬切，否则又发成一大段
+    final: list[str] = []
+    for chunk in out:
+        while len(chunk) > limit:
+            final.append(chunk[:limit])
+            chunk = chunk[limit:]
+        if chunk:
+            final.append(chunk)
+    return final
+
+
 def split_human_bubbles(text: str) -> list[str]:
-    """
-    借鉴 MaiBot / KouriChat 的「拟人分段发送」机制：
-    将回复拆成 1~3 条短微信气泡，去掉刻板的句末句号，模拟真人手机打字连发。
+    """把一条回复拆成几条微信气泡，模拟真人手机打字连发。
+
+    拆分顺序（模型怎么编排、代码怎么兜底）：
+    1. 模型自己用 `||` 分段时，按 `||` 走——她编排的分段最自然，代码只管长度兜底；
+    2. 没有 `||` 就按换行分；
+    3. 每一段再按 `BUBBLE_MAX_CHARS`（默认 30 字，tuning 可热调）拆：先句末，
+       再逗号，最后才硬切——保证发出去的每一条都不会是一大坨；
+    4. 最多 `BUBBLE_MAX_COUNT`（默认 6）条，超出的并进最后一条，防止刷屏。
+
+    段与段之间的停顿不在这里做，由发送层（adapters/wxauto_adapter.py `_send_bubbles`）
+    按字数算打字时间，这里只负责「切多长、切几条」。
     """
     raw = (text or "").strip()
     if not raw:
         return []
-    if "||" in raw:
-        parts = [p.strip() for p in raw.split("||") if p.strip()]
-    else:
-        # 若模型没输出 ||，按换行拆成最多 3 段短气泡
-        parts = [p.strip() for p in raw.splitlines() if p.strip()]
+    max_chars = tuning.get_int("BUBBLE_MAX_CHARS", BUBBLE_MAX_CHARS_DEFAULT)
+    max_count = max(1, tuning.get_int("BUBBLE_MAX_COUNT", BUBBLE_MAX_COUNT_DEFAULT))
 
-    # 限制最多 3 条气泡，防止刷屏；若超过则合并末尾
-    if len(parts) > 3:
-        parts = parts[:2] + [" ".join(parts[2:])]
+    sep = "||" if "||" in raw else "\n"
+    parts = [p.strip() for p in raw.split(sep) if p.strip()]
 
-    cleaned: list[str] = []
-    for p in parts:
-        # 真人微信聊天很少在每句话末尾打正式句号
-        p = p.rstrip("。")
-        if p:
-            cleaned.append(p)
-    return cleaned or [raw]
+    expanded: list[str] = []
+    for part in parts:
+        part = part.rstrip("。").strip()
+        if part:
+            expanded.extend(_split_long_bubble(part, max_chars))
+
+    # 真人微信聊天很少在每句话末尾打正式句号；顺便把断句留下的逗号尾巴收掉
+    cleaned = [p.strip().rstrip(_TRAIL_JUNK) for p in expanded]
+    cleaned = [p for p in cleaned if p]
+    if not cleaned:
+        return [raw]
+
+    if len(cleaned) > max_count:
+        tail = "，".join(cleaned[max_count - 1:]).strip().rstrip(_TRAIL_JUNK)
+        cleaned = cleaned[: max_count - 1] + ([tail] if tail else [])
+    return cleaned
 
 
 def _encode_image_data_url(image_path: Path) -> str:

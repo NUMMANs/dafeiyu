@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+from brain import split_human_bubbles
 from bot_core import bot_core
 from config import BASE_DIR, UPLOADS_DIR, settings
 import gitmeta
@@ -113,6 +114,41 @@ class WxAutoAdapter:
         except Exception as exc:
             logger.warning("[%s] %s失败: %s", target, action, exc)
             return False
+
+    def _bubble_gap(self, prev_text: str) -> float:
+        """两条气泡之间等多久：当上一条是她一个字一个字敲出来的。
+
+        固定 0.15 秒的连发读起来像机器人在倒豆子；这里按上一条的字数算打字时间，
+        再加 ±15% 抖动，长短句之间的节奏才不会一模一样。上下限兜住极端值：
+        太短显得手速不似人类，太长（一条 60 字的气泡要 5 秒）群里会以为她掉线。
+        """
+        chars = len((prev_text or "").strip())
+        gap = settings.BUBBLE_GAP_BASE_SEC + chars * settings.BUBBLE_GAP_PER_CHAR_SEC
+        gap *= random.uniform(0.85, 1.15)
+        return max(settings.BUBBLE_GAP_MIN_SEC, min(settings.BUBBLE_GAP_MAX_SEC, gap))
+
+    def _send_bubbles(self, wx, texts: list[str], who: str, action: str = "发送") -> bool:
+        """按顺序发一串气泡，条与条之间留出真实的打字停顿。返回是否发出去过。
+
+        这一串最多磨蹭十来秒：超过之后剩下的走最小间隔，否则一轮巡检（1 秒）
+        会被一条长回复拖住，消息、定时任务都跟着晚。
+        """
+        sent_any = False
+        prev = ""
+        started = time.time()
+        for idx, bubble in enumerate(texts):
+            text = (bubble or "").strip()
+            if not text:
+                continue
+            if idx and sent_any:
+                gap = self._bubble_gap(prev)
+                if time.time() - started > 12:
+                    gap = min(gap, settings.BUBBLE_GAP_MIN_SEC)
+                time.sleep(gap)
+            if self._safe_send(wx, text, who, action):
+                sent_any = True
+                prev = text
+        return sent_any
 
     def _clean_group_text(self, raw: str) -> str:
         text = (raw or "").strip()
@@ -355,12 +391,13 @@ class WxAutoAdapter:
         bubbles = resp.get_bubbles()
         logger.info("[%s] 大肥鱼准备分段回复 %s (%d条): %s", group_name, sender, len(bubbles), resp.text[:80])
         for idx, bubble in enumerate(bubbles):
+            if idx:
+                # 逐条发、条间按下一条之前的打字时间停顿（长度按上一条算）
+                time.sleep(self._bubble_gap(bubbles[idx - 1]))
             chat.SendMsg(bubble)
-            if idx < len(bubbles) - 1:
-                time.sleep(0.15)
 
         if resp.sticker_path and resp.sticker_path.is_file() and resp.sticker_path.stat().st_size > 0:
-            time.sleep(0.15)
+            time.sleep(0.3)
             sticker_abs = str(resp.sticker_path.resolve())
             if hasattr(chat, "SendFiles"):
                 send_res = chat.SendFiles(sticker_abs)
@@ -479,13 +516,10 @@ class WxAutoAdapter:
                             self._reject_group(target_group, "停顿后接话")
                             continue
                         logger.info("[%s] 停顿后接话: %s", target_group, (d_resp.text or "")[:80])
-                        bubbles = d_resp.get_bubbles()
-                        for idx, b in enumerate(bubbles):
-                            self._safe_send(wx, b, target_group, "停顿后接话")
-                            if idx < len(bubbles) - 1:
-                                time.sleep(0.15)
+                        # 气泡按字数逐条发、条间留打字停顿（见 _send_bubbles）
+                        self._send_bubbles(wx, d_resp.get_bubbles(), target_group, "停顿后接话")
                         if d_resp.sticker_path and d_resp.sticker_path.is_file() and d_resp.sticker_path.stat().st_size > 0:
-                            time.sleep(0.15)
+                            time.sleep(0.3)
                             self._safe_send_file(wx, str(d_resp.sticker_path.resolve()), target_group)
                 except Exception as exc:
                     logger.warning("去抖判定发送异常: %s", exc)
@@ -499,17 +533,13 @@ class WxAutoAdapter:
                             self._reject_group(t_group, "冷场找话题")
                             continue
                         logger.info("[%s] 🌐 冷场分享: %s", t_group, (t_resp.text or "")[:80])
-                        bubbles = t_resp.get_bubbles()
-                        for idx, b in enumerate(bubbles):
-                            self._safe_send(wx, b, t_group, "冷场找话题")
-                            if idx < len(bubbles) - 1:
-                                time.sleep(0.15)
+                        self._send_bubbles(wx, t_resp.get_bubbles(), t_group, "冷场找话题")
                         if (
                             t_resp.sticker_path
                             and t_resp.sticker_path.is_file()
                             and t_resp.sticker_path.stat().st_size > 0
                         ):
-                            time.sleep(0.15)
+                            time.sleep(0.3)
                             self._safe_send_file(wx, str(t_resp.sticker_path.resolve()), t_group)
                 except Exception as exc:
                     logger.warning("冷场找话题发送异常: %s", exc)
@@ -529,17 +559,13 @@ class WxAutoAdapter:
                             logger.info("⏰ 触发定时任务 #%s -> [%s]: %s", task.get("id"), target_group, task.get("content"))
                             t_resp = bot_core.execute_scheduled_task(task)
                             if t_resp and t_resp.should_reply:
-                                bubbles = t_resp.get_bubbles()
-                                for idx, b in enumerate(bubbles):
-                                    self._safe_send(wx, b, target_group, "定时任务")
-                                    if idx < len(bubbles) - 1:
-                                        time.sleep(0.15)
+                                self._send_bubbles(wx, t_resp.get_bubbles(), target_group, "定时任务")
                                 if (
                                     t_resp.sticker_path
                                     and t_resp.sticker_path.is_file()
                                     and t_resp.sticker_path.stat().st_size > 0
                                 ):
-                                    time.sleep(0.15)
+                                    time.sleep(0.3)
                                     ok = self._safe_send_file(wx, str(t_resp.sticker_path.resolve()), target_group)
                                     logger.info("⏰ 定时任务发送附件 [%s] 结果: %s", t_resp.sticker_path.name, ok)
                         except Exception as exc:
@@ -567,11 +593,13 @@ class WxAutoAdapter:
                                     group,
                                     (hb.text or (hb.file_path.name if hb.file_path else ""))[:80],
                                 )
-                                if hb.text and not self._safe_send(wx, hb.text, group, "自主冒泡"):
+                                # 自主冒泡也走气泡：单独发 hb.text 会把多段拼成一大条
+                                sent = self._send_bubbles(wx, hb.get_bubbles(), group, "自主冒泡")
+                                if hb.text and not sent:
                                     continue
                                 # 每日统计 txt 之类需要以文件形式发出的附件
                                 if hb.file_path and hb.file_path.is_file():
-                                    time.sleep(0.2)
+                                    time.sleep(0.3)
                                     logger.info("[%s] 发送文件: %s", group, hb.file_path.name)
                                     self._safe_send_file(wx, str(hb.file_path.resolve()), group)
                                 if hb.sticker_path and hb.sticker_path.is_file():
@@ -731,7 +759,9 @@ class WxAutoAdapter:
                                     f"\n\n（另外：这次干活越界动了项目里 {len(guard_violations)} 个文件，"
                                     f"{handled}。）"
                                 )
-                            if not self._safe_send(wx, spoken, target_group, "DSH 任务投递"):
+                            if not self._send_bubbles(
+                                wx, split_human_bubbles(spoken), target_group, "DSH 任务投递"
+                            ):
                                 continue
                             logger.info(
                                 "🤖 已投递 DSH 任务 #%s 结果到 [%s]（播报 %d 字｜产出文件 %d 个｜报告 %s）",
@@ -820,13 +850,9 @@ class WxAutoAdapter:
                         self._reject_group(target_group, "停顿后接话")
                         continue
                     logger.info("[%s] 停顿后接话: %s", target_group, (d_resp.text or "")[:80])
-                    bubbles = d_resp.get_bubbles()
-                    for idx, b in enumerate(bubbles):
-                        self._safe_send(wx, b, target_group, "停顿后接话")
-                        if idx < len(bubbles) - 1:
-                            time.sleep(0.15)
+                    self._send_bubbles(wx, d_resp.get_bubbles(), target_group, "停顿后接话")
                     if d_resp.sticker_path and d_resp.sticker_path.is_file() and d_resp.sticker_path.stat().st_size > 0:
-                        time.sleep(0.15)
+                        time.sleep(0.3)
                         self._safe_send_file(wx, str(d_resp.sticker_path.resolve()), target_group)
 
                 listen_msgs = wx.GetListenMessage()

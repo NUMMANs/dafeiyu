@@ -254,7 +254,7 @@ uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
 3. **图片解密**：`MediaDownloader.download_image(tier="full"/"best")`，最多 4 次、每次失败 `sleep(1.2)`；回退 `msg.download()`；再回退“content 就是本地路径”（`:138-182`）。
 4. **XML 解析**：处理微信引用回复 `type=57` 与合并转发 `type=19`，提取 `displayname` 作为 `quoted_sender`（`:58-120`）。
 5. **消息分发**：过滤 self/system/time/recall；群聊遵守 `GROUP_AT_ONLY`，私聊 `force_trigger=True`；图片消息与文本消息分别调用 `bot_core.handle_message`（`:220-266`）。
-6. **发送**：按 `resp.get_bubbles()` 逐条 `chat.SendMsg`，每条间隔 0.15s；附件优先 `SendFiles`，回退 `SendImage`（`:268-286`）。
+6. **发送**：按 `resp.get_bubbles()` 逐条 `_send_bubbles`，条间按「上一条字数」等打字时间（`BUBBLE_GAP_BASE_SEC + 字数 × BUBBLE_GAP_PER_CHAR_SEC`，±15% 抖动，夹在 MIN/MAX）；附件优先 `SendFiles`，回退 `SendImage`（`:268-286`）。
 7. **后台循环**（关键，见 3.11~3.13）：每 15s 取定时任务、每 300s 做主动冒泡与夜间养护、每 `AUTO_GIT_POLL_SEC` 检查 Git、每 5s 投递 DSH 完成结果（`:350-453`）。
 
 优点：
@@ -384,7 +384,7 @@ uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
 5. **文本分支**：命中 `PRE_SEARCH_CUES`（最新/今天/天气/价格/攻略/比赛…）时先联网搜索，把结果拼进同一条 user 消息，省掉一次工具往返（`:572-593`）。
 6. **构建请求**：按场景调温度/频率/存在惩罚；普通回复 `max_tokens=260`、视觉 800、Owner 非视觉 4096；工具列表 = 10 个内容工具（非 Owner）+ 15 个桌面/自运维工具（Owner），共最多 25 个（`:598-626`）。
 7. **Function Calling 循环**：最多 4 轮，每轮最多处理前 3 个 `tool_calls`；工具涵盖搜索、记忆、黑话、人格进化、定时、历史图片、搜图、下载图、Shell、读写文件、截屏、系统信息、网页抓取、生成文件、发送文件、自更新、自修改、重启、DSH 派发/查询（`:632-921`）。
-8. **输出解析**：剥离 `[MOOD:xxx|配字]`，去掉 Markdown 粗体/标题/反引号，按 `||` 或换行拆成最多 3 条气泡（`:425-434/267-291`）。
+8. **输出解析**：剥离 `[MOOD:xxx|配字]`，去掉 Markdown 粗体/标题/反引号，按 `||` 或换行分段，再按 `BUBBLE_MAX_CHARS`（默认 30 字，句末→逗号→硬切）拆到每条不超长，最多 `BUBBLE_MAX_COUNT`（默认 6）条（`:425-434/267-291`）。
 9. **异常兜底**：捕获所有异常，把“大脑断网了/看图接口抽风了（err[:100]）”直接发到群里（`:936-942`）。
 
 #### 3.5.2 设计亮点

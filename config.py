@@ -21,6 +21,16 @@ def _parse_bool(val: str | None, default: bool = True) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_float(val: str | None, default: float) -> float:
+    """浮点环境变量：写错/留空都回默认值，启动不该因为一个手滑的数字挂掉。"""
+    if val is None or not str(val).strip():
+        return default
+    try:
+        return float(str(val).strip())
+    except ValueError:
+        return default
+
+
 def _parse_list(val: str | None, default: list[str]) -> list[str]:
     if not val:
         return default
@@ -249,6 +259,14 @@ class Settings:
         x.strip() for x in os.getenv("QQ_GROUP_WHITELIST", "").split(",") if x.strip()
     ]
     QQ_ONEBOT_TOKEN: str = os.getenv("QQ_ONEBOT_TOKEN", "").strip()
+
+    # 分段发送的节奏：真人不会「嗒」一下把三条气泡同时甩出来，中间那段是打字时间。
+    # 第 n 条发完到第 n+1 条之间 = 基础停顿 + 上一条字数 × 每字打字时间，再乘一点抖动。
+    # 默认 0.5s + 0.075s/字（约等于手机上手打 13 字/秒），夹在 0.6~4.5 秒之间。
+    BUBBLE_GAP_BASE_SEC: float = _parse_float(os.getenv("BUBBLE_GAP_BASE_SEC"), 0.5)
+    BUBBLE_GAP_PER_CHAR_SEC: float = _parse_float(os.getenv("BUBBLE_GAP_PER_CHAR_SEC"), 0.075)
+    BUBBLE_GAP_MIN_SEC: float = _parse_float(os.getenv("BUBBLE_GAP_MIN_SEC"), 0.6)
+    BUBBLE_GAP_MAX_SEC: float = _parse_float(os.getenv("BUBBLE_GAP_MAX_SEC"), 4.5)
 
     WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1").strip()
     WEB_PORT: int = int(os.getenv("WEB_PORT", "8765"))
