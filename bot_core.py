@@ -100,41 +100,64 @@ def looks_like_self_modify(task: str) -> bool:
 
 
 def humanize_job_announcement(text: str, limit: int = 120) -> str:
-    """把后台任务播报压成群聊该有的长度。
+    """把后台任务播报压成群聊该有的长度，顺手把「机械味」清干净。
 
     2026-11-26 复盘：模型把 575/800 字的报告连列点和 Windows 路径一起贴进群。
-    提示词已要求 1~2 句，它偶尔仍照抄摘要，所以在出口再做一次硬截断：去列点、
-    去路径、去 markdown，按句号取能放下的前一两句；报告全文仍走 txt 附件。
+    2026-11-27：`format_job_delivery` 的兜底文本也走这里，所以它得能处理
+    「1. 新建 C:\\a\\b.md 2. 改配置 3. 跑测试」这种摘要原文。
+    处理顺序：换行还原成句子边界 → 去 markdown/标题 → 编号与列点 → 路径 → 按句截断。
+    报告全文仍然走 txt 附件，群里只留能读懂的那一两句。
     """
-    body = re.sub(r"\s+", " ", (text or "")).strip()
-    if not body:
+    body = (text or "").replace("\r", "")
+    if not body.strip():
         return ""
-    body = re.sub(r"(?:^|\s)\d+[.、)]\s*", "，", body)     # 行内 1. 2. 编号
-    body = re.sub(r"(?:^|\s)[-*•·]\s*", "，", body)        # 行首列点
-    body = re.sub(r"[A-Za-z]:\\[^\s，。；、]+", "文件", body)
-    body = body.replace("`", "").replace("**", "")
-    body = re.sub(r"^[，、；：\s]+", "", body)
+    # markdown 表格整行丢掉：竖线拼进群聊只会变成「项 值 a 1」这种乱码
+    body = re.sub(r"(?m)^\s*\|.*\|\s*$", "", body)
+    # 换行先变句号：列点各自成句，不会粘成一长串
+    body = re.sub(r"\n+", "。", body)
+    body = re.sub(r"(?:^|。)\s*#{1,6}\s*", "。", body)          # markdown 标题
+    body = re.sub(r"\*{1,3}|`{1,3}", "", body)                  # 粗体/斜体/反引号（下划线留着，任务号里有）
+    body = re.sub(r"\|", " ", body)                            # 残留竖线
+    body = re.sub(                                              # 行首编号 1. 2) （3） ①
+        r"(?:^|。)\s*(?:\d{1,2}[.、)）]|[（(]\d{1,2}[)）]|[①-⑳])\s*", "。", body
+    )
+    body = re.sub(r"\s\d{1,2}[.、)]\s+", "。", body)            # 同一行里的 1. xx 2. yy
+    body = re.sub(r"(?:^|。)\s*[-*•·]\s+", "。", body)          # 行首列点
+    body = re.sub(r"[A-Za-z]:[\\/][^\s，。；、）」'\"】]*", "文件", body)  # C:\ 与 C:/
+    body = re.sub(                                              # 相对路径 data/docs/x.md
+        r"(?:[\w\u4e00-\u9fa5.()（）-]+/)+[\w\u4e00-\u9fa5.()（）-]+\."
+        r"(?:md|txt|py|json|csv|xlsx?|docx?|pdf|pptx?|png|jpe?g|webp|gif|zip|html?|ya?ml|log|sql|svg)\b",
+        "文件",
+        body,
+    )
+    body = re.sub(r"\s+", " ", body)
+    body = re.sub(r"[：:]\s*(?=[。，、；])", "", body)          # 「理了一遍：。」这种断头
+    body = re.sub(r"[。；;]{2,}", "。", body)
     body = re.sub(r"([。！？!?；;])[，、]+", r"\1", body)
     body = re.sub(r"[，、]{2,}", "，", body)
+    body = re.sub(r" +文件", "文件", body)
+    body = re.sub(r"^[。，、；：\s]+", "", body).strip()
+    if not body:
+        return ""
+    if body[-1] not in "。！？!?…":
+        body += "。"
     if len(body) <= limit:
-        return body.strip()
-    # 先按句号/分号切，凑到至少半条消息的长度，避免只剩一句干巴巴的「做完了」
+        return body
+    # 按句号/分号切，凑够半条再看下一句放不放得下，避免只剩一句干巴巴的「做完了」
     out = ""
     for part in re.split(r"(?<=[。！？!?；;])", body):
-        if not part.strip():
+        part = part.strip()
+        if not part:
             continue
         if len(out) + len(part) > limit:
             break
         out += part
-        if len(out) >= limit // 2:
+        if len(out) >= max(40, limit // 2):
             break
-    out = out.strip()
-    if len(out) < limit // 2:
-        tail = body[len(out):].strip()
-        if tail:
-            out = (out + tail)[: limit - 1].rstrip("，、；： ")
-            return out + "…"
-    return out or (body[:limit].rstrip("，、；： ") + "…")
+    out = out.strip().rstrip("，、；： ")
+    if not out:
+        return body[: limit - 1].rstrip("，、；： ") + "…"
+    return out
 
 
 @dataclass
@@ -1681,7 +1704,7 @@ class DaFeiYuBotCore:
             f"派活的人：{sender}",
             f"任务：{task_line}",
             f"状态：{label}（耗时 {duration} 秒）",
-            f"结果摘要：\n{summary[:1200] if summary else '(执行助手没给摘要)'}",
+            f"结果摘要：\n{summary[:700] if summary else '(执行助手没给摘要)'}",
         ]
         if artifacts:
             names = "、".join(Path(str(p)).name for p in artifacts[:5])
@@ -1694,11 +1717,13 @@ class DaFeiYuBotCore:
                 "怎么说：用你自己的口吻说 1~2 句，交代清做成了什么、结果在哪里；"
                 "顺着摘要说，别编摘要里没有的东西，别提“执行助手”“后台任务”这种词，"
                 "别用 Markdown、别贴代码块、别列长清单，就当普通群聊回一句。"
+                "摘要里如果带 1. 2. 3. 的编号、C:\\ 这种路径、文件名、命令行，"
+                "一律别抄进群里——群里只要结果，文件反正是自动发过去的。"
             )
         else:
             lines.append(
                 "怎么说：用你自己的口吻说 1~2 句，老实说没弄成、卡在哪一步（把英文报错翻译成人话），"
-                "别道歉超过一次，别找借口，别用 Markdown。"
+                "别道歉超过一次，别找借口，别用 Markdown，别把报错原文和路径抄进群里。"
             )
 
         job_report = "\n".join(lines)

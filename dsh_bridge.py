@@ -455,48 +455,28 @@ def _backend_label(done_data: dict[str, Any]) -> str:
 
 
 def format_job_delivery(done_data: dict[str, Any]) -> tuple[str, Path | None]:
-    """格式化适合发到微信群的任务结果文本，长输出额外生成 .txt 附件。"""
-    job_id = str(done_data.get("job_id") or "unknown")
-    session_id = str(done_data.get("session_id") or "")
+    """后台任务跑完后发群里的「兜底一句话」（模型播报失败时才会用到）。
+
+    2026-11-27：以前这里会把 summary 截 650 字原样贴进群——摘要里常带
+    「1. 2. 3.」的列点、`C:\\...` 的绝对路径，失败时还有英文报错（实测 #406 那条
+    就是这样发出去的）。现在机械信息一律走 build_job_report_file 生成的 txt 附件，
+    聊天部分只留一句人话：说清成没成、花了多久、东西在哪拿。
+    """
     status = str(done_data.get("status") or "done")
-    duration = done_data.get("duration_sec", 0.0)
-    task = str(done_data.get("task") or "").strip()
-    summary = str(done_data.get("summary") or "").strip()
-    task_preview = task[:60] + ("..." if len(task) > 60 else "")
+    try:
+        secs = int(float(done_data.get("duration_sec") or 0))
+    except (TypeError, ValueError):
+        secs = 0
 
     if status == "done":
-        header = f"✅ 后台 {_backend_label(done_data)} 任务完成（#{job_id}｜耗时 {duration}s）"
+        text = f"✅ 活干完了（{secs} 秒），完整报告和产出文件一起发你了。"
     elif status == "timeout":
-        header = f"⏱️ 后台 {_backend_label(done_data)} 任务超时（#{job_id}｜耗时 {duration}s）"
+        text = f"⏱️ 这活超时了（跑了 {secs} 秒），卡在哪写在报告里。"
     else:
-        header = f"⚠️ 后台 {_backend_label(done_data)} 任务执行异常（#{job_id}｜退出码 {done_data.get('exit_code')}）"
-
-    attach_path: Path | None = None
-    job_dir_str = str(done_data.get("_job_dir") or "").strip()
-    job_dir = Path(job_dir_str) if job_dir_str else (DSH_JOBS_DIR / job_id)
-    stdout_path = job_dir / "stdout.txt"
-    full_stdout = stdout_path.read_text(encoding="utf-8", errors="replace").strip() if stdout_path.is_file() else ""
-
-    if len(full_stdout) > 700:
-        attach_file = job_dir / f"dsh_result_{job_id}.txt"
-        attach_file.write_text(full_stdout, encoding="utf-8")
-        attach_path = attach_file
-
-    body_text = summary[:650] + ("..." if len(summary) > 650 else "")
-    lines = [header, f"📝 任务：{task_preview}"]
-    _fb_reason = str(done_data.get("fallback_reason") or "").strip()
-    if str(done_data.get("fallback_from") or "").lower() == "codebuddy" and _fb_reason:
-        lines.append(f"⚠️ CodeBuddy 本次不可用（{_fb_reason}），已自动改用 DSH 执行")
-    if session_id:
-        lines.append(f"🔗 会话：{session_id}（发 `/dsh 续 补充要求` 可继续追问）")
-    elif status == "done":
-        lines.append("💡 发 `/dsh 续 补充要求` 可基于本轮结果继续追问")
-    if body_text:
-        lines.append(f"\n{body_text}")
-    if attach_path is not None:
-        lines.append("\n📎 完整输出较长，已随附结果文本文件。")
-
-    return "\n".join(lines), attach_path
+        text = "⚠️ 这活没干成，原因和报错都写在报告里。"
+    if str(done_data.get("fallback_from") or "").lower() == "codebuddy":
+        text += "（CodeBuddy 没连上，换备用通道跑的）"
+    return text, None
 
 
 # ======================================================================
