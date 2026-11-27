@@ -754,11 +754,18 @@ class DaFeiYuBrain:
         )
         # 她今天自己的生活（只放已发生、最近 4 段）：让「你在干嘛」这种回答前后一致
         life_note = ""
+        life_hint = ""
         if tuning.get_int("LIFE_INJECT_ON", 1):
             try:
                 import daily_life
 
                 life_note = daily_life.context_line()
+                # 有人直接问「你在干嘛」时，再补一条「就照现在这一段答」的指令；
+                # 光有生活线，模型容易顺着当天话题编，或者回一句没内容的「在刷手机」。
+                life_hint = daily_life.question_hint(text)
+                if not life_note:
+                    # 今天还没生成过：后台补一条，这轮先不带，下次问起就能对上
+                    daily_life.ensure_today_async(self)
             except Exception as exc:  # noqa: BLE001 - 生活线读不出来不影响聊天
                 logger.warning("今日生活：上下文读取失败: %s", exc)
         turn_context = _build_turn_context(
@@ -771,7 +778,7 @@ class DaFeiYuBrain:
             diary_note=diary_note,
             bg_note=bg_note,
             job_report=job_report,
-            life_note=life_note,
+            life_note="\n".join(x for x in (life_note, life_hint) if x),
             l3_notes=l3_notes,
         )
         # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效

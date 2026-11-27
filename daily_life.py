@@ -66,6 +66,8 @@ RETRY_AFTER_SEC = 1800
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 _lock = threading.RLock()
+# 后台补生成是否正在跑（连问几句「在干嘛」时只补一次）
+_ensure_inflight = False
 
 
 def _empty() -> dict:
@@ -528,6 +530,110 @@ def context_line(max_items: int = 4) -> str:
 
 def today_str(now: datetime | None = None) -> str:
     return (now or datetime.now()).strftime("%Y-%m-%d")
+
+
+# 「在干嘛」这类问句。必须有主语或时间词兜着，否则「你干嘛啊」这种责怪、
+# 「干嘛要这样」这种反问也会被当成询问，白白塞一段生活线进上下文。
+_ASK_LIFE_RE = re.compile(
+    r"(?:你|你们|鱼|肥鱼|大肥鱼|现在|这会儿|今天|刚刚|刚才)[^，。！？\n]{0,6}?"
+    r"(?:在忙|忙不忙|在做|在干|干啥|干什么|做什么|做啥|忙啥|忙什么)"
+    r"|(?:在干嘛|干嘛呢|干啥呢|做啥呢|在忙吗|忙啥呢|忙什么呢|在忙什么|在做什么)"
+)
+
+
+def _current_slots(state: dict, now: datetime) -> tuple[dict | None, dict | None]:
+    """返回 (现在大概正在做的那段, 下一段)。今天还没到第一段时前者是 None。"""
+    slots = [s for s in (state.get("slots") or []) if s.get("title")]
+    now_m = _now_minutes(now)
+    cur = None
+    nxt = None
+    for slot in slots:
+        at_m = _at_minutes(str(slot.get("at") or ""))
+        if at_m <= now_m:
+            cur = slot
+        elif nxt is None:
+            nxt = slot
+    return cur, nxt
+
+
+def question_hint(text: str, now: datetime | None = None) -> str:
+    """有人问「你在干嘛」时，补一条「就照这段答」的指令；不是问句就返回空串。
+
+    只把【你今天】塞进上下文还不够：模型更愿意顺着群里正在聊的话题答，
+    被问「在干嘛」时容易回一句「在刷手机」这种没内容的敷衍，或者干脆现编一件
+    跟今天对不上的事。这里点明「这个点她正在做哪一件」，并附上「别另编行程、
+    别把一天念完」的约束，前后才对得上。
+    """
+    if not text or not _ASK_LIFE_RE.search(text):
+        return ""
+    now = now or datetime.now()
+    state = _load()
+    if state.get("date") != today_str(now) or not state.get("slots"):
+        return ""
+    cur, nxt = _current_slots(state, now)
+    if not cur:
+        # 还没到今早第一段：按作息就是还没起，别让她凭空编一趟早市
+        if not nxt:
+            return ""
+        logger.info("🐟 有人在问「在干嘛」，今天还没到第一段，按「还没起」作答")
+        return (
+            "【本轮：对方在问你现在在干嘛】按今天的作息你这时候还没起"
+            f"（{nxt.get('at')} 才{nxt.get('kind')}）。照「还没起／在床上赖着」这种答，"
+            "一句话，别编别的行程。"
+        )
+    detail = str(cur.get("detail") or "").strip()
+    tail = f"，{detail}" if detail else ""
+    soon = ""
+    if nxt:
+        gap = _at_minutes(str(nxt.get("at") or "")) - _now_minutes(now)
+        if 0 < gap <= 60:
+            soon = f"再过一会儿打算{nxt.get('kind')}。"
+    logger.info(
+        "🐟 有人在问「在干嘛」，按生活线作答：%s %s",
+        cur.get("at"),
+        str(cur.get("title"))[:20],
+    )
+    return (
+        "【本轮：对方在问你现在在干嘛】就照今天这一段答，别另编行程：\n"
+        f"- 现在大概是：{cur.get('at')} {cur.get('kind')}，{cur.get('title')}{tail}\n"
+        f"{soon}"
+        "一句话说完，像随口说的；别报备，也别把今天其它几段一起倒出来。"
+    )
+
+
+def ensure_today_async(brain) -> None:
+    """今天还没有生活线时，后台补生成一次（别人问「在干嘛」用得上）。
+
+    生成一次要十几秒（CodeBuddy 写手最长 120 秒），绝不能卡在回消息的路径上：
+    这一轮先不带，生成完了下一轮问起就能对上。失败过的半小时内不再重试，
+    免得每句「在干嘛」都去调一次模型。
+    """
+    now = datetime.now()
+    state = _load()
+    if state.get("date") == today_str(now) and state.get("slots"):
+        return
+    failed_at = float(state.get("gen_fail_ts") or 0)
+    if state.get("date") == today_str(now) and (now.timestamp() - failed_at) < RETRY_AFTER_SEC:
+        return
+
+    # 同一时刻只允许一个补生成线程：连问三句「在干嘛」不该触发三次模型调用
+    global _ensure_inflight
+    with _lock:
+        if _ensure_inflight:
+            return
+        _ensure_inflight = True
+
+    def _run() -> None:
+        global _ensure_inflight
+        try:
+            ensure_today(brain, datetime.now())
+        except Exception as exc:  # noqa: BLE001 - 后台补生成失败不影响聊天
+            logger.warning("今日生活：后台补生成失败: %s", exc)
+        finally:
+            with _lock:
+                _ensure_inflight = False
+
+    threading.Thread(target=_run, name="daily-life-ensure", daemon=True).start()
 
 
 def snapshot() -> dict:
