@@ -61,7 +61,17 @@ class Settings:
     )
     GROUP_AT_ONLY: bool = _parse_bool(os.getenv("GROUP_AT_ONLY"), True)
     AUTO_ROAST_IMAGE_PROB: float = float(os.getenv("AUTO_ROAST_IMAGE_PROB", "0.35"))
-    STICKER_REPLY_PROB: float = float(os.getenv("STICKER_REPLY_PROB", "0.75"))
+    # 发不发图由她自己定：只有回复里写了 `[图:关键词]` 才发，代码不再按概率硬贴。
+    # 留这个键是为了兼容老 .env，值已经不用了。
+    STICKER_REPLY_PROB: float = float(os.getenv("STICKER_REPLY_PROB", "0"))
+    # 发图前是否过视觉审核。关掉就等于"挑到什么发什么"，不建议。
+    STICKER_AUDIT_ON: bool = _parse_bool(os.getenv("STICKER_AUDIT_ON"), True)
+    # 每小时最多发几张，防她连着刷图
+    STICKER_MAX_PER_HOUR: int = int(os.getenv("STICKER_MAX_PER_HOUR", "3"))
+    # 去网上搜表情包（搜回来还要过审核）
+    STICKER_WEB_FETCH_ON: bool = _parse_bool(os.getenv("STICKER_WEB_FETCH_ON"), True)
+    # 反手发群友的梗图。默认关：这些图来路不明，常带别处的水印和别人的梗
+    STICKER_STEAL_ON: bool = _parse_bool(os.getenv("STICKER_STEAL_ON"), False)
 
     # 自主意识与联网搜索配置
     ENABLE_WEB_SEARCH: bool = _parse_bool(os.getenv("ENABLE_WEB_SEARCH"), True)

@@ -5,6 +5,8 @@
 data/
 state/
 stickers/web_cache/
+# 旧搜索词（塔菲/猫猫/熊猫头）抓的图，已隔离待清理
+stickers/web_cache_legacy*/
 stickers/stolen/
 wechatauto_logs/
 *.log

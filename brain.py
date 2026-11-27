@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
 import re
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,7 +27,7 @@ from agent_tools import (
     take_screenshot,
     write_local_file,
 )
-from config import settings
+from config import DATA_DIR, settings
 from dsh_bridge import is_dsh_available
 from dsh_bridge import list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
@@ -47,6 +49,60 @@ MOOD_TAG_PATTERN = re.compile(
     r"\[(?:MOOD|NM|情绪)\s*[:：]\s*(happy|smug|hungry|shocked|angry|sleepy|gaming|love)(?:\s*[|｜]\s*([^\]]{1,14}))?\]",
     re.IGNORECASE,
 )
+
+# 配图申请。只有她自己写了 `[图:xxx]` 才发，没写就一张不发。
+# 以前是按 STICKER_REPLY_PROB 概率硬贴，跟回复内容没关系，还常贴出别人家角色，
+# 群里看着就像"这谁发的图"。
+STICKER_TAG_PATTERN = re.compile(
+    r"\[(?:图|表情|STICKER)\s*[:：]\s*([\u4e00-\u9fa5A-Za-z0-9·\s]{1,12})\]",
+    re.IGNORECASE,
+)
+
+# 审核结论按文件内容哈希缓存 7 天：同一张图被挑中多次，只花一次视觉调用的钱。
+STICKER_AUDIT_PATH = DATA_DIR / "sticker_audit.json"
+STICKER_AUDIT_TTL = 7 * 24 * 3600
+
+
+def _file_digest(path: Path) -> str:
+    try:
+        return hashlib.md5(path.read_bytes()).hexdigest()
+    except OSError:
+        return str(path)
+
+
+def _load_sticker_audit() -> dict:
+    try:
+        with open(STICKER_AUDIT_PATH, encoding="utf-8") as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - 缓存坏了就当没有
+        return {}
+
+
+def _save_sticker_audit(cache: dict) -> None:
+    try:
+        STICKER_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # 只留最近 500 条，别让这个文件无限长
+        if len(cache) > 500:
+            keep = sorted(cache.items(), key=lambda kv: float(kv[1].get("ts") or 0))[-500:]
+            cache = dict(keep)
+        with open(STICKER_AUDIT_PATH, "w", encoding="utf-8") as fp:
+            json.dump(cache, fp, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001 - 写不进去不影响发不发
+        logger.debug("表情包审核缓存写入失败: %s", exc)
+
+
+def _parse_audit_verdict(answer: str) -> tuple[bool, str]:
+    """审核回复只认第一行的 PASS；REJECT、空、看不懂，全部当不通过。"""
+    # 智谱的输出会裹一层 <|begin_of_box|>PASS<|end_of_box|>，不清掉会把 PASS 当成没通过
+    text = re.sub(r"<\|[^|>]*\|>", "", answer or "").strip()
+    if not text:
+        return False, "审核无返回"
+    head = text.splitlines()[0].strip()
+    if re.match(r"^[【\[]?\s*PASS\s*[】\]]?[。.!！]?$", head, re.IGNORECASE):
+        return True, "审核通过"
+    reason = re.sub(r"^[【\[]?\s*REJECT\s*[:：]?\s*", "", head, flags=re.IGNORECASE).strip()
+    return False, reason[:60] or "审核未通过"
 
 # 命中这些实时/资料类词时，直接前置秒搜并合并进单轮 DeepSeek 调用（省掉一轮 tool_call 往返，速度翻倍）
 PRE_SEARCH_CUES = (
@@ -219,6 +275,8 @@ class BrainReply:
     used_vision: bool
     used_search: bool = False
     sticker_caption: str = ""
+    # 她自己点名要的配图关键词（`[图:xxx]`）。空 = 这轮不发表情包。
+    sticker_request: str = ""
     attachment_path: Path | None = None
     vision_summary: str = ""
 
@@ -400,7 +458,9 @@ def strip_think(text: str) -> str:
     return s.strip()
 
 
-def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | None:
+def _inspect_image_with_zhipu(
+    image_path: Path, question: str = "", *, prompt: str | None = None
+) -> str | None:
     """
     使用智谱永久免费深度思考视觉模型 `glm-4.1v-thinking-flash` 做高精度看图：
     - 精准读取中文小字/微信截图/游戏战绩KDA/梗图文字/画面细节
@@ -410,11 +470,15 @@ def _inspect_image_with_zhipu(image_path: Path, question: str = "") -> str | Non
         return None
     try:
         data_url = _encode_image_data_url(image_path)
-        ask = (
-            f"请仔细看清这张图片里的所有细节（包括小字、数字、人名、游戏战绩/KDA/英雄、梗图文字、人物动作和表情），"
-            f"并用简明准确的中文客观描述出来（不要瞎编图里没有的东西）。"
-            + (f" 群友针对这张图问了：{question}" if question.strip() else "")
-        )
+        # prompt 传了就完全用调用方自己的指令（审核场景要的是 PASS/REJECT，不是描述）
+        if prompt:
+            ask = prompt
+        else:
+            ask = (
+                f"请仔细看清这张图片里的所有细节（包括小字、数字、人名、游戏战绩/KDA/英雄、梗图文字、人物动作和表情），"
+                f"并用简明准确的中文客观描述出来（不要瞎编图里没有的东西）。"
+                + (f" 群友针对这张图问了：{question}" if question.strip() else "")
+            )
         payload = json.dumps(
             {
                 "model": "glm-4.1v-thinking-flash",
@@ -744,16 +808,22 @@ class DaFeiYuBrain:
         params["max_tokens"] = max(max_tokens, 1024)
         return client.chat.completions.create(**params)
 
-    def _parse_mood(self, raw_text: str, default_mood: str) -> tuple[str, str, str]:
+    def _parse_mood(self, raw_text: str, default_mood: str) -> tuple[str, str, str, str]:
+        """剥掉 `[MOOD:xxx|配字]` 和 `[图:关键词]`，返回 (正文, 情绪, 配字, 发图关键词)。"""
         match = MOOD_TAG_PATTERN.search(raw_text)
         mood = match.group(1).lower() if match else default_mood
         caption = (match.group(2) or "").strip() if match else ""
         cleaned = MOOD_TAG_PATTERN.sub("", raw_text).strip()
+        # 配图得她自己在正文里点名要，代码不再按概率硬贴一张。
+        # 没写 `[图:xxx]` 就是不想发图，`sticker_request` 留空，一条都不发。
+        sticker_match = STICKER_TAG_PATTERN.search(cleaned)
+        sticker_request = (sticker_match.group(1) or "").strip() if sticker_match else ""
+        cleaned = STICKER_TAG_PATTERN.sub("", cleaned).strip()
         # 顺手去掉微信里显示很丑的 Markdown 粗体/标题符号
         cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
         cleaned = re.sub(r"^#{1,4}\s*", "", cleaned, flags=re.M)
         cleaned = cleaned.replace("`", "")
-        return _strip_persona_leaks(cleaned).strip(), mood, caption
+        return _strip_persona_leaks(cleaned).strip(), mood, caption, sticker_request
 
     def summarize_image(self, image_path: Path) -> str | None:
         """后台静默概括图片核心内容：先走智谱免费视觉，拿不到正文再回退一次原生视觉。
@@ -823,6 +893,75 @@ class DaFeiYuBrain:
             return body[:1200] or "未能识别出图片内容"
         except Exception as exc:
             return f"查看历史图片失败: {exc}"
+
+    def audit_sticker(self, image_path: Path, keyword: str = "", context: str = "") -> tuple[bool, str]:
+        """发图前最后一道闸：让视觉模型看一眼，这张图能不能当大肥鱼的表情包发出去。
+
+        fail-closed。看不懂、报错、超时、拿不准，一律不放行——宁可这轮不发，
+        也别往群里甩别人家角色、带水印二维码、或者干脆是张截图的图。
+        审核结果按文件内容哈希缓存，同一张图只花一次钱。
+        """
+        if not image_path or not image_path.is_file():
+            return False, "文件不存在"
+        try:
+            if image_path.stat().st_size > 6 * 1024 * 1024:
+                return False, "文件过大"
+        except OSError:
+            return False, "文件读不到"
+
+        key = _file_digest(image_path)
+        cache = _load_sticker_audit()
+        hit = cache.get(key) or {}
+        if hit and (time.time() - float(hit.get("ts") or 0)) < STICKER_AUDIT_TTL:
+            return bool(hit.get("ok")), str(hit.get("why") or "缓存结论")
+
+        said = " ".join((context or "").split())[:80]
+        ask = (
+            "这是内容审核，只输出一行结论。\n"
+            "下面这张图会被「大肥鱼」当成表情包发到微信群里。大肥鱼是一条电子宠物鱼，"
+            "在群里贫嘴、爱吐槽，人设活泼但不出格。\n"
+            + (f"她配这张图时说的一句话是：「{said}」，图得跟这句话搭得上，对不上也算不合格。\n" if said else "")
+            + 
+            "判 PASS 的条件：是网聊笑点图 / 梗图 / 表情包，图上文字干净，跟日常闲聊搭得上。\n"
+            "其余一律 REJECT，尤其这些：\n"
+            "- 根本不是表情包：真人照片、风景、聊天截图、表格、长图、海报、公告、商品图\n"
+            "- 带二维码、网址、水印、店铺名、公众号、群号、联系方式、广告\n"
+            "- 涉政、低俗、擦边、暴露、血腥、恐怖、恶心\n"
+            "- 真人明星、主播、动漫第三方角色的形象照（不是抽象梗图）\n"
+            "- 图上文字与闲聊无关，或含辱骂歧视\n"
+            "拿不准也 REJECT。\n\n"
+            "输出格式（只一行）：\nPASS\n或\nREJECT: 一句话理由"
+        )
+        answer = ""
+        if settings.ZHIPU_API_KEY:
+            answer = _inspect_image_with_zhipu(image_path, prompt=ask) or ""
+        if not answer and settings.has_valid_api_key:
+            try:
+                data_url = _encode_image_data_url(image_path)
+                resp = self._get_vision_client().chat.completions.create(
+                    model=settings.DEEPSEEK_VISION_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": ask},
+                                {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                            ],
+                        }
+                    ],
+                    # 这个视觉模型先思考再给正文，120 会被思考吃干净、正文为空（实测 finish_reason=length）
+                    max_tokens=400,
+                )
+                answer = strip_think(resp.choices[0].message.content or "")
+            except Exception as exc:  # noqa: BLE001 - 审核挂掉就当没通过
+                logger.warning("表情包审核调用失败 [%s]: %s", image_path.name, exc)
+                return False, f"审核不可用({type(exc).__name__})"
+
+        ok, why = _parse_audit_verdict(answer)
+        cache[key] = {"ok": ok, "why": why, "ts": time.time(), "name": image_path.name}
+        _save_sticker_audit(cache)
+        logger.info("%s 表情包审核 [%s] 关键词=%s: %s", "✅" if ok else "🚫", image_path.name, keyword, why)
+        return ok, why
 
     def reply(
         self,
@@ -1416,7 +1555,9 @@ class DaFeiYuBrain:
             else:
                 raw_content = f"工具跑完一轮了，结果已经在上面了{tail_word}"
 
-            cleaned, mood, sticker_caption = self._parse_mood(raw_content, "shocked" if used_vision else status.mood_tag)
+            cleaned, mood, sticker_caption, sticker_request = self._parse_mood(
+                raw_content, "shocked" if used_vision else status.mood_tag
+            )
             bubbles = split_human_bubbles(cleaned or f"网卡了一下 刚才说啥来着{tail_word}")
             return BrainReply(
                 text="\n".join(bubbles),
@@ -1426,6 +1567,7 @@ class DaFeiYuBrain:
                 used_vision=used_vision,
                 used_search=used_search,
                 sticker_caption=sticker_caption,
+                sticker_request=sticker_request,
                 attachment_path=attachment_path,
                 vision_summary=vision_summary,
             )
@@ -1474,7 +1616,7 @@ class DaFeiYuBrain:
             tokens_used = getattr(resp.usage, "total_tokens", 0) or 0
             if not raw or "[PASS]" in raw.upper():
                 return None
-            cleaned, mood, sticker_caption = self._parse_mood(raw, "happy")
+            cleaned, mood, sticker_caption, sticker_request = self._parse_mood(raw, "happy")
             if not cleaned:
                 return None
             bubbles = split_human_bubbles(cleaned)
@@ -1485,6 +1627,7 @@ class DaFeiYuBrain:
                 tokens_used=tokens_used,
                 used_vision=False,
                 sticker_caption=sticker_caption,
+                sticker_request=sticker_request,
             )
         except Exception as exc:
             logger.warning("自主插嘴判断异常: %s", exc)
@@ -1895,7 +2038,9 @@ class DaFeiYuBrain:
             )
             raw = (resp.choices[0].message.content or "").strip()
             tokens_used = getattr(resp.usage, "total_tokens", 0) or 0
-            cleaned, mood, sticker_caption = self._parse_mood(raw, "hungry" if kind == "hungry" else "happy")
+            cleaned, mood, sticker_caption, sticker_request = self._parse_mood(
+                raw, "hungry" if kind == "hungry" else "happy"
+            )
             # 兜底也不能是空问句（原来是「都在干嘛呢」）：宁可说一件死板的实事
             b = split_human_bubbles(cleaned or "盯着鱼缸发了会儿呆")
             return BrainReply(
@@ -1905,6 +2050,7 @@ class DaFeiYuBrain:
                 tokens_used=tokens_used,
                 used_vision=False,
                 sticker_caption=sticker_caption,
+                sticker_request=sticker_request,
             )
         except Exception:
             fallback = (

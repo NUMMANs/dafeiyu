@@ -303,9 +303,55 @@ class DaFeiYuBotCore:
         self._topic_jobs: dict[str, dict] = {}
         self._topic_lock = threading.Lock()
         self._last_topic_attempt_ts: dict[str, float] = {}
+        # 最近一小时发出去的图（时间戳），用来压住"连着刷图"
+        self._sticker_sent_ts: list[float] = []
 
-    def _maybe_pick_sticker(self, mood: str, caption: str | None = None) -> Path | None:
-        return sticker_manager.pick_sticker(mood, caption=caption)
+    def _maybe_pick_sticker(self, mood: str, caption: str | None = None, keyword: str = "") -> Path | None:
+        return sticker_manager.pick_sticker(mood, caption=caption, keyword=keyword)
+
+    def _sticker_quota_ok(self) -> bool:
+        now = time.time()
+        self._sticker_sent_ts = [t for t in self._sticker_sent_ts if now - t < 3600]
+        return len(self._sticker_sent_ts) < settings.STICKER_MAX_PER_HOUR
+
+    def _resolve_sticker(
+        self,
+        mood: str,
+        keyword: str = "",
+        caption: str | None = None,
+        context: str = "",
+    ) -> Path | None:
+        """这一轮到底发不发图、发哪张、发之前过审核。
+
+        以前是 `random.random() < STICKER_REPLY_PROB` 随手贴一张，跟回复内容没关系，
+        还常贴出别人家角色——群里看到的「这谁发的图」就是这么来的。
+        现在只有她自己写了 `[图:关键词]` 才发；挑完再过一道视觉审核，
+        不合格直接丢，宁可不发。
+        """
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return None
+        if not self._sticker_quota_ok():
+            logger.info("🎭 想要图[%s]，但这一小时已经发够了 %d 张，跳过", keyword, settings.STICKER_MAX_PER_HOUR)
+            return None
+        path = self._maybe_pick_sticker(mood, caption=caption, keyword=keyword)
+        if not path or not path.is_file():
+            logger.info("🎭 想要图[%s]，没挑到合适的", keyword)
+            return None
+        if settings.STICKER_AUDIT_ON:
+            ok, why = brain.audit_sticker(path, keyword=keyword, context=context)
+            if not ok:
+                logger.info("🎭 图没通过审核，这次不发 [%s]: %s", path.name, why)
+                # 网络缓存里这张不合格，删掉免得下次又抽到它
+                try:
+                    if path.parent.name == "web_cache":
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+        self._sticker_sent_ts.append(time.time())
+        logger.info("🎭 发图 [%s] 关键词=%s", path.name, keyword)
+        return path
 
     def is_quiet_hours(self) -> bool:
         """23:00 ~ 次日 08:00 默认静默睡觉，绝不半夜扰民"""
@@ -819,7 +865,8 @@ class DaFeiYuBotCore:
                 f"累计吃白饭：{st.total_tokens} Tokens｜锐评图片：{st.total_images} 张\n"
                 f"你（{sender}）的关系：{aff['title']}（好感度 {aff['affinity']}/100）"
             )
-            sticker = self._maybe_pick_sticker(st.mood_tag)
+            # 命令回复是模板话术，不是她自己写的，没有 [图:xxx] 就不配图
+            sticker = None
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -845,7 +892,8 @@ class DaFeiYuBotCore:
                 f"饱食度 → {st.hunger}/100｜心情 → {st.mood}/100｜"
                 f"对 {sender} 的好感度涨到 {aff['affinity']}（{aff['title']}）"
             )
-            sticker = self._maybe_pick_sticker("happy")
+            # 命令回复是模板话术，不是她自己写的，没有 [图:xxx] 就不配图
+            sticker = None
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -879,7 +927,8 @@ class DaFeiYuBotCore:
                 )
                 reply_text = f"杂鱼 {sender} 别光动手动脚不给饭吃！快发 `/投喂` 进贡白饭！"
                 mood = "hungry"
-            sticker = self._maybe_pick_sticker(mood)
+            # 命令回复是模板话术，不是她自己写的，没有 [图:xxx] 就不配图
+            sticker = None
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -902,7 +951,8 @@ class DaFeiYuBotCore:
                         f"{medals[idx]} {item['user_name']} — 好感 {item['affinity']}（{item['title']}｜投喂 {item['feed_count']} 次）"
                     )
                 reply_text = "\n".join(lines)
-            sticker = self._maybe_pick_sticker("happy")
+            # 命令回复是模板话术，不是她自己写的，没有 [图:xxx] 就不配图
+            sticker = None
             return BotResponse(
                 should_reply=True,
                 text=reply_text,
@@ -1873,14 +1923,17 @@ class DaFeiYuBotCore:
         emotion_sm.on_bot_reply(group_id, brain_reply.mood)
         self._last_bot_reply_ts[group_id] = time.time()
 
-        # 8. 如果 Agent 工具产出了附件图片（如桌面截屏），优先发附件；否则按概率发表情包
+        # 8. Agent 工具产出的附件（截屏等）是她自己要发的，照发；
+        #    表情包只有她写了 `[图:xxx]` 才发，挑完还要过审核，不合格就不发
         sticker_path = None
         if brain_reply.attachment_path and brain_reply.attachment_path.is_file():
             sticker_path = brain_reply.attachment_path
-        elif random.random() < settings.STICKER_REPLY_PROB:
-            sticker_path = self._maybe_pick_sticker(
+        else:
+            sticker_path = self._resolve_sticker(
                 brain_reply.mood,
-                caption=brain_reply.sticker_caption or None,
+                brain_reply.sticker_request,
+                brain_reply.sticker_caption or None,
+                context=brain_reply.text,
             )
         sticker_url = sticker_manager.to_web_url(sticker_path)
 
@@ -1943,7 +1996,9 @@ class DaFeiYuBotCore:
             exp_delta=5,
             affinity_delta=0,
         )
-        sticker_path = self._maybe_pick_sticker(chime.mood) if random.random() < 0.6 else None
+        sticker_path = self._resolve_sticker(
+            chime.mood, chime.sticker_request, chime.sticker_caption or None, context=chime.text
+        )
         sticker_url = sticker_manager.to_web_url(sticker_path)
         pet_engine.append_history(
             group_id=group_id,
@@ -2343,7 +2398,9 @@ class DaFeiYuBotCore:
             if (now - last_hungry) >= 3 * 3600:
                 self._last_hungry_bubble_ts[group_id] = now
                 bubble = brain.generate_autonomous_bubble("hungry", status)
-                sticker = self._maybe_pick_sticker("hungry")
+                sticker = self._resolve_sticker(
+                    bubble.mood, bubble.sticker_request, bubble.sticker_caption or None, context=bubble.text
+                )
                 sticker_url = sticker_manager.to_web_url(sticker)
                 pet_engine.append_history(
                     group_id=group_id,
@@ -2372,7 +2429,9 @@ class DaFeiYuBotCore:
             if (now - last_act) >= 5400:
                 self._last_evening_bubble_date[group_id] = today
                 bubble = brain.generate_autonomous_bubble("evening", status)
-                sticker = self._maybe_pick_sticker(bubble.mood)
+                sticker = self._resolve_sticker(
+                    bubble.mood, bubble.sticker_request, bubble.sticker_caption or None, context=bubble.text
+                )
                 sticker_url = sticker_manager.to_web_url(sticker)
                 pet_engine.append_history(
                     group_id=group_id,
@@ -2511,7 +2570,8 @@ class DaFeiYuBotCore:
                 continue
             bubbles = split_human_bubbles(text)
             mood = str(job.get("mood") or "happy")
-            sticker = self._maybe_pick_sticker(mood)
+            # 冷场分享的正文是后台线程直接拼的，没有她自己的 [图:xxx] 请求，就不配图
+            sticker = None
             sticker_url = sticker_manager.to_web_url(sticker)
             pet_engine.append_history(
                 group_id=gid,
@@ -2555,7 +2615,7 @@ class DaFeiYuBotCore:
             )
 
         msg = f"⏰ 定时提醒（{creator} 设的）：{content}"
-        sticker = self._maybe_pick_sticker("happy", caption="到点啦")
+        sticker = None  # 提醒是模板话术，不是她写的，不配图
         pet_engine.append_history(
             group_id=group_id,
             sender=settings.BOT_NAME,
