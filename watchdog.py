@@ -370,7 +370,7 @@ def _watchdog_loop(args: list[str], target_script: Path) -> int:
                     f"⚠️ 检测到刚启动即崩溃（退出码 {rc}，运行 {uptime:.1f}s），"
                     f"已自动回滚至稳定版本 {last_good[:7]} 并重新启动。"
                 )
-                save_restart_notice("", rolled_back_msg)
+                save_restart_notice("", rolled_back_msg, alert=True)
             else:
                 # 闸门拦下或回滚失败时只记日志，别往群里发「已回滚」这种误导消息
                 logger.warning("启动即崩溃，但未执行回滚：%s", rb_detail)
@@ -378,6 +378,7 @@ def _watchdog_loop(args: list[str], target_script: Path) -> int:
             save_restart_notice(
                 "",
                 f"⚠️ 进程启动异常退出（退出码 {rc}，运行 {uptime:.1f}s），看门狗已自动重新拉起。",
+                alert=True,
             )
 
         state["crash_streak"] = crash_streak

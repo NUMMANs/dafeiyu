@@ -434,8 +434,11 @@ class WxAutoAdapter:
                 wx.StartListening()
 
             notice = consume_restart_notice()
-            # 深夜不播报重启：夜间人格复盘 0:30 会推一次代码，自动更新随即拉取重启，
-            # 凌晨往群里甩一句「鱼重启回来啦」比不说话还假。白天照旧。
+            # 重启播报默认关闭：重启是运维动作，群里不该看到「鱼重启回来啦」。
+            # 深夜本来就跳过；白天也一并不发，只在日志里留一行。
+            if notice and notice.get("msg") and not settings.RESTART_NOTICE_ON:
+                logger.info("🔇 重启播报已关，跳过重启通知: %s", notice["msg"][:60])
+                notice = None
             if notice and notice.get("msg"):
                 _hour = datetime.now().hour
                 if _hour >= 23 or _hour < settings.QUIET_END_HOUR:
@@ -583,7 +586,8 @@ class WxAutoAdapter:
                         if branch_now and run_branch and branch_now != run_branch:
                             logger.info("🪾 检测到分支切换: %s → %s，按新分支代码重启", run_branch, branch_now)
                             first_group = self.groups[0] if self.groups else ""
-                            if first_group:
+                            # 切分支是运维动作，默认不往群里预告（RESTART_NOTICE_ON=1 才发）
+                            if first_group and settings.RESTART_NOTICE_ON:
                                 self._safe_send(
                                     wx,
                                     f"🪾 已切到分支 {branch_now}，正在按该分支的代码重启...",
@@ -632,7 +636,7 @@ class WxAutoAdapter:
                             first_group = self.groups[0] if self.groups else ""
                             if ok_pull:
                                 pre_notice = f"🛰️ 检测到 Git 新提交（{update_info}），代码校验通过，即将重启更新..."
-                                if first_group:
+                                if first_group and settings.RESTART_NOTICE_ON:
                                     self._safe_send(wx, pre_notice, first_group, "发送更新预告")
                                 request_restart(
                                     reason=f"GitHub 自动更新 ({update_info})",
@@ -642,7 +646,7 @@ class WxAutoAdapter:
                                 self._stop_event.set()
                             else:
                                 logger.warning("自动拉取未通过检查: %s", pull_detail)
-                                if first_group and "语法错误" in pull_detail:
+                                if first_group and "语法错误" in pull_detail and settings.RESTART_ALERT_ON:
                                     self._safe_send(
                                         wx,
                                         f"⚠️ 检测到 Git 新提交（{update_info}），但 {pull_detail}",
