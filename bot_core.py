@@ -78,6 +78,65 @@ ABOUT_ME_CUES = (
 )
 
 
+# 派活前最后一道硬拦：小 LLM 偶尔会把「改大肥鱼自己」也当成活派出去。
+# 提示词里已写死这条基线，但 2026-11-26 仍发生了一次，所以不能只靠模型自觉。
+_SELF_MODIFY_RE = re.compile(
+    r"(dafeiyu-wechat-bot|大肥鱼(?:的)?(?:项目|代码|源码|人格|人设|配置|程序)|"
+    r"(?:roles[/\\])?大肥鱼\.(?:人格|操作)\.md|"
+    r"(?:bot_core|brain|memory|watchdog|self_ops|config)\.py|项目目录)"
+)
+_SELF_MODIFY_ACT_RE = re.compile(r"(改|修改|编辑|重构|修复|优化|删|替换|更新|调整|重写)")
+
+
+def looks_like_self_modify(task: str) -> bool:
+    """任务是不是在动大肥鱼自己的项目/人格/源码。
+
+    只拦「明确指向本项目」且带改动动作的组合；「帮我写个脚本」这类正常派活不受影响。
+    """
+    body = (task or "").strip()
+    if not body:
+        return False
+    return bool(_SELF_MODIFY_RE.search(body) and _SELF_MODIFY_ACT_RE.search(body))
+
+
+def humanize_job_announcement(text: str, limit: int = 120) -> str:
+    """把后台任务播报压成群聊该有的长度。
+
+    2026-11-26 复盘：模型把 575/800 字的报告连列点和 Windows 路径一起贴进群。
+    提示词已要求 1~2 句，它偶尔仍照抄摘要，所以在出口再做一次硬截断：去列点、
+    去路径、去 markdown，按句号取能放下的前一两句；报告全文仍走 txt 附件。
+    """
+    body = re.sub(r"\s+", " ", (text or "")).strip()
+    if not body:
+        return ""
+    body = re.sub(r"(?:^|\s)\d+[.、)]\s*", "，", body)     # 行内 1. 2. 编号
+    body = re.sub(r"(?:^|\s)[-*•·]\s*", "，", body)        # 行首列点
+    body = re.sub(r"[A-Za-z]:\\[^\s，。；、]+", "文件", body)
+    body = body.replace("`", "").replace("**", "")
+    body = re.sub(r"^[，、；：\s]+", "", body)
+    body = re.sub(r"([。！？!?；;])[，、]+", r"\1", body)
+    body = re.sub(r"[，、]{2,}", "，", body)
+    if len(body) <= limit:
+        return body.strip()
+    # 先按句号/分号切，凑到至少半条消息的长度，避免只剩一句干巴巴的「做完了」
+    out = ""
+    for part in re.split(r"(?<=[。！？!?；;])", body):
+        if not part.strip():
+            continue
+        if len(out) + len(part) > limit:
+            break
+        out += part
+        if len(out) >= limit // 2:
+            break
+    out = out.strip()
+    if len(out) < limit // 2:
+        tail = body[len(out):].strip()
+        if tail:
+            out = (out + tail)[: limit - 1].rstrip("，、；： ")
+            return out + "…"
+    return out or (body[:limit].rstrip("，、；： ") + "…")
+
+
 @dataclass
 class BotResponse:
     should_reply: bool
@@ -1574,6 +1633,13 @@ class DaFeiYuBotCore:
         task = (task or "").strip()[:400]
         if not task:
             return ""
+        if looks_like_self_modify(task):
+            logger.warning(
+                "[%s] 🚫 拒绝派活：任务在动大肥鱼自己的项目/人格，留给夜间复盘和主人 → %s",
+                group_id,
+                task[:80],
+            )
+            return ""
         ok, payload = submit_dsh_job(group_id=group_id, sender=sender, task=task)
         if not ok:
             logger.warning("[%s] 派活给执行助手失败: %s", group_id, payload)
@@ -1660,7 +1726,10 @@ class DaFeiYuBotCore:
         text = text.replace("**", "").replace("`", "").strip()
         if not text:
             return None
-        logger.info("[%s] 🗣️ 后台任务播报: %s", group_id, text[:100])
+        text = humanize_job_announcement(text)
+        if not text:
+            return None
+        logger.info("[%s] 🗣️ 后台任务播报(%d字): %s", group_id, len(text), text[:100])
         return BotResponse(
             should_reply=True,
             text=text,

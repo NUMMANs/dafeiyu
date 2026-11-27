@@ -68,7 +68,11 @@ def cmd_write(args: argparse.Namespace) -> int:
     facts = payload.get("facts") or []
     diary = payload.get("diary") or {}
     written_facts = 0
-    for fact in facts:
+    # 代码层再兜一道：提示词说最多 6 条，模型偶尔会多给。超出部分不写，
+    # 免得一夜把识海灌满。
+    if len(facts) > 8:
+        print(f"⚠️ facts 给了 {len(facts)} 条，只取前 8 条")
+    for fact in facts[:8]:
         text = str(fact.get("text") or "").strip()
         if not text:
             continue
@@ -79,6 +83,9 @@ def cmd_write(args: argparse.Namespace) -> int:
             source="self",
             group_id=args.group,
             raw=str(fact.get("raw") or ""),
+            # 夜间提炼不受「自然日 8 条」限制：00:02 自动养护已经写过几条，
+            # 再按自然日卡，0:45 复盘就一条也写不进去。
+            ignore_daily_limit=True,
         )
         print(("✅ " if ok else "⏭ ") + f"L1 {text[:50]} → {msg}")
         written_facts += 1 if ok else 0

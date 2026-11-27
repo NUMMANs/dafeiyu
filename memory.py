@@ -187,8 +187,14 @@ class FourLayerMemory:
         source: str = "self",
         group_id: str = "",
         raw: str = "",
+        ignore_daily_limit: bool = False,
     ) -> tuple[bool, str]:
-        """写入一条记忆节点到 L1 识海（带隐私过滤、权限检查、每日 8 条上限、去重）"""
+        """写入一条记忆节点到 L1 识海（带隐私过滤、权限检查、每日 8 条上限、去重）
+
+        ignore_daily_limit 只给夜间提炼用：00:02 的自动养护会先写掉几条，
+        0:45 的复盘再按自然日数就被挤到没额度了。夜间任务本身有 6 条/晚的
+        提示词约束和 8 条代码上限，不属于「日常自发膨胀」。
+        """
         clean_text = (text or "").strip()[:200]
         if len(clean_text) < 3:
             return False, "记忆内容太短"
@@ -204,7 +210,11 @@ class FourLayerMemory:
 
         with self._lock:
             now = time.time()
-            if source == "self" and self._count_today_self_writes_locked(now) >= DAILY_SELF_LIMIT:
+            if (
+                source == "self"
+                and not ignore_daily_limit
+                and self._count_today_self_writes_locked(now) >= DAILY_SELF_LIMIT
+            ):
                 return False, f"今天主动记忆已达上限（{DAILY_SELF_LIMIT} 条），防膨胀拒绝写入"
 
             # 去重：如果已有高度相似节点（>=0.82），直接强化旧节点而不是重复写

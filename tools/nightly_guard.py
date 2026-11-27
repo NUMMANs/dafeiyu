@@ -232,6 +232,10 @@ def _verify_tuning() -> tuple[list[str], list[str]]:
                 )
             elif delta > 0:
                 notes.append(f"{key}: {prev[key]} → {value}")
+        else:
+            # 第一次写进 tuning.json 的键没有上一轮可比，但必须进台账——
+            # 否则 11-26 那种「实际调了 2 项、台账写调参：无」还会发生。
+            notes.append(f"{key}: 新设为 {value:g}")
     return errors, notes
 
 
@@ -285,6 +289,26 @@ def run_check(allow_new: bool = False) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 锁
 
+def _pid_alive(pid: Any) -> bool:
+    """持锁进程还在不在。查不到就当作还活着，宁可等 TTL 也不要抢活锁。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        rc, out = _ps(f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'ALIVE' }} else {{ 'DEAD' }}")
+        if rc != 0:
+            return True
+        return "ALIVE" in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def cmd_begin(args: argparse.Namespace) -> int:
     if args.owner not in OWNERS:
         _emit({"ok": False, "error": f"owner 只能是 {OWNERS}"})
@@ -297,7 +321,9 @@ def cmd_begin(args: argparse.Namespace) -> int:
         except FileExistsError:
             info = _read_lock()
             age = time.time() - float(info.get("ts") or 0)
-            if age > STALE_SEC:
+            # 进程被任务超时杀掉时锁文件不会自己消失；只等 TTL 会把下一个任务
+            # 堵到 1:00。先看持锁 pid 还在不在，死了立刻回收。
+            if age > STALE_SEC or not _pid_alive(info.get("pid")):
                 try:
                     LOCK_PATH.unlink()
                 except OSError:
@@ -316,8 +342,22 @@ def cmd_begin(args: argparse.Namespace) -> int:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"owner": args.owner, "pid": os.getpid(), "ts": time.time(),
                        "at": datetime.now().isoformat(timespec="seconds")}, f)
-        _emit({"ok": True, "owner": args.owner, "waited_sec": waited,
-               "stale_after_sec": STALE_SEC, "head": _git("rev-parse", "HEAD")})
+        # 上一轮超时被杀时，改动会留在工作区没人管；AUTO_GIT_UPDATE 一 pull 就 stash 吞掉。
+        # 开局先把它们摆出来，让任务决定「先收下还是先还原」，别再留给下一轮捡。
+        dirty = [f"{status} {path}" for status, path in _changed_files()]
+        _emit({
+            "ok": True,
+            "owner": args.owner,
+            "waited_sec": waited,
+            "stale_after_sec": STALE_SEC,
+            "head": _git("rev-parse", "HEAD"),
+            "dirty": dirty,
+            "hint": (
+                "工作区有未提交改动（多半是上一轮超时遗留）：先看清是什么，"
+                "能过 check 就随本轮 finish 一并收下，不能过就 abort 并在汇报里写明"
+                if dirty else ""
+            ),
+        })
         return 0
 
 
