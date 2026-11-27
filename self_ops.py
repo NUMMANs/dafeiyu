@@ -123,6 +123,21 @@ def git_current_commit(short: bool = False) -> str:
     return out if code == 0 else ""
 
 
+def _ahead_behind(remote_ref: str) -> tuple[int, int]:
+    """返回 (本地领先, 上游领先)。拿不到返回 (-1, -1)。
+
+    不能拿「HEAD != 上游」判断有没有新提交：本地有未推送的 commit 时两者同样不等，
+    那样每 60 秒都会误判一次「远程有新提交」，pull 什么也没做却触发一次重启
+    （20:19 那次重启就是这么来的）。
+    """
+    _, ahead_out, _ = _run_git(["rev-list", "--count", f"{remote_ref}..HEAD"], timeout=10)
+    _, behind_out, _ = _run_git(["rev-list", "--count", f"HEAD..{remote_ref}"], timeout=10)
+    try:
+        return int(ahead_out), int(behind_out)
+    except (TypeError, ValueError):
+        return -1, -1
+
+
 def check_remote_update() -> tuple[bool, str]:
     """检查**当前分支的上游**是否有尚未拉取的新提交。
 
@@ -151,7 +166,12 @@ def check_remote_update() -> tuple[bool, str]:
     if code_local != 0 or code_remote != 0:
         return False, f"解析提交失败: {err_local or err_remote}"
 
-    if local_head == remote_head:
+    ahead, behind = _ahead_behind(remote_ref)
+    if behind < 0:
+        return False, "无法解析本地与上游的差异"
+    if behind == 0:
+        if ahead > 0:
+            return False, f"本地 {branch} 领先上游 {ahead} 个未推送提交，不拉取"
         return False, f"已是最新版本 ({local_head[:7]})"
 
     state = load_watchdog_state()
@@ -206,8 +226,10 @@ def git_pull_and_check(auto_pip: bool = True) -> tuple[bool, str]:
         return False, f"git fetch 失败: {err_fetch or '网络或认证异常'}"
 
     code_remote, remote_head, _ = _run_git(["rev-parse", remote_ref], timeout=10)
-    if code_remote == 0 and before_commit and before_commit == remote_head:
-        return False, f"当前已经是最新提交 ({before_commit[:7]})，无需重启"
+    ahead, behind = _ahead_behind(remote_ref)
+    if code_remote == 0 and behind == 0:
+        extra = f"，本地领先 {ahead} 个未推送提交" if ahead > 0 else ""
+        return False, f"当前已经是最新提交 ({before_commit[:7]}){extra}，无需拉取"
 
     stash_note = ""
     _, dirty_out, _ = _run_git(["status", "--porcelain", "--untracked-files=no"], timeout=10)
