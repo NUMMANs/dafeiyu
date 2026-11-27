@@ -177,7 +177,11 @@ class BotResponse:
     def get_bubbles(self) -> list[str]:
         if self.bubbles:
             return self.bubbles
-        return [self.text] if self.text else []
+        if not self.text:
+            return []
+        # 没显式给气泡的（定时任务、任务播报、模板话术）也走一遍拆分：
+        # 以前这里直接 return [self.text]，一段两百字的话就这么整条发出去了。
+        return split_human_bubbles(self.text)
 
 
 # 派活成功后先回一句占位（纯模板，不走模型、不写 L3）。
