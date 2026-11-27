@@ -75,6 +75,11 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "TOPIC_SHARE_MAX_CHARS": (30, 120),
     # 分享时带原帖链接的概率（0~1）。调高 = 更像随手转发，调低 = 更像自己随口一说。
     "TOPIC_SHARE_LINK_PROB": (0.0, 1.0),
+    # 今日生活：冷场分享里讲「今天自己身上的事」的概率（其余是上网找话题）。
+    # 调高 = 更像在过日子，调低 = 更像个资讯号。
+    "LIFE_SHARE_PROB": (0.0, 1.0),
+    # 生活分享正文最多多少字
+    "LIFE_MAX_CHARS": (30, 120),
 
     # ---- 注入方式（夜间「记忆与人格」任务负责）----
     # L3 注文：后台工具读懂链接/图片后留下的话，每轮最多几条、每条多少字、总开关。
@@ -84,6 +89,9 @@ BOUNDS: dict[str, tuple[float, float]] = {
     # L1 旧事 / L2 日记是否注入本轮上下文（0 关 1 开）
     "RECALL_INJECT_ON": (0, 1),
     "DIARY_INJECT_ON": (0, 1),
+    # 「你今天」这块（今天自己的生活进度）是否每轮注入（0 关 1 开）。
+    # 关了之后她照样会分享生活，只是别人问「在干嘛」时容易和刚说过的话打架。
+    "LIFE_INJECT_ON": (0, 1),
     # L2 日记注入方式：看最近几天、最多几条、每条截多少字、整块最多多少字。
     "DIARY_DAYS": (1, 7),
     "DIARY_MAX_ITEMS": (1, 3),
@@ -97,13 +105,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "IMAGE_REPLY_PROB", "PROACTIVE_ENERGY_MIN", "TRIGGER_DEBOUNCE_SEC",
         "TRIGGER_BURST_MAX_ITEMS", "VISION_SUMMARY_CHARS",
         "TOPIC_SHARE_SILENCE_MIN", "TOPIC_SHARE_COOLDOWN_MIN", "TOPIC_SHARE_MAX_CHARS",
-        "TOPIC_SHARE_LINK_PROB",
+        "TOPIC_SHARE_LINK_PROB", "LIFE_SHARE_PROB", "LIFE_MAX_CHARS",
     ),
     "mind": (
         "RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS",
         "L3_NOTE_MAX_ITEMS", "L3_NOTE_MAX_CHARS", "L3_INJECT_ON",
-        "RECALL_INJECT_ON", "DIARY_INJECT_ON", "DIARY_DAYS", "DIARY_MAX_ITEMS",
-        "DIARY_ITEM_CHARS", "DIARY_MAX_CHARS",
+        "RECALL_INJECT_ON", "DIARY_INJECT_ON", "LIFE_INJECT_ON", "DIARY_DAYS",
+        "DIARY_MAX_ITEMS", "DIARY_ITEM_CHARS", "DIARY_MAX_CHARS",
     ),
     "core": (
         "TOPIC_ROAST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC",
@@ -122,11 +130,14 @@ STEP_LIMITS: dict[str, float] = {
     "TOPIC_SHARE_COOLDOWN_MIN": 30,
     "TOPIC_SHARE_MAX_CHARS": 15,
     "TOPIC_SHARE_LINK_PROB": 0.2,
+    "LIFE_SHARE_PROB": 0.2,
+    "LIFE_MAX_CHARS": 15,
     "L3_NOTE_MAX_ITEMS": 1,
     "L3_NOTE_MAX_CHARS": 60,
     "L3_INJECT_ON": 1,
     "RECALL_INJECT_ON": 1,
     "DIARY_INJECT_ON": 1,
+    "LIFE_INJECT_ON": 1,
     "DIARY_DAYS": 1,
     "DIARY_MAX_ITEMS": 1,
     "DIARY_ITEM_CHARS": 20,
@@ -235,7 +246,7 @@ def snapshot() -> dict[str, Any]:
         "step_limits": dict(STEP_LIMITS),
         "judges": {
             kind: judge_extra(kind)
-            for kind in ("l2", "l2_5", "tool_router", "topic_share")
+            for kind in ("l2", "l2_5", "tool_router", "topic_share", "life")
         },
     }
 

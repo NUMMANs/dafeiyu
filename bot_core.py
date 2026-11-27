@@ -18,6 +18,7 @@ from agent_tools import (
 )
 from brain import brain, split_human_bubbles
 from config import BASE_DIR, settings, DATA_DIR
+import daily_life
 from dsh_bridge import is_dsh_available, list_dsh_jobs, submit_dsh_job
 from image_fetcher import download_image_url, search_and_download_image
 import link_reader
@@ -2430,10 +2431,15 @@ class DaFeiYuBotCore:
             daemon=True,
             name=f"topic-share-{group_id[:8]}",
         ).start()
-        logger.info("[%s] 🌐 群里安静了 %.0f 分钟，去网上找个话题", group_id, (now - last_act) / 60)
+        logger.info(
+            "[%s] 🌐 群里安静了 %.0f 分钟，想找个话头（生活线 %s）",
+            group_id,
+            (now - last_act) / 60,
+            "可用" if daily_life.has_candidate() else "今天暂时没有可讲的",
+        )
 
     def _topic_share_worker(self, group_id: str, status: PetStatus) -> None:
-        """后台线程：读最近聊天 → 出关键词 → 搜索 → 写一句话，结果放回 _topic_jobs。"""
+        """后台线程：先看今天的生活线要不要讲，否则读最近聊天 → 出关键词 → 搜索 → 写一句话。"""
         try:
             rows = pet_engine.get_recent_history(group_id, limit=24)
             lines: list[str] = []
@@ -2442,7 +2448,19 @@ class DaFeiYuBotCore:
                 body = " ".join(str(r.get("content") or "").split())[:80]
                 if body:
                     lines.append(f"[{who}]: {body}")
-            out = topic_bubble.compose(brain, group_id, lines)
+            # 两条路：讲今天自己身上发生的事（更像个活人），或者上网找条感兴趣的分享。
+            # 先抽签决定走哪条——生活线没有可讲的事（还没到点/今天讲完了）就自动退回上网。
+            out = None
+            if daily_life.wants_turn():
+                out = daily_life.compose(brain, group_id, lines)
+                if out:
+                    daily_life.note_result("life")
+                else:
+                    logger.info("[%s] 🗓️ 生活线这轮没写出来，改去网上找话题", group_id)
+            if out is None:
+                out = topic_bubble.compose(brain, group_id, lines)
+                if out:
+                    daily_life.note_result("web")
             with self._topic_lock:
                 job = self._topic_jobs.get(group_id)
                 if job is None:

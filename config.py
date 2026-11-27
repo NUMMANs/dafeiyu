@@ -90,6 +90,14 @@ class Settings:
     # 分享时带原帖链接的概率（0~1，默认 0.35）：带链接更像「随手转发」，
     # 但每次都贴就像营销号，所以按概率来。热调键同名，归 0:15 感官任务管。
     TOPIC_SHARE_LINK_PROB: float = float(os.getenv("TOPIC_SHARE_LINK_PROB", "0.35"))
+    # 今日生活：给她一条「今天也在过日子」的线（见 daily_life.py）。冷场时除了上网找话题，
+    # 也会讲讲今天自己身上发生的事——上午出门看见什么、晚上打游戏翻车。
+    # 每天的剧情是懒生成的：整天没机会冒泡就一次模型调用都不花。
+    ENABLE_DAILY_LIFE: bool = _parse_bool(os.getenv("ENABLE_DAILY_LIFE"), True)
+    # 冷场分享时走「今天生活」的概率（另一部分是上网找话题）。0.45 = 差不多一半一半。
+    LIFE_SHARE_PROB: float = float(os.getenv("LIFE_SHARE_PROB", "0.45"))
+    # 生活分享正文最多多少字（超出按句截断）
+    LIFE_MAX_CHARS: int = int(os.getenv("LIFE_MAX_CHARS", "60"))
     # 静默期：默认只从凌晨 1 点睡到 8 点，0 点这段留着发每日统计
     QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))

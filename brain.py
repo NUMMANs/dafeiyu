@@ -416,6 +416,7 @@ def _build_turn_context(
     diary_note: str = "",
     bg_note: str = "",
     job_report: str = "",
+    life_note: str = "",
     l3_notes: list[str] | None = None,
 ) -> str:
     """本轮动态上下文（时间/后台任务/旧事/日记/黑话/情绪），拼在最后一条 user 消息前面。"""
@@ -440,6 +441,10 @@ def _build_turn_context(
         )
     if bg_note:
         extra_blocks.append(bg_note)
+    if life_note:
+        # 她今天自己过的日子（见 daily_life.py）：有了这块，别人问「你在干嘛」时
+        # 不会和半小时前在群里说过的对不上，也能顺口带出「上午买的那包薯片」。
+        extra_blocks.append(life_note)
     if recalled_memory:
         extra_blocks.append(recalled_memory)
     if diary_note:
@@ -747,6 +752,15 @@ class DaFeiYuBrain:
             if group_id and tuning.get_int("L3_INJECT_ON", 1)
             else []
         )
+        # 她今天自己的生活（只放已发生、最近 4 段）：让「你在干嘛」这种回答前后一致
+        life_note = ""
+        if tuning.get_int("LIFE_INJECT_ON", 1):
+            try:
+                import daily_life
+
+                life_note = daily_life.context_line()
+            except Exception as exc:  # noqa: BLE001 - 生活线读不出来不影响聊天
+                logger.warning("今日生活：上下文读取失败: %s", exc)
         turn_context = _build_turn_context(
             status,
             sender,
@@ -757,6 +771,7 @@ class DaFeiYuBrain:
             diary_note=diary_note,
             bg_note=bg_note,
             job_report=job_report,
+            life_note=life_note,
             l3_notes=l3_notes,
         )
         # system 只放静态人设卡：动态内容一旦进了 system，前缀缓存就会从第一个 token 起失效
@@ -1881,6 +1896,121 @@ class DaFeiYuBrain:
             }
         except Exception as exc:
             logger.warning("冷场找话题：分享文本调用失败: %s", exc)
+            return {}
+
+    def generate_daily_life(
+        self,
+        date_str: str,
+        weekday: str,
+        season_hint: str,
+        recent_titles: list[str],
+        slots_spec: list[tuple[str, str, str]],
+        extra: str = "",
+    ) -> list[dict]:
+        """编出「今天这一天」：按作息骨架给出 8 件发生在她身上的具体小事。
+
+        为什么要一次编一整天，而不是每次现编一段：一天之内要有因果。上午买的东西
+        晚上还在吃，出门淋了雨回家鞋还没干——分开编就会互相打架，听起来像两个人在过日子。
+        前几天的事一起喂进来，是为了不重复（不能天天捡猫），也能接着昨天的话头。
+        """
+        if not settings.has_valid_api_key:
+            return []
+        recent = "\n".join(f"- {t}" for t in recent_titles[-24:]) or "（没有记录，这是第一天）"
+        prompt = (
+            f"你是微信群里的「{settings.BOT_NAME}」，一个普通人，不是助手也不是 AI。"
+            f"今天是 {date_str} {weekday}，{season_hint}。\n"
+            f"【你的人设（只学语气和爱好，不要照抄句子）】\n{load_card()[:900]}\n"
+            f"【前几天你干过的事】（别重复；能接着昨天的话头更好）\n{recent}\n"
+            + (f"【额外偏好】{extra}\n" if extra else "")
+            + "请编出你今天这一天，按下面这些时间点各写一件事：\n"
+            + "\n".join(f"- {at} {kind}：{hint}" for at, kind, hint in slots_spec)
+            + "\n要求：\n"
+            "1. 每条都是发生在你自己身上的具体小事，要能说出「在哪儿、是什么、谁说了什么」；\n"
+            "2. 不能是「出去转了转」「看了会儿手机」这种空话，也别写成段子合集——普通的一天，"
+            "有一两件值得说的就够了，其余平淡；\n"
+            "3. 一天之内要连贯：上午买的东西晚上可以吃，出门淋了雨回家就换衣服、鞋还没干，"
+            "熬夜了下午就困；\n"
+            "4. 只写自己的日常，不碰真实新闻、明星、政事、灾害、他人隐私，也别报价格和型号"
+            "（随手买的便宜零食除外）；\n"
+            "5. 时间要跟时段对得上：早上别在打排位，晚上别在挤地铁；\n"
+            "6. interest 给 1~5 分，表示「这件事值不值得在群里说」，一天里最多两条打 4 分以上；\n"
+            "7. title 不超过 16 字；detail 不超过 45 字，而且必须是说完整的一句话"
+            "（别写到一半断掉，宁可少说点）。\n"
+            '只输出 JSON：{"slots": [{"at": "09:40", "title": "...", "detail": "...", '
+            '"interest": 4, "mood": "happy"}, ...]}'
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=1.0,
+                max_tokens=900,
+            )
+            raw = strip_think(resp.choices[0].message.content or "")
+            matched = re.search(r"\{.*\}", raw, re.S)
+            if not matched:
+                logger.info("今日生活：生成结果无法解析 %r", raw[:120])
+                return []
+            data = json.loads(matched.group(0))
+            items = data.get("slots") if isinstance(data, dict) else None
+            return items if isinstance(items, list) else []
+        except Exception as exc:  # noqa: BLE001 - 编不出今天的生活不该影响冒泡
+            logger.warning("今日生活：生成失败: %s", exc)
+            return []
+
+    def compose_life_share(self, event: dict, when_label: str, recent_lines: list[str]) -> dict:
+        """把「今天自己身上发生的一件小事」写成一句群聊话。
+
+        和 ``compose_topic_share`` 的区别：那边有搜回来的材料可以核对，这边是编出来的一天，
+        没有原文可比。所以闸门换成「具体」——必须说出在哪儿、什么东西、什么味道，
+        含糊的（「今天遇到点好笑的事」）重写一遍，还含糊就这轮不发。
+        """
+        if not settings.has_valid_api_key:
+            return {}
+        extra = tuning.judge_extra("life").strip()
+        recent = "\n".join(recent_lines[-8:]) or "（最近没人说话）"
+        detail = str(event.get("detail") or "").strip()
+        prompt = (
+            f"你是微信群里的「{settings.BOT_NAME}」，是群友不是助手。"
+            f"现在是 {datetime.now().strftime('%m月%d日 %H:%M')}，群里安静了很久。\n"
+            f"你今天这一小段：{when_label}，{event.get('kind')}——{event.get('title')}"
+            + (f"（{detail}）" if detail else "")
+            + "\n"
+            f"【你的人设（只学语气，别照抄句子）】\n{load_card()[:900]}\n"
+            f"【最近群聊】（只用来避免驴唇不对马嘴，别接着聊）\n{recent}\n"
+            + (f"【额外偏好】{extra}\n" if extra else "")
+            + "你想把这件事随口发到群里。要求：\n"
+            "1. 只讲这一件事，1~2 句、20~45 字；\n"
+            "2. 必须具体：在哪儿、买了什么、看到了什么、谁说了什么，得写出来；"
+            "不许写成「今天挺有意思」「遇到点好笑的事」这种没有内容的概括；\n"
+            f"3. 时间要用「{when_label}」这种说法，别说得像刚发生（除非确实是刚才）；\n"
+            "4. 第一人称口语，可以带一句自己的评价或吐槽，像随手发的微信；\n"
+            "5. 不要「今日分享」「跟你们说个事」这种开头，不要列点、不要链接、不要 Markdown，"
+            "不要用「你们呢」「有人吗」收尾；\n"
+            "6. 这是你自己的日常，别扯上新闻、明星、别人的隐私。\n"
+            '输出 JSON：{"text": "...", "topic": "不超过10字的主题词", '
+            '"mood": "happy|smug|shocked|gaming|hungry|sleepy|love"}'
+        )
+        try:
+            resp = self._create(
+                [{"role": "user", "content": prompt}],
+                temperature=0.9,
+                max_tokens=220,
+            )
+            raw = strip_think(resp.choices[0].message.content or "")
+            matched = re.search(r"\{.*\}", raw, re.S)
+            if not matched:
+                logger.info("今日生活：分享文本输出无法解析 %r", raw[:120])
+                return {}
+            data = json.loads(matched.group(0))
+            if not isinstance(data, dict):
+                return {}
+            return {
+                "text": " ".join(str(data.get("text") or "").split())[:120],
+                "topic": " ".join(str(data.get("topic") or "").split())[:16],
+                "mood": str(data.get("mood") or "happy"),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("今日生活：分享文本调用失败: %s", exc)
             return {}
 
     def summarize_l3_history(self, rows: list[dict], group_id: str = "") -> str:
