@@ -8,7 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 from bot_core import bot_core
-from config import UPLOADS_DIR, settings
+from config import BASE_DIR, UPLOADS_DIR, settings
+import gitmeta
 from dsh_bridge import (
     build_job_report_file,
     collect_artifacts,
@@ -453,6 +454,10 @@ class WxAutoAdapter:
             last_schedule_check = time.time()
             last_git_check = time.time()
             last_dsh_check = 0.0
+            # 启动时跑在哪个分支/提交上。之后只要它变了，就说明有人改过工作区。
+            run_branch = gitmeta.branch(BASE_DIR)
+            run_commit = gitmeta.commit(BASE_DIR)
+            last_branch_check = time.time()
             while not self._stop_event.is_set():
                 time.sleep(1.0)
                 now_loop = time.time()
@@ -566,6 +571,55 @@ class WxAutoAdapter:
                                     self._safe_send_file(wx, str(hb.sticker_path.resolve()), group)
                         except Exception as exc:
                             logger.warning("[%s] 自主冒泡发送异常: %s", group, exc)
+
+                # 2.9 分支守护：有人在本地 checkout 了别的分支 → 按新分支的代码重启。
+                # 只提交了热加载文件（roles/judges/*.md）则不重启，否则夜间热调每提交一次
+                # 就要把机器人重启一遍。独立于 AUTO_GIT_UPDATE：那个管去远程拉更新，
+                # 这个管本地工作区换了分支，所以关掉自动拉取也照样能切分支。
+                if settings.AUTO_BRANCH_WATCH and (now_loop - last_branch_check) >= settings.AUTO_GIT_POLL_SEC:
+                    last_branch_check = now_loop
+                    try:
+                        branch_now = gitmeta.branch(BASE_DIR)
+                        if branch_now and run_branch and branch_now != run_branch:
+                            logger.info("🪾 检测到分支切换: %s → %s，按新分支代码重启", run_branch, branch_now)
+                            first_group = self.groups[0] if self.groups else ""
+                            if first_group:
+                                self._safe_send(
+                                    wx,
+                                    f"🪾 已切到分支 {branch_now}，正在按该分支的代码重启...",
+                                    first_group,
+                                    "发送分支切换预告",
+                                )
+                            request_restart(
+                                reason=f"分支切换 {run_branch} → {branch_now}",
+                                notify_group=first_group,
+                                delay_sec=2.0,
+                            )
+                            self._stop_event.set()
+                            continue
+                        commit_now = gitmeta.commit(BASE_DIR)
+                        if commit_now and run_commit and commit_now != run_commit:
+                            if gitmeta.touches_code(BASE_DIR, run_commit, commit_now):
+                                logger.info(
+                                    "🪾 本地代码更新 %s → %s（含 .py），重启生效",
+                                    run_commit[:7], commit_now[:7],
+                                )
+                                first_group = self.groups[0] if self.groups else ""
+                                request_restart(
+                                    reason=f"本地代码更新 ({commit_now[:7]})",
+                                    notify_group=first_group,
+                                    delay_sec=2.0,
+                                )
+                                self._stop_event.set()
+                                continue
+                            # 只动了热加载文件（判定规则/文档），下一句就生效，不必重启
+                            logger.info(
+                                "🪾 热加载文件已更新 %s → %s，无需重启",
+                                run_commit[:7], commit_now[:7],
+                            )
+                            run_commit = commit_now
+                    except Exception as exc:
+                        logger.warning("分支守护异常: %s", exc)
 
                 # 3. 定期检测 GitHub 是否有新提交（推送即自动拉取 + 语法校验 + 重启）
                 if settings.AUTO_GIT_UPDATE and (now_loop - last_git_check) >= settings.AUTO_GIT_POLL_SEC:

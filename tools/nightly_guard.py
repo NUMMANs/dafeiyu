@@ -51,6 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import BASE_DIR, DATA_DIR  # noqa: E402
+import gitmeta  # noqa: E402
 import tuning  # noqa: E402
 
 LOCK_PATH = DATA_DIR / "nightly_guard.lock"
@@ -102,7 +103,8 @@ Write-Output ('CANDIDATES=' + $cands.Count + ' NO_UNIQUE_CHILD'); exit 3
 
 def _git(*args: str, input_text: str = "", check: bool = True) -> str:
     proc = subprocess.run(
-        ["git", "-C", str(BASE_DIR), "-c", "core.quotepath=false", *args],
+        ["git", "-C", str(BASE_DIR), *gitmeta.net_args(BASE_DIR),
+         "-c", "core.quotepath=false", *args],
         input=input_text or None,
         capture_output=True,
         text=True,
@@ -431,14 +433,23 @@ def cmd_finish(args: argparse.Namespace) -> int:
         return 4
 
     commit = ""
+    pushed_branch = ""
     if result["changed"]:
         try:
             _git("add", "--", *result["changed"])
             staged = _git("diff", "--cached", "--name-only")
             if staged:
+                # commit 落在当前分支，push 也必须推当前分支。
+                # 以前写死 origin main：在别的分支上跑夜间任务时，push 推的是本地 main
+                # （没动过），git 返回 "Everything up-to-date" 且 exit 0，护栏以为推成功了，
+                # 实际这条 commit 只留在本地分支上，下一轮自动 pull 一快进就没了。
+                branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+                if not branch or branch == "HEAD":
+                    raise RuntimeError("当前处于 detached HEAD，拒绝提交（不知道要推到哪个分支）")
                 _git("commit", "-F", "-", input_text=args.message.strip() + "\n")
                 commit = _git("rev-parse", "HEAD")[:7]
-                _git("push", "--quiet", "origin", "main")
+                _git("push", "--quiet", "--set-upstream", "origin", branch)
+                pushed_branch = branch
         except RuntimeError as exc:
             _emit({"ok": False, "stage": "git", "error": str(exc), **result,
                    "hint": "提交/推送失败：不要放着不管，AUTO_GIT_UPDATE 会 stash 吞改动"})
@@ -450,6 +461,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         pass
     out = {"ok": True, "commit": commit or "", "pushed": bool(commit),
+           "branch": pushed_branch,
            "changed": result["changed"], "knob_notes": result["knob_notes"],
            "ledger": str(LEDGER_FILE)}
     if args.restart:
@@ -547,13 +559,17 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         _emit({"ok": False, "error": f"将 revert {head[:7]} 并 push；确认请加 --yes"})
         return 2
     try:
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if not branch or branch == "HEAD":
+            raise RuntimeError("当前处于 detached HEAD，拒绝 revert（不知道要推到哪个分支）")
         _git("revert", "--no-edit", "HEAD")
-        _git("push", "--quiet", "origin", "main")
+        _git("push", "--quiet", "origin", branch)
     except RuntimeError as exc:
         _emit({"ok": False, "error": str(exc)})
         return 3
     _emit({"ok": True, "reverted": head[:7], "new_head": _git("rev-parse", "HEAD")[:7],
-           "hint": "回滚已推送，等自动更新或手动重启让机器人加载回来"})
+           "branch": branch,
+           "hint": "回滚已推到当前分支，等自动更新或手动重启让机器人加载回来"})
     return 0
 
 

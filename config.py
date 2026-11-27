@@ -166,6 +166,10 @@ class Settings:
     # Git 自动拉取更新与看门狗守护配置
     AUTO_GIT_UPDATE: bool = _parse_bool(os.getenv("AUTO_GIT_UPDATE"), True)
     AUTO_GIT_POLL_SEC: int = max(15, int(os.getenv("AUTO_GIT_POLL_SEC", "60")))
+    # 分支守护：有人在本地切了分支 / HEAD 变了，就按新代码重启。
+    # 和 AUTO_GIT_UPDATE 分开：那个管「去远程拉更新」，这个管「本地工作区换了分支」，
+    # 所以关掉自动拉取也照样能切分支。
+    AUTO_BRANCH_WATCH: bool = _parse_bool(os.getenv("AUTO_BRANCH_WATCH"), True)
 
     # DeepSeek Harness (DSH) CLI 独立后台异步执行配置
     ENABLE_DSH: bool = _parse_bool(os.getenv("ENABLE_DSH"), True)
