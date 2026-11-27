@@ -123,10 +123,37 @@ def render_caption_sticker(base_path: Path, caption: str) -> Path:
         return base_path
 
 
+def is_local_custom(path: Path | None) -> bool:
+    """是不是她自己家的图：stickers/<情绪>/ 下的定制形象图，或压好配字的成品。
+
+    只有这两类算「本地定制」；网络抓来的（web_cache）和偷来的群友图（stolen）
+    都算外来的，发之前必须过视觉审核。
+    """
+    if not path:
+        return False
+    try:
+        p = path.resolve()
+    except OSError:
+        return False
+    for trusted_root in (STICKERS_DIR.resolve(), GENERATED_DIR.resolve()):
+        try:
+            rel = p.relative_to(trusted_root)
+        except ValueError:
+            continue
+        head = rel.parts[0].lower() if rel.parts else ""
+        # web_cache / web_cache_legacy_xxx / stolen 都是外来图
+        if head == "stolen" or head.startswith("web_cache"):
+            return False
+        return True
+    return False
+
+
 def _fetch_online_meme(query: str, recent_urls: deque[str]) -> Path | None:
     """
-    实时从网上拉取真实网友制作的爆款表情包（永雏塔菲 / 抽象 / LoL / 熊猫头），
-    自动过滤长图/坏图并缓存到本地 stickers/web_cache/。
+    从网上按关键词捞一张梗图，自动过滤长图/坏图并缓存到本地 stickers/web_cache/。
+
+    现在只在本地定制图凑不出来时才走这条路——搜回来的图是网友做的，
+    风格、角色都不一定是大肥鱼，要过完视觉审核才可能发出去。
     """
     try:
         sn = random.choice([0, 6, 12, 18])
@@ -218,9 +245,9 @@ def _fetch_online_meme(query: str, recent_urls: deque[str]) -> Path | None:
 
 class StickerManager:
     """
-    大肥鱼表情包引擎（真实网络爆款表情包主力 + 偷群友图 + 本地定制图兜底）：
-    - 80% 实时抓发真实网上的「永雏塔菲 / 抽象 / LoL / 熊猫头」爆款表情包
-    - 20% 混搭偷来的群友梗图 & 本地定制配字大肥鱼
+    大肥鱼表情包引擎（本地定制图主力 + 网络梗图补位 + 偷群友图默认关）：
+    - 优先发`stickers/<情绪>/` 下她自己的定制形象图，压上配字就发
+    - 本地图都刚发过一轮，或这个情绪压根没图时，才去网上抓一张（要过视觉审核）
     - 12 张 LRU 防重，彻底告别单调
     """
 
@@ -283,24 +310,45 @@ class StickerManager:
             return False
         return False
 
+    def _local_sticker(self, base: Path, mood: str, caption: str | None) -> Path:
+        """本地定制底图 + 配字，成品落在 data/generated_stickers/。"""
+        self._recent_bases.append(str(base.resolve()))
+        final_caption = (caption or "").strip() or random.choice(
+            DEFAULT_CAPTIONS.get(mood, DEFAULT_CAPTIONS["happy"])
+        )
+        return render_caption_sticker(base, final_caption)
+
     def pick_sticker(self, mood: str, caption: str | None = None, keyword: str = "") -> Path | None:
         """挑一张表情包。只有她自己点名要图时才会走到这里（见 bot_core._resolve_sticker）。
 
-        keyword 是她写的 `[图:xxx]`：比情绪标签准得多，优先按它搜。
+        顺序：本地定制图（同情绪优先）→ 网络抓图 → 偷来的群友图 → 本地兜底。
+        本地图是她自己的形象，风格不会跑偏，也不用过视觉审核，所以让它在最前面。
+        keyword 是她写的 `[图:xxx]`：本地图轮空了，才拿它去网上搜。
         """
         mood = (mood or "happy").lower().strip()
         if mood not in VALID_MOODS:
             mood = "happy"
         keyword = (keyword or "").strip()[:16]
 
-        # 1. 她自己点了题的图：直接按关键词去搜，命中率最高
+        local_mood = self._collect_for_mood(mood)
+        fresh_local = [p for p in local_mood if str(p.resolve()) not in self._recent_bases]
+
+        # 1. 本地定制图优先：这个情绪还有没发过的，直接用
+        if fresh_local:
+            return self._local_sticker(random.choice(fresh_local), mood, caption)
+
+        # 2. 本地图都刚发过：大概率还是发本地（换个配字），小概率换张网络图透口气
+        if local_mood and random.random() < settings.STICKER_LOCAL_FIRST_PROB:
+            return self._local_sticker(random.choice(local_mood), mood, caption)
+
+        # 3. 她自己点了题的图：按关键词去搜，命中率最高
         if keyword and settings.STICKER_WEB_FETCH_ON:
             web_img = _fetch_online_meme(f"{keyword} 表情包", self._recent_urls)
             if web_img and web_img.is_file():
                 self._recent_bases.append(str(web_img.resolve()))
                 return web_img
 
-        # 2. 按情绪抓网络梗图（每次抓一张，审核在发之前做）
+        # 4. 按情绪抓网络梗图（每次抓一张，审核在发之前做）
         if settings.STICKER_WEB_FETCH_ON:
             query = random.choice(WEB_MEME_QUERIES.get(mood, WEB_MEME_QUERIES["happy"]))
             web_img = _fetch_online_meme(query, self._recent_urls)
@@ -315,7 +363,7 @@ class StickerManager:
                 self._recent_bases.append(str(chosen_web.resolve()))
                 return chosen_web
 
-        # 3. 反手发群友梗图（默认关：这些图来路不明，往往带着别人群的水印和梗）
+        # 5. 反手发群友梗图（默认关：这些图来路不明，往往带着别人群的水印和梗）
         if settings.STICKER_STEAL_ON:
             stolen = self._collect_stolen()
             if stolen and random.random() < 0.35:
@@ -324,17 +372,12 @@ class StickerManager:
                 self._recent_bases.append(str(chosen.resolve()))
                 return chosen
 
-        # 4. 本地定制大肥鱼 + 配字兜底
-        candidates = self._collect_for_mood(mood) or self._collect_all()
-        if not candidates:
+        # 6. 兜底：这个情绪确实没图，其它情绪的本地定制图也认，总比不发强
+        fallback = self._collect_all()
+        if not fallback:
             return None
-        fresh = [p for p in candidates if str(p.resolve()) not in self._recent_bases]
-        base = random.choice(fresh or candidates)
-        self._recent_bases.append(str(base.resolve()))
-        final_caption = (caption or "").strip() or random.choice(
-            DEFAULT_CAPTIONS.get(mood, DEFAULT_CAPTIONS["happy"])
-        )
-        return render_caption_sticker(base, final_caption)
+        fresh_all = [p for p in fallback if str(p.resolve()) not in self._recent_bases]
+        return self._local_sticker(random.choice(fresh_all or fallback), mood, caption)
 
     def to_web_url(self, sticker_path: Path | None) -> str | None:
         if not sticker_path:

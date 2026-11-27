@@ -66,8 +66,14 @@ class Settings:
     STICKER_REPLY_PROB: float = float(os.getenv("STICKER_REPLY_PROB", "0"))
     # 发图前是否过视觉审核。关掉就等于"挑到什么发什么"，不建议。
     STICKER_AUDIT_ON: bool = _parse_bool(os.getenv("STICKER_AUDIT_ON"), True)
+    # 本地定制图（stickers/<情绪>/ 与压字成品）默认不再过审核：图是她自己的形象，
+    # 白名单资产，风格不会跑偏，不需要每张都花一次视觉调用。置 true 可恢复全量审核。
+    STICKER_LOCAL_AUDIT_ON: bool = _parse_bool(os.getenv("STICKER_LOCAL_AUDIT_ON"), False)
+    # 本地定制图优先：这个情绪的本地图都刚发过一轮时，还有多大比例继续用本地图
+    # （剩下的概率去网上抓一张换换口味）。
+    STICKER_LOCAL_FIRST_PROB: float = float(os.getenv("STICKER_LOCAL_FIRST_PROB", "0.8"))
     # 每小时最多发几张，防她连着刷图
-    STICKER_MAX_PER_HOUR: int = int(os.getenv("STICKER_MAX_PER_HOUR", "3"))
+    STICKER_MAX_PER_HOUR: int = int(os.getenv("STICKER_MAX_PER_HOUR", "5"))
     # 去网上搜表情包（搜回来还要过审核）
     STICKER_WEB_FETCH_ON: bool = _parse_bool(os.getenv("STICKER_WEB_FETCH_ON"), True)
     # 反手发群友的梗图。默认关：这些图来路不明，常带别处的水印和别人的梗

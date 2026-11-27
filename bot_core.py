@@ -37,7 +37,7 @@ from safety_guard import (
 from scheduler import scheduler
 import tuning
 from self_ops import git_pull_and_check, request_restart, self_edit_code
-from sticker_manager import sticker_manager
+from sticker_manager import is_local_custom, sticker_manager
 import topic_bubble
 
 logger = logging.getLogger(__name__)
@@ -325,8 +325,11 @@ class DaFeiYuBotCore:
 
         以前是 `random.random() < STICKER_REPLY_PROB` 随手贴一张，跟回复内容没关系，
         还常贴出别人家角色——群里看到的「这谁发的图」就是这么来的。
-        现在只有她自己写了 `[图:关键词]` 才发；挑完再过一道视觉审核，
-        不合格直接丢，宁可不发。
+        现在只有她自己写了 `[图:关键词]` 才发。
+
+        审核分两档：本地定制图（她自己的形象 + 压字成品）是自己家的白名单资产，
+        默认不再过视觉审核（STICKER_LOCAL_AUDIT_ON 可恢复）；网络抓图和偷来的群友图
+        照旧严格审核，不合格直接丢，宁可不发。
         """
         keyword = (keyword or "").strip()
         if not keyword:
@@ -338,7 +341,9 @@ class DaFeiYuBotCore:
         if not path or not path.is_file():
             logger.info("🎭 想要图[%s]，没挑到合适的", keyword)
             return None
-        if settings.STICKER_AUDIT_ON:
+        trusted = is_local_custom(path)
+        need_audit = settings.STICKER_AUDIT_ON and (not trusted or settings.STICKER_LOCAL_AUDIT_ON)
+        if need_audit:
             ok, why = brain.audit_sticker(path, keyword=keyword, context=context)
             if not ok:
                 logger.info("🎭 图没通过审核，这次不发 [%s]: %s", path.name, why)
@@ -350,7 +355,12 @@ class DaFeiYuBotCore:
                     pass
                 return None
         self._sticker_sent_ts.append(time.time())
-        logger.info("🎭 发图 [%s] 关键词=%s", path.name, keyword)
+        logger.info(
+            "🎭 发图 [%s] 关键词=%s%s",
+            path.name,
+            keyword,
+            "（本地定制，免审）" if trusted and not need_audit else "",
+        )
         return path
 
     def is_quiet_hours(self) -> bool:

@@ -610,21 +610,27 @@ uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
 
 #### 3.9.4 表情包
 
-`sticker_manager.py` 的优先级：
+发不发图由她自己定：只有回复里写了 `[图:关键词]` 才发，`bot_core._resolve_sticker` 拿到空关键词直接返回 None。
 
-1. 75% 概率实时抓 360 图片搜索的“大肥鱼/猫猫”表情包；失败则从 `stickers/web_cache/` 随机抽；
-2. 35% 概率发“偷来的”群友梗图（`stickers/stolen/`，最多 30 张）；
-3. 本地 `stickers/<mood>/` 或 `stickers/<mood>.jpg`，用 Pillow 压字（白字黑描边），缓存到 `data/generated_stickers/`；
-4. 12 张 LRU 防重；`to_web_url` 把本地路径映射成 `/stickers/...` 或 `/generated_stickers/...`。
+`sticker_manager.pick_sticker` 的优先级（2026-11-27 起**本地定制图优先**）：
 
-优点：本地兜底 + 网络新鲜感 + 偷图斗图，产品感强；配字渲染用系统微软雅黑，Windows 下效果好。
+1. 本地定制图（`stickers/<mood>/` 或 `stickers/<mood>.jpg`）：这个情绪还有没发过的就直接用，Pillow 压字（白字黑描边）后落到 `data/generated_stickers/`；
+2. 本地图都刚发过一轮时，按 `STICKER_LOCAL_FIRST_PROB`（默认 0.8）继续用本地图换个配字，剩下的概率去网上抓一张换口味；
+3. 网络抓图：`[图:关键词]` 命中时按关键词搜，否则按月情绪词表搜；抓不到再从 `stickers/web_cache/` 随机抽；
+4. 偷来的群友梗图（`stickers/stolen/`，`STICKER_STEAL_ON=false` 默认关）；
+5. 兜底：这个情绪确实没图时，其它情绪的本地定制图也认；
+6. 12 张 LRU 防重；`to_web_url` 把本地路径映射成 `/stickers/...` 或 `/generated_stickers/...`。
+
+审核分两档：本地定制图是自家白名单资产，默认免审（`STICKER_LOCAL_AUDIT_ON=true` 可恢复全量审核）；网络抓图和偷来的图必须过 `brain.audit_sticker`，fail-closed，不合格直接丢、`web_cache` 里那张顺手删掉。每小时上限 `STICKER_MAX_PER_HOUR`（默认 5）。
+
+优点：形象统一（优先自家图）+ 网络新鲜感兜底，配字用系统微软雅黑，Windows 下效果好。
 
 问题：
 
-- `pick_sticker` 在回复发送前同步执行；75% 概率走网络，`_fetch_online_meme` 每次尝试 4.5s、最多 12 个候选，最坏可能 50s+，直接拖慢回复；
+- 本地图优先的代价是「多样性靠补图」：`stickers/<mood>/` 目前多数情绪只有 1~2 张，纯本地时会反复出现同一张底图（只能换配字缓解）；
+- `pick_sticker` 在回复发送前同步执行，一旦走到网络分支，`_fetch_online_meme` 每次尝试 4.5s、最多 12 个候选，最坏可能 50s+，直接拖慢回复；
 - 缓存写 `out_path.write_bytes(raw)` 非原子，多线程同时抓同一 URL 可能写坏；
-- `_recent_bases` / `_recent_urls` 是共享 deque，无锁；并发下防重会失效；
-- 网络图无审核，可能抓到不适宜内容；公开群有风险。
+- `_recent_bases` / `_recent_urls` 是共享 deque，无锁；并发下防重会失效。
 
 ### 3.10 插件系统的真实形态
 
