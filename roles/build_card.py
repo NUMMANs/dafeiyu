@@ -29,6 +29,16 @@ EVOLVE_HEADER = "## 我的自我进化记录"
 MAX_EVOLVE_ITEMS = 15
 DAILY_EVOLVE_LIMIT = 2
 
+# 人格卡里的「兴趣区」：她自己写的「看见什么会来劲」。
+# L2.5 改成兴趣判定后，这一段会整段交给判定器（brain.judge_topic_interest），
+# 所以它必须能从模板里单独取出来 —— 不能取编译卡，编译卡里还掺着操作卡和进化记录。
+INTEREST_HEADER = "## 我的兴趣区"
+INTEREST_MAX_CHARS = 900
+# 这几条钉死，夜间复盘不许删：吐槽是她明确要的爱好，删了 L2.5 就退化成「只看话题热不热」。
+INTEREST_PINNED = ("吐槽",)
+
+_interest_cache: tuple[float, str] = (0.0, "")
+
 
 def _strip_quotes(text: str) -> str:
     """去掉文件开头那段「本文件是…」的说明引用。
@@ -149,6 +159,54 @@ def load_card(persona: str | None = None) -> str:
     if need_rebuild:
         return build_card()
     return out_path.read_text(encoding="utf-8")
+
+
+def interest_zone(limit: int = INTEREST_MAX_CHARS) -> str:
+    """取人格卡里「我的兴趣区」那一段正文，给 L2.5 兴趣判定当依据。
+
+    只读模板文件（`roles/大肥鱼.人格.md`）而不是编译卡：编译卡里还掺着操作卡与
+    自我进化记录，把那些喂给判定器会让它把「怎么用工具」当成她的爱好。
+
+    以「（」开头的说明行跳过（那是写给人看的注解）；有 `- ` 条目时只取条目，
+    段落里那句「这一块是我的雷达…」不会混进去当爱好。没有这一段时返回空串，
+    调用方按「没有兴趣区」处理 —— 宁可判定器保守，也不要让她对什么都来劲。
+    """
+    global _interest_cache
+    try:
+        mtime = PERSONA_PATH.stat().st_mtime
+    except OSError:
+        return ""
+    if _interest_cache[0] == mtime:
+        return _interest_cache[1]
+    try:
+        text = PERSONA_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    blocks: list[str] = []
+    bullets: list[str] = []
+    prose: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("## "):
+            if inside:
+                break
+            inside = s.startswith(INTEREST_HEADER)
+            continue
+        if not inside or not s:
+            continue
+        if s.startswith(("（", "(", ">")):
+            continue
+        # 条目才是「她对什么来劲」；段落开头那句「这一块是我的雷达…」是人类注释，
+        # 混进判定器会变成一条假的兴趣（实测它会把「我在群里看见就想说两句」当爱好）。
+        if s.startswith("- "):
+            bullets.append(s)
+        else:
+            prose.append(f"- {s}")
+    blocks = bullets or prose
+    zone = "\n".join(blocks).strip()[:limit]
+    _interest_cache = (mtime, zone)
+    return zone
 
 
 def evolve_persona(note: str, persona: str | None = None) -> tuple[bool, str]:

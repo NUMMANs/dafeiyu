@@ -271,7 +271,7 @@ class DaFeiYuBotCore:
         self._last_assistant_ts: dict[str, float] = {}
         self._last_bot_reply_ts: dict[str, float] = {}
         self._last_group_activity_ts: dict[str, float] = {}
-        # L2.5 冷场重启话题吐槽：只靠 TOPIC_GAP_SEC 控频，不再有同群冷却/日上限
+        # L2.5 冷场重开话题的「兴趣判定」：只靠 TOPIC_GAP_SEC 控频，不再有同群冷却/日上限
         # L2/L2.5 去抖队列：群里连续发言时先挂起，等停顿够久再判定（适配器每秒 pop 一次）
         self._pending_trigger: dict[str, dict] = {}
         self._pending_lock = threading.Lock()
@@ -418,7 +418,7 @@ class DaFeiYuBotCore:
 
         # 追认必须有时间上的连贯性：我二十多分钟前随口一句，现在这句不可能是「接我话」。
         # 不加这条限制时，只要我发过一次言、后面又没攒满 5 条，L2 就会长期霸占判定机会，
-        # 冷场后重新起的话题（本该走 L2.5 吐槽雷达）永远轮不到 —— 2026-11-25 实测：
+        # 冷场后重新起的话题（本该走 L2.5 兴趣判定）永远轮不到 —— 2026-11-25 实测：
         # 20:52 大肥鱼发言，21:16:59 群友隔 23 分钟开话题，L2 抢走判定返回 NO，L2.5 一次没跑。
         asst_ts = float(recent[last_asst_idx].get("created_ts") or 0.0)
         followup_window = tuning.get_int("FOLLOWUP_WINDOW_SEC", settings.FOLLOWUP_WINDOW_SEC)
@@ -462,7 +462,7 @@ class DaFeiYuBotCore:
         return verdict
 
     @staticmethod
-    def _roast_text_ok(text: str) -> bool:
+    def _topic_probe_ok(text: str) -> bool:
         """一句话够不够格当「话题锚点」：非指令、非原始 XML、有基本话题量。"""
         body = (text or "").strip()
         if len(body) < 6:
@@ -482,7 +482,7 @@ class DaFeiYuBotCore:
             return False
         return sum(1 for ch in body if "\u4e00" <= ch <= "\u9fff") >= 1
 
-    def _roast_gate(
+    def _interest_gate(
         self,
         group_id: str,
         text: str,
@@ -499,12 +499,12 @@ class DaFeiYuBotCore:
 
         返回 (是否值得送判定, 冷场时长的人类可读描述)。
         """
-        if not settings.ENABLE_TOPIC_ROAST or self.is_quiet_hours():
+        if not settings.ENABLE_TOPIC_INTEREST or self.is_quiet_hours():
             return False, ""
 
-        if not self._roast_text_ok(text):
+        if not self._topic_probe_ok(text):
             return False, ""
-        # 进程刚启动时不知道这个群冷场了多久，宁可不吐槽，避免重启后乱接一句话
+        # 进程刚启动时不知道这个群冷场了多久，宁可不接话，避免重启后乱接一句话
         if prev_activity_ts <= 0:
             return False, ""
 
@@ -515,7 +515,7 @@ class DaFeiYuBotCore:
         gap_desc = f"约 {int(gap // 3600)} 小时" if gap >= 3600 else f"约 {int(gap // 60)} 分钟"
         return True, gap_desc
 
-    def _roast_judge(
+    def _interest_judge(
         self,
         group_id: str,
         sender: str,
@@ -524,7 +524,7 @@ class DaFeiYuBotCore:
         multi_speaker: bool = False,
     ) -> str:
         """
-        L2.5 正式判定：调轻量判定器，通过就返回可吐槽的点，否则返回空串。
+        L2.5 正式判定：调轻量判定器，通过就返回「她感兴趣的那个点」，否则返回空串。
 
         text 可能是这一波连续发言的合并探针：同一人连发时按行拼接，
         多人接话时每行带 `[说话人]:` 前缀（multi_speaker=True），
@@ -547,7 +547,7 @@ class DaFeiYuBotCore:
         if merged_lines:
             recent = [m for m in recent if (m.get("content") or "").strip() not in merged_lines]
 
-        angle = brain.judge_topic_roast(
+        angle = brain.judge_topic_interest(
             sender=sender,
             text=body,
             recent_history=recent,
@@ -560,7 +560,7 @@ class DaFeiYuBotCore:
             return ""
 
         logger.info(
-            "🔥 L2.5 冷场吐槽放行：%s 隔 %s 开话题「%s」，槽点=%s",
+            "🔥 L2.5 兴趣放行：%s 隔 %s 开话题「%s」，她想说=%s",
             sender,
             gap_desc,
             body[:40].replace("\n", " / "),
@@ -630,7 +630,7 @@ class DaFeiYuBotCore:
                 return
             self._pending_trigger[group_id] = {
                 "group_id": group_id,
-                "kind": kind,  # "l2" | "roast"
+                "kind": kind,  # "l2" | "interest"
                 "sender": sender,
                 # 每项记说话人：多人接话时探针要带 [昵称] 前缀，不能让判定器以为是一人连发
                 "burst": [{"sender": (sender or "").strip(), "text": body}],
@@ -690,17 +690,17 @@ class DaFeiYuBotCore:
 
     def _judge_pending(self, item: dict) -> tuple[bool, str, str, str]:
         """
-        执行一次挂起的判定，返回 (是否要回复, roast 槽点, 探针文本, 主说话人)。
+        执行一次挂起的判定，返回 (是否要回复, 她感兴趣的点, 探针文本, 主说话人)。
 
-        - L2.5：判定对象是这一波的**全部**发言（合并探针），因为是评价整段话题；
+        - L2.5：判定对象是这一波的**全部**发言（合并探针），因为要看整段话题落在她兴趣区哪一块；
         - L2：判定对象只取**最后一句**（「现在这句是不是在接我话」），
               前面的几句已经落库成历史上下文，再拼进探针只会重复。
         """
         group_id = item["group_id"]
         fallback = (item.get("sender") or "").strip()
-        if item.get("kind") == "roast":
+        if item.get("kind") == "interest":
             probe, who, multi = self._compose_burst(item.get("burst") or [], primary="first")
-            angle = self._roast_judge(
+            angle = self._interest_judge(
                 group_id,
                 who or fallback,
                 probe,
@@ -721,15 +721,15 @@ class DaFeiYuBotCore:
         gap = float(item.get("gap_sec") or 0.0)
         if (
             gap >= tuning.get_int("TOPIC_GAP_SEC", settings.TOPIC_GAP_SEC)
-            and settings.ENABLE_TOPIC_ROAST
+            and settings.ENABLE_TOPIC_INTEREST
             and not self.is_quiet_hours()
         ):
             probe2, who2, multi2 = self._compose_burst(burst, primary="first")
-            if self._roast_text_ok(probe2):
+            if self._topic_probe_ok(probe2):
                 gap_desc = (
                     f"约 {int(gap // 3600)} 小时" if gap >= 3600 else f"约 {int(gap // 60)} 分钟"
                 )
-                angle = self._roast_judge(
+                angle = self._interest_judge(
                     group_id,
                     who2 or fallback,
                     probe2,
@@ -778,7 +778,7 @@ class DaFeiYuBotCore:
                 probe[:40].replace("\n", " / "),
             )
             # 合并探针里的原始单条，回复前从历史尾部摘掉，避免模型以为群友说了两遍
-            if item.get("kind") == "roast":
+            if item.get("kind") == "interest":
                 strip_texts = [
                     b["text"].strip() for b in (item.get("burst") or []) if (b.get("text") or "").strip()
                 ]
@@ -791,8 +791,8 @@ class DaFeiYuBotCore:
                     text=probe,
                     quoted_sender=item.get("quoted", ""),
                     now=now,
-                    roast_angle=angle,
-                    allow_image_lookup=(item.get("kind") != "roast"),
+                    interest_angle=angle,
+                    allow_image_lookup=(item.get("kind") != "interest"),
                     history_strip=strip_texts,
                 )
             except Exception as exc:
@@ -1328,7 +1328,7 @@ class DaFeiYuBotCore:
         clean_text = (text or "").strip()
 
         # 1. 记录群友发来的消息 + 更新情绪惯性状态机
-        # 先取旧值：下面的赋值会覆盖它，而 L2.5 吐槽判定需要「距上一条消息隔了多久」
+        # 先取旧值：下面的赋值会覆盖它，而 L2.5 兴趣判定需要「距上一条消息隔了多久」
         prev_activity_ts = self._last_group_activity_ts.get(group_id, 0.0)
         self._last_group_activity_ts[group_id] = now
         if clean_text:
@@ -1381,7 +1381,7 @@ class DaFeiYuBotCore:
 
         # 4. 判断文本消息是否触发大肥鱼（L1：@唤名 或 以名字开头）
         triggered = self._is_triggered(group_id, clean_text, force_trigger=force_trigger)
-        roast_angle = ""
+        interest_angle = ""
 
         if image_path is None and not triggered:
             followup_ok, is_quoted = self._followup_gate(group_id, clean_text, quoted_sender)
@@ -1394,9 +1394,9 @@ class DaFeiYuBotCore:
                 if followup_ok:
                     kind = "l2"
                 elif clean_text:
-                    roast_ok, gap_desc = self._roast_gate(group_id, clean_text, now, prev_activity_ts)
-                    if roast_ok:
-                        kind = "roast"
+                    interest_ok, gap_desc = self._interest_gate(group_id, clean_text, now, prev_activity_ts)
+                    if interest_ok:
+                        kind = "interest"
 
                 if kind and settings.ENABLE_TRIGGER_DEBOUNCE:
                     # 连发场景：先登记，等这一波说完（停顿）再由适配器触发判定
@@ -1412,20 +1412,20 @@ class DaFeiYuBotCore:
                     )
                     return BotResponse(should_reply=False)
 
-                if kind == "roast":
-                    roast_angle = self._roast_judge(group_id, sender, clean_text, gap_desc)
-                    triggered = bool(roast_angle)
+                if kind == "interest":
+                    interest_angle = self._interest_judge(group_id, sender, clean_text, gap_desc)
+                    triggered = bool(interest_angle)
                 elif kind == "l2":
                     triggered = self._followup_judge(group_id, sender, clean_text)
                     if not triggered and clean_text:
                         # L2 说「不是在接我话」之后，再把机会还给 L2.5：
-                        # 冷场后重新开的话题本来就该由吐槽雷达接手，不能被 L2 的 NO 直接吞掉
-                        roast_ok, gap_desc = self._roast_gate(
+                        # 冷场后重新开的话题本来就该由兴趣判定接手，不能被 L2 的 NO 直接吞掉
+                        interest_ok, gap_desc = self._interest_gate(
                             group_id, clean_text, now, prev_activity_ts
                         )
-                        if roast_ok:
-                            roast_angle = self._roast_judge(group_id, sender, clean_text, gap_desc)
-                            triggered = bool(roast_angle)
+                        if interest_ok:
+                            interest_angle = self._interest_judge(group_id, sender, clean_text, gap_desc)
+                            triggered = bool(interest_angle)
 
         if image_path is None and not triggered:
             return self._maybe_proactive_chime_in(group_id, sender, clean_text, now)
@@ -1439,7 +1439,7 @@ class DaFeiYuBotCore:
             text=clean_text,
             quoted_sender=quoted_sender,
             now=now,
-            roast_angle=roast_angle,
+            interest_angle=interest_angle,
             image_path=image_path,
         )
 
@@ -1776,7 +1776,7 @@ class DaFeiYuBotCore:
         text: str,
         quoted_sender: str,
         now: float,
-        roast_angle: str = "",
+        interest_angle: str = "",
         image_path: Path | None = None,
         allow_image_lookup: bool = True,
         history_strip: list[str] | None = None,
@@ -1784,13 +1784,13 @@ class DaFeiYuBotCore:
         """
         「已决定回复」之后的统一流程：关联图片 → 调大脑 → 养成记账 → 挑表情包 → 写历史。
 
-        被 handle_message（@唤醒/追认/吐槽）和 pop_due_triggers（停顿后判定）共用，
+        被 handle_message（@唤醒/追认/兴趣接话）和 pop_due_triggers（停顿后判定）共用，
         保证两条入口的统计、表情包、历史落库行为完全一致。
         """
         # 0. 工具路由：先让轻量判定器看这句是不是在指挥我干活。
         #    要派活就先回一句模板占位（不进 L3），真正的活在 DSH 后台跑，结果由巡检投递回来。
-        #    吐槽任务和看图不走这条路：吐槽是纯嘴活，看图当场就能办。
-        if not roast_angle and image_path is None:
+        #    兴趣接话和看图不走这条路：接话是纯嘴活，看图当场就能办。
+        if not interest_angle and image_path is None:
             routed_task = self._route_tool_task(group_id, sender, text)
             if routed_task:
                 ack = random.choice(DISPATCH_ACKS)
@@ -1808,7 +1808,7 @@ class DaFeiYuBotCore:
         # 5. 如果这条是纯文本触发，从本群 SQLite 近期历史图片中智能关联（支持跨人问图、序号问图、引用图片、连续追问）
         effective_image = image_path
         image_sender = sender if effective_image is not None else ""
-        if effective_image is None and allow_image_lookup and not roast_angle:
+        if effective_image is None and allow_image_lookup and not interest_angle:
             effective_image, image_sender = self._pick_referenced_image(
                 group_id=group_id,
                 sender=sender,
@@ -1840,7 +1840,7 @@ class DaFeiYuBotCore:
             image_path=effective_image,
             group_id=group_id,
             image_sender=image_sender,
-            roast_hint=roast_angle,
+            interest_hint=interest_angle,
             # 后台还有活在跑时，告诉她一声，免得重复派活或假装做完了
             bg_note=self._bg_note(group_id),
         )

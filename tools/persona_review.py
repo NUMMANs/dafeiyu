@@ -57,12 +57,17 @@ MAX_PERSONA_CHARS = 60
 MAX_JUDGE_ITEMS = 5
 MAX_JUDGE_CHARS = 45
 MAX_ROUTER_ITEMS = 3
+# 兴趣区（人格卡的一段，L2.5 兴趣判定靠它）：一晚最多加 2 删 2，总数不超过 12 条，每条 30 字
+MAX_INTEREST_ITEMS = 12
+MAX_INTEREST_CHARS = 30
+MAX_INTEREST_ADD = 2
+MAX_INTEREST_DROP = 2
 
 PERSONA_BANNED = ("喵", "塔菲", "峰哥", "AI", "模型", "机器人", "助手", "客服", "作为一个")
 # 只挡「改输出格式」的措辞。YES/NO 不能挡 —— 判定规则本来就要写「什么情况判 YES」，
 # 早先连这个词一起挡，结果 L2 的建议全被丢掉，等于这一层从没调过。
 JUDGE_BANNED = ("输出格式", "只输出", "JSON", "返回格式", "分数", "阈值", "只回")
-# L2.5 只该回答「这段内容值不值得吐槽」，「安静多久、要不要开口」是 TOPIC_GAP_SEC 的活。
+# L2.5 只该回答「她自己对这话题有没有兴趣」，「安静多久、要不要开口」是 TOPIC_GAP_SEC 的活。
 # 实测模型会写出「冷场超过 5 分钟、无人 @ 我：0 分，不找话」这种规则，
 # 效果等于把 L2.5 整层关掉 —— 所以凡是碰时间/冷场/有没有人叫我的措辞，一律不收。
 L25_BANNED = (
@@ -80,7 +85,7 @@ ROUTER_BANNED = JUDGE_BANNED + (
 # 数值闸门：默认值和 config.Settings / memory.py 的常量保持一致。
 # 分三组，每组每晚最多落 1 项 —— 五层一起调容易互相打架，分层各走一步最稳。
 KNOB_DEFAULTS = {
-    "TOPIC_ROAST_MIN_SCORE": settings.TOPIC_ROAST_MIN_SCORE,
+    "TOPIC_INTEREST_MIN_SCORE": settings.TOPIC_INTEREST_MIN_SCORE,
     "FOLLOWUP_WINDOW_SEC": settings.FOLLOWUP_WINDOW_SEC,
     "TOPIC_GAP_SEC": settings.TOPIC_GAP_SEC,
     "RECALL_SCORE_THRESHOLD": 0.25,
@@ -90,7 +95,7 @@ KNOB_DEFAULTS = {
     "TOOL_ROUTER_MIN_CHARS": settings.TOOL_ROUTER_MIN_CHARS,
 }
 KNOB_STEPS = {
-    "TOPIC_ROAST_MIN_SCORE": 0.05,
+    "TOPIC_INTEREST_MIN_SCORE": 0.05,
     "FOLLOWUP_WINDOW_SEC": 150,
     "TOPIC_GAP_SEC": 300,
     "RECALL_SCORE_THRESHOLD": 0.03,
@@ -100,7 +105,7 @@ KNOB_STEPS = {
     "TOOL_ROUTER_MIN_CHARS": 2,
 }
 KNOB_GROUPS = {
-    "knobs": ("TOPIC_ROAST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC"),
+    "knobs": ("TOPIC_INTEREST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC"),
     "recall_knobs": ("RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS"),
     "router_knobs": ("TOOL_ROUTER_MIN_CHARS",),
 }
@@ -293,7 +298,10 @@ def parse_log(day: date) -> dict:
     if not path.is_file():
         return out
     l2_re = re.compile(r"L2 追认判定 \[(.+?)\] @他人=(\w+): (.+?) -> (YES|NO)")
-    roast_re = re.compile(r"吐槽判定 \[(.+?)\] ([\d.]+)/10 \(阈值 ([\d.]+)\) 槽点=(.+?) \| (.+)")
+    # 2026-11-27 之前写的是「吐槽判定 / 槽点」，之后是「兴趣判定 / 兴趣点」；两种都认，历史日志才比得了
+    roast_re = re.compile(
+        r"(?:兴趣|吐槽)判定 \[(.+?)\] ([\d.]+)/10 \(阈值 ([\d.]+)\) (?:兴趣点|槽点)=(.+?) \| (.+)"
+    )
     router_re = re.compile(r"工具路由判定：需要派活 → (.+?)（理由：(.+?)）")
     l1_re = re.compile(r"L1 召回 (\d+) 条｜阈值 ([\d.]+)｜字面 (\d+)")
     try:
@@ -403,6 +411,7 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
     current_l2 = tuning.judge_extra("l2") or "（无）"
     current_l25 = tuning.judge_extra("l2_5") or "（无）"
     current_router = tuning.judge_extra("tool_router") or "（无）"
+    current_interest = read_interest_zone()
     knobs = tuning.current_knobs() or "（无覆盖，全走默认）"
     recall_now = ", ".join(
         f"{k}={tuning.get(k, KNOB_DEFAULTS[k]):g}"
@@ -420,7 +429,7 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
         f"深夜/静默时段发言：{stats['night_msgs']} 条。\n"
         f"L2 追认判定：调用 {stats['l2_call']} 次，判 YES {stats['l2_hit']} 次（{stats['l2_hit_pct']}%）；"
         f"日志里 YES {log_info.get('l2_yes', 0)} / NO {log_info.get('l2_no', 0)}。\n"
-        f"L2.5 吐槽判定：调用 {stats['l25_call']} 次，放行 {stats['l25_hit']} 次"
+        f"L2.5 兴趣判定：调用 {stats['l25_call']} 次，放行 {stats['l25_hit']} 次"
         f"（{stats['l25_hit_pct']}%）；日志里 {len(log_info.get('roast_scores', []))} 次打分，"
         f"放行 {log_info.get('roast_pass', 0)} 次。"
     )
@@ -428,7 +437,7 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
         stats_block += "\n被判 NO 的样本：" + "；".join(log_info["l2_samples"][:6])
     if log_info.get("roast_scores"):
         scores = log_info["roast_scores"]
-        stats_block += f"\n吐槽分：最高 {max(scores):.0f}、平均 {sum(scores)/len(scores):.1f}、最低 {min(scores):.0f}。"
+        stats_block += f"\n兴趣分：最高 {max(scores):.0f}、平均 {sum(scores)/len(scores):.1f}、最低 {min(scores):.0f}。"
 
     stats_block += (
         f"\nL1 识海：每轮召回注入 {stats['l1_hit']}/{stats['l1_call']} 次"
@@ -458,10 +467,13 @@ def build_prompt(day: date, stats: dict, log_info: dict, episodes: list[dict]) -
 # 它现在的人格进化记录（最多 15 条，旧的自然淘汰）
 {chr(10).join('- ' + x for x in current_evo) or '（空）'}
 
+# 它现在的「兴趣区」（人格卡里的一段；L2.5 兴趣判定每次都会把这一整段交给判定器）
+{chr(10).join('- ' + x for x in current_interest) or '（空 —— 判定器只能退回「什么话题热就接什么」，容易又变成资讯号）'}
+
 # L2 判定器当前的补充规则（判断「这句是不是在接我的话」）
 {current_l2}
 
-# L2.5 判定器当前的补充规则（判断「冷场后这个话题值不值得吐槽」）
+# L2.5 判定器当前的补充规则（判断「冷场后这个话题她自己有没有兴趣接」）
 {current_l25}
 
 # 工具路由判定器当前的补充规则（判断「这句要不要派活给执行助手」）
@@ -490,12 +502,16 @@ TOOL_ROUTER_MIN_CHARS={router_min:g}（短于此不送判定器）
 1. 话太多/句句都接/自说自话 —— 真人大部分时间在听；
 2. 回复太长、太完整、结构太整齐（列点、总结、面面俱到）—— 真人在微信里不回长段落；
 3. 接不住梗、接得太规矩、把玩笑当真解释 —— 真人会损回去或者干脆不理；
-4. 冷场时硬找话说 —— 真人会让群冷着；
+4. 冷场时硬找话说 —— 真人会让群冷着；接的话题全在兴趣区之外（只挑离谱的损，聊到游戏、吃的、
+   群友日常反而一声不吭），说明它像个蹲着等笑点的段子手，而不是一个有自己爱好的人；
 5. 内容跟上下文脱节（自言自语、突然转话题）；
 6. 总把无关的旧事带进回复（L1 识海召回太松）；
 7. 明明是闲聊却派了活、或明显该派活却没派（工具路由判偏了）。
 
 对 L2 / L2.5 / 工具路由的修正要具体到「什么情况该放行、什么情况该拦」，能直接写进判定提示词。
+对兴趣区的修正：只加她真的会来劲的具体方向（某个游戏模式、某类吃的、某种抽象视频）；
+只有明显不准、她其实插不上话的条目才点删（「吐槽」那条钉死，点了也不会生效）；一晚最多加 2 删 2，总数不超过 12。
+如果放行的话题反复在兴趣区之外，先想清楚是「判定太松（动数值）」还是「兴趣区写得太宽（点删）」，别两头一起动。
 对人格的修正要写成「习惯/态度」，不要写「我要更幽默」这种空话。
 对 L1 / 工具路由的数值只按上面的方向动一小步，没有把握就给空对象。
 
@@ -505,16 +521,18 @@ TOOL_ROUTER_MIN_CHARS={router_min:g}（短于此不送判定器）
   "like_human_score": 1到10的整数,
   "diagnosis": ["最多5条，每条40字以内，必须引用片段编号，指出具体毛病"],
   "persona_evolution": ["0到2条，每条60字以内，第一人称，写成以后要改的习惯"],
+  "interest_zone_add": ["0到2条，每条30字以内，写成「她看见什么会来劲」的具体方向，不要空话"],
+  "interest_zone_drop": ["0到2条，填要删掉的那条现有兴趣的前12字，用来点掉明显不准的"],
   "judge_l2": ["0到4条，每条40字以内，只写什么情况判YES/什么情况判NO"],
   "judge_l2_5": ["0到4条，每条40字以内，只写什么情况给高分/给0分"],
   "judge_tool_router": ["0到3条，每条45字以内，只写什么场景该派活/不该派活"],
-  "knobs": {{"TOPIC_ROAST_MIN_SCORE": 0.75}},
+  "knobs": {{"TOPIC_INTEREST_MIN_SCORE": 0.75}},
   "recall_knobs": {{"RECALL_SCORE_THRESHOLD": 0.28}},
   "router_knobs": {{"TOOL_ROUTER_MIN_CHARS": 10}},
   "note": "一句话总结今天"
 }}
 三组数值每组最多改 1 项，不改就给空对象；脚本还会再卡一次边界和步长：
-- knobs: TOPIC_ROAST_MIN_SCORE(0.5~0.9)、FOLLOWUP_WINDOW_SEC(120~900)、TOPIC_GAP_SEC(300~1800)
+- knobs: TOPIC_INTEREST_MIN_SCORE(0.5~0.9)、FOLLOWUP_WINDOW_SEC(120~900)、TOPIC_GAP_SEC(300~1800)
 - recall_knobs: RECALL_SCORE_THRESHOLD(0.15~0.45)、MIN_LITERAL_HITS(1~3)、RECALL_TOP_N(3~8)、RECALL_MAX_CHARS(200~800)
 - router_knobs: TOOL_ROUTER_MIN_CHARS(4~20)
 没有把握的字段给空数组或空对象，不要凑数。
@@ -650,6 +668,110 @@ def _too_similar(a: str, b: str, threshold: float = 0.72) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= threshold
 
 
+def read_interest_zone() -> list[str]:
+    """读人格卡「我的兴趣区」当前的条目（不含「- 」前缀），给复盘提示词当现状。"""
+    if not card_mod.PERSONA_PATH.is_file():
+        return []
+    lines = card_mod.PERSONA_PATH.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        text = line.strip()
+        if text.startswith("## "):
+            if inside:
+                break
+            inside = text.startswith(card_mod.INTEREST_HEADER)
+            continue
+        if inside and text.startswith("- "):
+            out.append(text[2:].strip())
+    return out
+
+
+def apply_interest_zone(add: list[str], drop: list[str], day: date) -> tuple[list[str], list[str]]:
+    """往人格卡的「兴趣区」里加/删几条，返回 (实际加了什么, 实际删了什么)。
+
+    为什么单开一个函数而不是让模型重写整段：兴趣区是 L2.5 兴趣判定的唯一依据，
+    被写成「热爱生活、喜欢交朋友」这种空话，判定器就再也分不出她对什么来劲了。
+    所以只允许加具体方向、点删明显不准的条目，其余守门：
+
+    - 加：最多 2 条、每条 ≤30 字，去重，「AI/模型/机器人」这类词直接丢；
+    - 删：按「现有条目前 12 字」匹配，关键词不足 4 字不认，避免模型随手删；
+    - 钉住的条目（build_card.INTEREST_PINNED，目前是「吐槽」）任何情况下都不删 ——
+      用户明确要求「喜欢吐槽」写进兴趣区，删了 L2.5 就退化成只看话题热不热；
+    - 总数超过 12 条时，从列表尾部（越靠后越旧）丢，钉住的除外；
+    - 改完必须过 build_card 的 6000 字上限，过不了就整段回滚。
+    """
+    path = card_mod.PERSONA_PATH
+    if not path.is_file():
+        return [], []
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines()
+    header_idx = next(
+        (i for i, line in enumerate(lines) if line.strip().startswith(card_mod.INTEREST_HEADER)), None
+    )
+    if header_idx is None:
+        return [], []
+    end = next(
+        (i for i in range(header_idx + 1, len(lines)) if lines[i].startswith("## ")), len(lines)
+    )
+    body = lines[header_idx + 1 : end]
+    # 段里那段「（冷场后…）」说明保留原样，只重排条目
+    notes = [line for line in body if line.strip() and not line.strip().startswith("- ")]
+    items = [line.strip()[2:].strip() for line in body if line.strip().startswith("- ")]
+
+    def pinned(text: str) -> bool:
+        return any(word in text for word in card_mod.INTEREST_PINNED)
+
+    dropped: list[str] = []
+    for raw in (drop or [])[:MAX_INTEREST_DROP]:
+        token = " ".join(str(raw or "").split()).strip("-•· 　\"'「」")
+        if len(token) < 4:
+            continue
+        for item in list(items):
+            if pinned(item):
+                continue
+            if item in dropped:
+                continue
+            if token[:12] in item or _too_similar(token, item, 0.6):
+                items.remove(item)
+                dropped.append(item)
+                break
+
+    added: list[str] = []
+    for raw in (add or [])[:MAX_INTEREST_ADD]:
+        text = _clean_line(raw, MAX_INTEREST_CHARS)
+        if len(text) < 4 or any(word in text for word in PERSONA_BANNED):
+            continue
+        if any(_too_similar(text, old, 0.7) for old in items + added):
+            continue
+        added.append(text)
+
+    if not added and not dropped:
+        return [], []
+
+    merged = items + added
+    while len(merged) > MAX_INTEREST_ITEMS:
+        tail = next((i for i in range(len(merged) - 1, -1, -1) if not pinned(merged[i])), None)
+        if tail is None:
+            break
+        merged.pop(tail)
+
+    block = [card_mod.INTEREST_HEADER, "", *notes, "", *[f"- {x}" for x in merged], ""]
+    new_text = "\n".join(lines[:header_idx] + block + lines[end:])
+    card_mod._atomic_write_text(path, new_text)
+    try:
+        card_mod.build_card()
+    except Exception:
+        # 超 6000 字上限之类：人格卡是命根子，宁可这次不调也不能留半截
+        card_mod._atomic_write_text(path, original)
+        try:
+            card_mod.build_card()
+        except Exception:
+            pass
+        raise
+    return added, dropped
+
+
 def apply_persona(items: list[str], day: date) -> list[str]:
     existing = card_mod._load_evolutions_list()
     snapshot = list(existing)
@@ -692,7 +814,7 @@ def apply_judge(kind: str, items: list[str], day: date) -> list[str]:
     elif kind == "l2_5":
         banned = JUDGE_BANNED + L25_BANNED
         max_items = MAX_JUDGE_ITEMS
-        label = "L2.5 冷场吐槽判定补充规则"
+        label = "L2.5 兴趣判定补充规则"
     else:
         banned = JUDGE_BANNED
         max_items = MAX_JUDGE_ITEMS
@@ -863,6 +985,11 @@ def write_report(
         lines.append("**人格进化记录（data/persona_evolutions.json）**")
         lines += [f"- {x}" for x in changes["persona"]]
         lines.append("")
+    if changes.get("interest_add") or changes.get("interest_drop"):
+        lines.append("**兴趣区（roles/大肥鱼.人格.md，「我的兴趣区」）**")
+        lines += [f"- 加：{x}" for x in changes.get("interest_add", [])]
+        lines += [f"- 删：{x}" for x in changes.get("interest_drop", [])]
+        lines.append("")
     if changes.get("judge_l2") or changes.get("judge_l2_5") or changes.get("judge_tool_router"):
         lines.append("**判定补充规则（roles/judges/）**")
         lines += [f"- L2：{x}" for x in changes.get("judge_l2", [])]
@@ -879,7 +1006,10 @@ def write_report(
         lines += [""]
     if not any(
         changes.get(k)
-        for k in ("persona", "judge_l2", "judge_l2_5", "judge_tool_router", "knob_notes")
+        for k in (
+            "persona", "interest_add", "interest_drop",
+            "judge_l2", "judge_l2_5", "judge_tool_router", "knob_notes",
+        )
     ):
         lines += ["本轮没有改动（证据不足或建议都撞了守门规则）。", ""]
 
@@ -888,6 +1018,11 @@ def write_report(
         if plan.get("persona_evolution"):
             lines.append("**人格进化**")
             lines += [f"- {x}" for x in plan["persona_evolution"]]
+            lines.append("")
+        if plan.get("interest_zone_add") or plan.get("interest_zone_drop"):
+            lines.append("**兴趣区建议**")
+            lines += [f"- 加：{x}" for x in plan.get("interest_zone_add") or []]
+            lines += [f"- 删：{x}" for x in plan.get("interest_zone_drop") or []]
             lines.append("")
         if plan.get("judge_l2"):
             lines.append("**L2 补充**")
@@ -932,7 +1067,8 @@ def git_commit(paths: list[str], day: date) -> str:
         f"chore(persona): {day.isoformat()} 夜间复盘自动微调\n\n"
         "由 tools/persona_review.py 生成：人格进化记录、L2/L2.5/工具路由判定补充规则、\n"
         "L2 与 L1 召回、工具路由的数值闸门。\n"
-        "人设记录与 tuning.json 在 data/ 下不入库，本次只提交 roles/judges 的规则文件。"
+        "人设记录与 tuning.json 在 data/ 下不入库；本次提交 roles/judges 的规则文件，"
+        "以及（如有）人格卡里的「兴趣区」改动。"
     )
     proc = subprocess.run(
         ["git", "commit", "-m", msg], cwd=str(BASE_DIR), capture_output=True, text=True
@@ -1028,6 +1164,8 @@ def main() -> int:
 
     changes = {
         "persona": [],
+        "interest_add": [],
+        "interest_drop": [],
         "judge_l2": [],
         "judge_l2_5": [],
         "judge_tool_router": [],
@@ -1045,7 +1183,7 @@ def main() -> int:
 
         try:
             if args.owner == "sense":
-                changes["skipped"].append("人格进化归 0:45 的 mind 任务，本轮不落盘")
+                changes["skipped"].append("人格进化与兴趣区归 0:45 的 mind 任务，本轮不落盘")
             else:
                 persona_items = plan.get("persona_evolution") or []
                 today_tag = f"[{day.isoformat()}]"
@@ -1061,6 +1199,14 @@ def main() -> int:
                     )
                 else:
                     _diff(persona_items, changes["persona"], "人格")
+
+                # 兴趣区（人格卡）归 mind：L2.5 兴趣判定读的就是这一段，改它等于改她的爱好
+                zone_add = plan.get("interest_zone_add") or []
+                zone_drop = plan.get("interest_zone_drop") or []
+                changes["interest_add"], changes["interest_drop"] = apply_interest_zone(
+                    zone_add, zone_drop, day
+                )
+                _diff(zone_add, changes["interest_add"], "兴趣区")
 
             if args.owner == "mind":
                 changes["skipped"].append("判定器补充规则归 0:15 的 sense 任务，本轮不落盘")
@@ -1098,14 +1244,19 @@ def main() -> int:
         day, stats, log_info, plan, changes, plan.get("note", ""), applied=args.apply
     )
 
-    if args.apply and (
-        changes["judge_l2"] or changes["judge_l2_5"] or changes["judge_tool_router"]
-    ):
-        print("git:", git_commit(["roles/judges"], day))
+    commit_paths: list[str] = []
+    if changes["judge_l2"] or changes["judge_l2_5"] or changes["judge_tool_router"]:
+        commit_paths.append("roles/judges")
+    if changes["interest_add"] or changes["interest_drop"]:
+        commit_paths.append("roles/大肥鱼.人格.md")
+    if args.apply and commit_paths:
+        print("git:", git_commit(commit_paths, day))
 
     print(f"报告：{path}")
     print(
-        f"改动（owner={args.owner}）：人格 {len(changes['persona'])} 条 / L2 {len(changes['judge_l2'])} 条 / "
+        f"改动（owner={args.owner}）：人格 {len(changes['persona'])} 条 / "
+        f"兴趣区 +{len(changes['interest_add'])} -{len(changes['interest_drop'])} / "
+        f"L2 {len(changes['judge_l2'])} 条 / "
         f"L2.5 {len(changes['judge_l2_5'])} 条 / 工具路由 {len(changes['judge_tool_router'])} 条 / "
         f"数值 {len(changes['knob_notes'])} 项"
     )

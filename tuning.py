@@ -36,8 +36,9 @@ JUDGE_DIR = BASE_DIR / "roles" / "judges"
 
 # 允许夜间复盘的数值项：名称 -> (下限, 上限)
 BOUNDS: dict[str, tuple[float, float]] = {
-    # L2.5 吐槽阈值（0~1）。0.7 表示模型给 7 分才接话
-    "TOPIC_ROAST_MIN_SCORE": (0.5, 0.9),
+    # L2.5 兴趣阈值（0~1）。0.7 表示判定器认为「她真感兴趣」给到 7 分才接话。
+    # 2026-11-27 由「吐槽判定」改成「兴趣判定」，键名随之改名（旧名仍兼容，见 LEGACY_ALIASES）。
+    "TOPIC_INTEREST_MIN_SCORE": (0.5, 0.9),
     # L2 追认时间窗（秒）：我发言后多久内的群友发言还算「可能接我的话」
     "FOLLOWUP_WINDOW_SEC": (120, 900),
     # L2.5 冷场判定间隔（秒）：群里安静多久才算「重新开话题」
@@ -114,9 +115,15 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "DIARY_MAX_ITEMS", "DIARY_ITEM_CHARS", "DIARY_MAX_CHARS",
     ),
     "core": (
-        "TOPIC_ROAST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC",
+        "TOPIC_INTEREST_MIN_SCORE", "FOLLOWUP_WINDOW_SEC", "TOPIC_GAP_SEC",
         "TOOL_ROUTER_MIN_CHARS",
     ),
+}
+
+# 改过名的键：新名 -> 旧名。data/tuning.json 里还留着旧名的按旧名继续生效，
+# 免得一改名就把夜间调好的阈值丢回默认值（2026-11-27 TOPIC_ROAST → TOPIC_INTEREST）。
+LEGACY_ALIASES: dict[str, str] = {
+    "TOPIC_INTEREST_MIN_SCORE": "TOPIC_ROAST_MIN_SCORE",
 }
 
 # 单晚允许的最大变动幅度。守门在 tools/nightly_guard.py 里；手写 tuning.json 也请照这个来。
@@ -146,7 +153,7 @@ STEP_LIMITS: dict[str, float] = {
     "MIN_LITERAL_HITS": 1,
     "RECALL_TOP_N": 1,
     "RECALL_MAX_CHARS": 100,
-    "TOPIC_ROAST_MIN_SCORE": 0.05,
+    "TOPIC_INTEREST_MIN_SCORE": 0.05,
     "FOLLOWUP_WINDOW_SEC": 150,
     "TOPIC_GAP_SEC": 300,
     "TOOL_ROUTER_MIN_CHARS": 2,
@@ -178,7 +185,12 @@ def _load_knobs() -> dict[str, Any]:
 
 def get(name: str, default: Any) -> Any:
     """取一个运行期覆盖值；没配、类型不对、越界都回落到默认值。"""
-    raw = _load_knobs().get(name)
+    knobs = _load_knobs()
+    raw = knobs.get(name)
+    if raw is None:
+        legacy = LEGACY_ALIASES.get(name)
+        if legacy:
+            raw = knobs.get(legacy)
     if raw is None:
         return default
     try:
@@ -236,6 +248,16 @@ def judge_extra(kind: str) -> str:
     return text
 
 
+def _interest_zone() -> str:
+    """人格卡「我的兴趣区」（只读）。放在函数里懒导入，避免模块加载期的循环依赖。"""
+    try:
+        from roles.build_card import interest_zone
+
+        return interest_zone()
+    except Exception:  # noqa: BLE001 - 快照只为排查，读不到不该让进程起不来
+        return ""
+
+
 def snapshot() -> dict[str, Any]:
     """完整快照，给排查用。"""
     return {
@@ -244,6 +266,8 @@ def snapshot() -> dict[str, Any]:
         "bounds": {k: list(v) for k, v in BOUNDS.items()},
         "groups": {k: list(v) for k, v in GROUPS.items()},
         "step_limits": dict(STEP_LIMITS),
+        # 人格卡里的「兴趣区」：L2.5 兴趣判定的唯一依据，排查时先看这段
+        "interest_zone": _interest_zone(),
         "judges": {
             kind: judge_extra(kind)
             for kind in ("l2", "l2_5", "tool_router", "topic_share", "life")

@@ -34,7 +34,7 @@ import metrics
 from memory import estimate_tokens, memory_store
 from persona_runtime import emotion_sm, slang_book
 from pet_engine import PetStatus, pet_engine
-from roles.build_card import evolve_persona, load_card
+from roles.build_card import evolve_persona, interest_zone, load_card
 from safety_guard import assess_danger, stage_pending_action
 from scheduler import scheduler
 from self_ops import git_pull_and_check, request_restart, self_edit_code
@@ -719,7 +719,7 @@ class DaFeiYuBrain:
         image_path: Path | None = None,
         group_id: str = "",
         image_sender: str = "",
-        roast_hint: str = "",
+        interest_hint: str = "",
         bg_note: str = "",
         job_report: str = "",
     ) -> BrainReply:
@@ -833,7 +833,7 @@ class DaFeiYuBrain:
         else:
             # 命中实时/查询类问题时，直接前置秒搜并拼进单轮对话，省掉一次 DeepSeek 来回！
             pre_searched_block = ""
-            if settings.ENABLE_WEB_SEARCH and not roast_hint and any(cue in text for cue in PRE_SEARCH_CUES):
+            if settings.ENABLE_WEB_SEARCH and not interest_hint and any(cue in text for cue in PRE_SEARCH_CUES):
                 logger.info("⚡ 前置高速联网搜索: %s", text[:40])
                 pre_searched_block = web_search(text, max_results=4)
 
@@ -849,21 +849,23 @@ class DaFeiYuBrain:
                     }
                 )
             else:
-                if roast_hint:
-                    # L2.5 冷场吐槽任务：明确告知这是「吐槽需求」，而不是有人在问我
+                if interest_hint:
+                    # L2.5 兴趣接话：这不是在问我，是我自己对这话题有兴趣，主动凑一句
                     messages.append(
                         {
                             "role": "user",
                             "content": (
                                 f"[{sender}]: {text}\n\n"
-                                f"【任务：吐槽】群里刚冷场了一阵，是 {sender} 重新开了这个话题，"
+                                f"【任务：接话】群里刚冷了一阵，是 {sender} 重新开了这个话题，"
                                 f"没人叫你，也不是在问你问题。\n"
-                                f"现在请你以群友身份，就这个话题接一句吐槽/损一句/接个梗：\n"
-                                f"- 可下嘴的点：{roast_hint}\n"
-                                f"- 只发 1~2 句，短、准、有包袱，像真人随口接话，别铺垫别解释。\n"
+                                f"你自己对这话题有兴趣（你想说的点：{interest_hint}），"
+                                f"现在以群友身份主动接一句：\n"
+                                f"- 可以损、可以接梗、可以问细节、可以说一句自己类似的经历，"
+                                f"短、准，像真人随口接话，别铺垫别解释。\n"
+                                f"- 只发 1~2 句。\n"
                                 f"- 不要问好、不要说“这个问题很好”、不要分析、不要总结、不要用 Markdown、"
                                 f"不要自称 AI 或助手。\n"
-                                f"- 吐槽对事不对人：可以损这事离谱，别攻击长相、家人、地域、职业，别碰政治和疾病。"
+                                f"- 对事不对人：可以损这事离谱，别攻击长相、家人、地域、职业，别碰政治和疾病。"
                             ),
                         }
                     )
@@ -910,9 +912,9 @@ class DaFeiYuBrain:
                 freq_pen = 0.1 if (used_search or used_vision) else 0.45
                 pres_pen = 0.0 if (used_search or used_vision) else 0.4
             # 开启桌面工具时给足 4096 max_tokens，防止 deepseek-flash 思考 + .html/.py 参数 JSON 被截断
-            # 吐槽任务只发 1~2 句，160 足够，避免 owner 拿到 4096 后开始长篇大论
+            # 兴趣接话只发 1~2 句，160 足够，避免 owner 拿到 4096 后开始长篇大论
             # 任务播报要交代清楚做了什么/结果在哪，但也不许写论文，700 封顶
-            if roast_hint:
+            if interest_hint:
                 max_tokens = 160
             elif job_report:
                 max_tokens = 700
@@ -937,8 +939,8 @@ class DaFeiYuBrain:
                 # 只有显式关掉开关时才退回旧行为（DSH 不可用时挂电脑工具兜底）。
                 if not (settings.ENABLE_TOOL_ROUTER and is_dsh_available()[0]):
                     available_tools.extend(AGENT_TOOL_SCHEMAS)
-            if roast_hint or job_report:
-                # 吐槽是纯嘴活；任务播报只需要张嘴说结果，再挂工具只会又派一次活
+            if interest_hint or job_report:
+                # 兴趣接话是纯嘴活；任务播报只需要张嘴说结果，再挂工具只会又派一次活
                 available_tools = []
 
             if not used_vision and available_tools:
@@ -1603,7 +1605,7 @@ class DaFeiYuBrain:
         )
         return pack(True, task, reason, kind)
 
-    def judge_topic_roast(
+    def judge_topic_interest(
         self,
         sender: str,
         text: str,
@@ -1613,18 +1615,24 @@ class DaFeiYuBrain:
         multi_speaker: bool = False,
     ) -> str:
         """
-        L2.5 冷场重启话题的「吐槽雷达」（轻量判定，只输出一行结论）。
+        L2.5 冷场重启话题的「兴趣雷达」（轻量判定，只输出一行结论）。
 
-        场景：群里安静了很久，某人重新开口。此时既不是在叫我，也算不上接话茬，
-        但如果他抛的话题够抽象/够有槽点，接一句会很有节目效果。
+        2026-11-27 改动：原来是「这个话题有没有槽点」的吐槽判定，现在改成
+        「她自己对这个话题有没有兴趣」的兴趣判定。原因：只按槽点评分，她只会接
+        「离谱、翻车、抽象」那一类，聊到游戏、吃的、群友日常反而一声不吭 —— 不像一个
+        有自己爱好的活人，倒像个蹲着等笑点的段子手。
 
-        输入刻意保持极简：不带人格、不带工具、只给「冷场多久 + 最近几句 + 这句」。
-        输出格式 `SCORE|可吐槽的点`，SCORE 为 0~10 整数，由调用方按阈值决定是否接话。
+        判定依据是她人格卡里的「兴趣区」（roles/build_card.interest_zone）：那一整段会
+        原样交给判定器。**这是唯一一处把人格卡带进轻量判定的地方**，所以提示词里
+        明确写了「以兴趣区为准」，否则模型会退回到「普遍意义上什么话题热门」。
+
+        场景：群里安静了很久，某人重新开口。此时既不是在叫我，也算不上接话茬。
+        输出格式 `SCORE|她想接的那个点`，SCORE 为 0~10 整数，由调用方按阈值决定是否接话。
 
         multi_speaker=True 表示 text 是这一波多人接话的合并探针（每行 `[昵称]: 内容`），
         此时不能沿用「[sender] 重新开口说」的说法，否则会把几个人的话当成一个人说的。
 
-        返回：可吐槽的点（非空字符串）表示值得吐槽；空字符串表示不接话。
+        返回：她想说的那个点（非空字符串）表示值得接话；空字符串表示不接话。
         """
         if not settings.has_valid_api_key:
             return ""
@@ -1654,8 +1662,18 @@ class DaFeiYuBrain:
                 f"现在 [{sender}] 重新开口说：{probe}\n"
             )
 
-        # 夜间复盘沉淀下来的临时偏好（roles/judges/l2_5.md）。只调整「什么算有槽点」，
-        # 输出格式必须保持不变，否则 SCORE|槽点 的解析会崩。
+        # 她自己的兴趣区（人格卡 roles/大肥鱼.人格.md 的「我的兴趣区」）。
+        # 这是 L2.5 的唯一判断依据：有这一段，她接的是自己关心的事；
+        # 没有这一段，判定器就会退回「什么话题在普遍意义上热门」，那又变成资讯号了。
+        zone = interest_zone()
+        zone_block = (
+            "【她的兴趣区】（写在里面的，她看见就想凑上去说两句）\n" + zone + "\n\n"
+            if zone
+            else "【她的兴趣区】（还没写，按一个爱吐槽、爱打游戏、嘴有点欠的普通人判断，别对什么都来劲）\n\n"
+        )
+
+        # 夜间复盘沉淀下来的临时偏好（roles/judges/l2_5.md）。只调整「什么算她感兴趣」，
+        # 输出格式必须保持不变，否则 SCORE|兴趣点 的解析会崩。
         extra = tuning.judge_extra("l2_5")
         extra_block = (
             "\n昨天群里复盘出这几条，评分时一并考虑（和上面冲突时以这里为准）：\n"
@@ -1665,26 +1683,29 @@ class DaFeiYuBrain:
         )
 
         prompt = (
-            "你是群聊里的「吐槽雷达」，只负责判断一段群聊值不值得接梗吐槽，不负责真的吐槽。\n\n"
+            f"你是「{settings.BOT_NAME}」的注意力开关。她是个普通群友，不是助手。\n"
+            "现在群里冷了一阵，有人重新开了个话题。你要判断：这个话题她自己有没有兴趣凑上去说一句。\n\n"
+            + zone_block
             + opening
             + (
-                "（这条消息 @ 的是群里的其他人，不是叫你。"
-                "@ 别人不算扣分，照常只看他抛的话题本身有没有槽点。）\n"
+                "（这条消息 @ 的是群里的其他人，不是叫她。"
+                "@ 别人不算扣分，照常只看这个话题本身她感不感兴趣。）\n"
                 if at_others
                 else ""
             )
             + f"\n更早的几句（可能为空）：\n{ctx}\n\n"
-            "评分标准（0~10 分）：\n"
-            "- 8~10：有明显的槽点、反差、离谱、抽象、可接梗的具体事（吹牛、翻车、奇葩经历、逆天观点、被生活暴打）。\n"
-            "- 4~7：有点意思但不好接，或者需要很多背景才懂。\n"
-            "- 0~3：打招呼、问在不在、单纯陈述事实、发牢骚没内容、纯表情、广告、正事通知、涉政涉黄涉暴。\n\n"
+            "评分标准（0~10 分，只看「她对这个话题有多感兴趣 + 她接不接得上话」，不看话题热不热门）：\n"
+            "- 8~10：正踩在兴趣区上，而且有具体的东西可以说（她懂这个、她吃过这个、这事离谱到她忍不住要损一句）。\n"
+            "- 4~7：沾一点边，但懂得不够多，或者没什么可接的。\n"
+            "- 0~3：跟她没关系（正事通知、纯打卡、纯表情、广告、别人的私事、她完全不懂的领域）。\n"
+            "注意：话题再热，只要不在兴趣区里、她其实插不上话，就给 0~3 分。\n\n"
             "另外，出现以下任一情况直接给 0 分：\n"
             "在问正经求助问题、在讨论别人的隐私或外貌、内容涉及政治/疾病/丧事、纯粹约时间见面的私事。\n"
             "如果这几句其实是几个人在聊各自不相干的事、或者已经变成一对一私聊，也给 0 分。\n\n"
             + extra_block
             + "输出格式（只输出一行，不要解释）：\n"
-            "分数|可以吐槽的那个点（15 字以内，没槽点就写「无」）\n"
-            "例如：9|他居然把鱼缸当显示器"
+            "分数|她最想说的那个点（15 字以内，具体到事；没兴趣就写「无」）\n"
+            "例如：9|队友把大乱斗当排位打"
         )
         try:
             resp = self._create(
@@ -1699,17 +1720,17 @@ class DaFeiYuBrain:
             score = float(m_score.group()) if m_score else 0.0
             angle = angle.strip().strip("\"'「」 ")
             threshold = tuning.get_float(
-                "TOPIC_ROAST_MIN_SCORE", settings.TOPIC_ROAST_MIN_SCORE
+                "TOPIC_INTEREST_MIN_SCORE", settings.TOPIC_INTEREST_MIN_SCORE
             ) * 10
             logger.info(
-                "🔥 吐槽判定 [%s] %.1f/10 (阈值 %.0f) 槽点=%s | %s",
+                "🔥 兴趣判定 [%s] %.1f/10 (阈值 %.0f) 兴趣点=%s | %s",
                 sender, score, threshold, angle[:20] or "无", probe[:30],
             )
             if score < threshold or not angle or angle == "无":
                 return ""
             return angle[:30]
         except Exception as exc:
-            logger.warning("吐槽判定异常: %s", exc)
+            logger.warning("兴趣判定异常: %s", exc)
             return ""
 
     def generate_autonomous_bubble(self, kind: str, status: PetStatus) -> BrainReply:

@@ -67,13 +67,21 @@ class Settings:
     # 群里一直不停顿时的最大等待：从第一句挂起算起超过这个秒数就强制判定，防止永远排不上
     TRIGGER_DEBOUNCE_MAX_WAIT_SEC: float = float(os.getenv("TRIGGER_DEBOUNCE_MAX_WAIT_SEC", "12"))
 
-    # L2.5 冷场重启话题的吐槽判定（有人隔了很久重新开口时，先轻量判断值不值得接一句）
-    ENABLE_TOPIC_ROAST: bool = _parse_bool(os.getenv("ENABLE_TOPIC_ROAST"), True)
+    # L2.5 冷场重开话题的「兴趣判定」（有人隔了很久重新开口时，先看她对这话题有没有兴趣）。
+    # 2026-11-27 由「吐槽判定」改名而来：原来只问「有没有槽点」，她只会接离谱那一类；
+    # 现在判定依据是她人格卡里的「兴趣区」，接的是自己真正关心的事。
+    # 环境变量保留旧名兜底，老 .env 不用改。
+    ENABLE_TOPIC_INTEREST: bool = _parse_bool(
+        os.getenv("ENABLE_TOPIC_INTEREST", os.getenv("ENABLE_TOPIC_ROAST")), True
+    )
     # 距上一条群消息超过多少秒算「开新话题」，默认 10 分钟
     # 注意：这是 L2.5 唯一的频控，不再有同群冷却和每日上限（用户要求去掉）
     TOPIC_GAP_SEC: int = int(os.getenv("TOPIC_GAP_SEC", "600"))
-    # 判定器认为「有意思」的最低把握度（0~1）。模型输出 0-10 分，低于该值不接话
-    TOPIC_ROAST_MIN_SCORE: float = float(os.getenv("TOPIC_ROAST_MIN_SCORE", "0.7"))
+    # 判定器认为「她真的感兴趣」的最低把握度（0~1）。模型输出 0-10 分，低于该值不接话。
+    # 热调键同名（归 0:15 感官任务），data/tuning.json 里还有旧名时会自动沿用。
+    TOPIC_INTEREST_MIN_SCORE: float = float(
+        os.getenv("TOPIC_INTEREST_MIN_SCORE", os.getenv("TOPIC_ROAST_MIN_SCORE") or "0.7")
+    )
     # 一波连续发言最多合并几句送给判定器（攒满就立刻整批送出，不等停顿）
     TRIGGER_BURST_MAX_ITEMS: int = int(os.getenv("TRIGGER_BURST_MAX_ITEMS", "5"))
 
