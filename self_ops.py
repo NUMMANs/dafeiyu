@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from config import BASE_DIR, DATA_DIR
+import gitmeta
 
 logger = logging.getLogger("dafeiyu.self_ops")
 
@@ -71,7 +72,7 @@ def _git_env() -> dict[str, str]:
 def _run_git(args: list[str], timeout: int = 25) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", *gitmeta.net_args(BASE_DIR), *args],
             cwd=str(BASE_DIR),
             env=_git_env(),
             capture_output=True,
@@ -123,16 +124,30 @@ def git_current_commit(short: bool = False) -> str:
 
 
 def check_remote_update() -> tuple[bool, str]:
-    """检查 origin/main 是否有尚未拉取的新提交。"""
+    """检查**当前分支的上游**是否有尚未拉取的新提交。
+
+    以前这里写死 origin/main。切到别的分支后，HEAD 永远不等于 origin/main，
+    于是每一轮都判定「远程有新提交」，再 ``git pull --ff-only origin main``
+    把刚切过去的分支直接快进回 main——等于分支白切。
+    现在跟着当前分支走：在 Smila_FZ 上就只比对 origin/Smila_FZ。
+    """
     if not (BASE_DIR / ".git").exists():
         return False, "当前目录不是 Git 仓库"
 
-    code, _, err = _run_git(["fetch", "--quiet", "origin", "main"], timeout=25)
+    branch = gitmeta.branch(BASE_DIR)
+    if not branch or branch == "HEAD":
+        return False, "当前处于 detached HEAD，跳过自动更新"
+    upstream = gitmeta.upstream_branch(BASE_DIR)
+    if not upstream:
+        return False, f"分支 {branch} 没有上游，跳过自动更新"
+    remote_ref = f"origin/{upstream}"
+
+    code, _, err = _run_git(["fetch", "--quiet", "origin", upstream], timeout=60)
     if code != 0:
         return False, f"git fetch 失败: {err or '未知错误'}"
 
     code_local, local_head, err_local = _run_git(["rev-parse", "HEAD"], timeout=10)
-    code_remote, remote_head, err_remote = _run_git(["rev-parse", "origin/main"], timeout=10)
+    code_remote, remote_head, err_remote = _run_git(["rev-parse", remote_ref], timeout=10)
     if code_local != 0 or code_remote != 0:
         return False, f"解析提交失败: {err_local or err_remote}"
 
@@ -143,8 +158,8 @@ def check_remote_update() -> tuple[bool, str]:
     if state.get("failed_commit") == remote_head:
         return False, f"远程提交 {remote_head[:7]} 曾导致启动崩溃并被自动回滚，已跳过拉取"
 
-    _, summary, _ = _run_git(["log", "-1", "--oneline", "origin/main"], timeout=10)
-    return True, summary or remote_head[:7]
+    _, summary, _ = _run_git(["log", "-1", "--oneline", remote_ref], timeout=10)
+    return True, f"{branch}: {summary or remote_head[:7]}"
 
 
 def compile_all_python() -> tuple[bool, str]:
@@ -178,11 +193,19 @@ def git_pull_and_check(auto_pip: bool = True) -> tuple[bool, str]:
         return False, "当前目录不是 Git 仓库，无法拉取更新"
 
     before_commit = git_current_commit()
-    code_fetch, _, err_fetch = _run_git(["fetch", "--quiet", "origin", "main"], timeout=25)
+    branch = gitmeta.branch(BASE_DIR)
+    if not branch or branch == "HEAD":
+        return False, "当前处于 detached HEAD，不知道要拉哪个分支，已跳过"
+    upstream = gitmeta.upstream_branch(BASE_DIR)
+    if not upstream:
+        return False, f"分支 {branch} 还没有上游，已跳过（先 git push -u origin {branch}）"
+    remote_ref = f"origin/{upstream}"
+
+    code_fetch, _, err_fetch = _run_git(["fetch", "--quiet", "origin", upstream], timeout=60)
     if code_fetch != 0:
         return False, f"git fetch 失败: {err_fetch or '网络或认证异常'}"
 
-    code_remote, remote_head, _ = _run_git(["rev-parse", "origin/main"], timeout=10)
+    code_remote, remote_head, _ = _run_git(["rev-parse", remote_ref], timeout=10)
     if code_remote == 0 and before_commit and before_commit == remote_head:
         return False, f"当前已经是最新提交 ({before_commit[:7]})，无需重启"
 
@@ -196,10 +219,10 @@ def git_pull_and_check(auto_pip: bool = True) -> tuple[bool, str]:
         else:
             logger.warning("拉取前自动 stash 失败: %s", stash_err)
 
-    code_pull, pull_out, pull_err = _run_git(["pull", "--ff-only", "origin", "main"], timeout=45)
+    code_pull, pull_out, pull_err = _run_git(["pull", "--ff-only", "origin", upstream], timeout=90)
     if code_pull != 0:
         return False, (
-            f"git pull --ff-only 失败（可能存在本地未提交改动或分叉）:\n"
+            f"git pull --ff-only origin {upstream} 失败（可能存在本地未提交改动或分叉）:\n"
             f"{pull_err or pull_out}"
         )
 

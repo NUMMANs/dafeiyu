@@ -6,7 +6,8 @@
 现在三层防护：
   1. 单例锁：同一时刻只允许一个 watchdog 拉起子进程；
   2. 端口预检：端口被占用属于环境冲突，等它释放，不回滚、不播报；
-  3. 回滚闸门：工作区脏 / 稳定版本落后于 origin/main 时绝不 reset --hard。
+  3. 回滚闸门：工作区脏 / 稳定版本落后于当前分支上游 / 稳定版本不在当前分支历史里
+     时绝不 reset --hard。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from config import BASE_DIR, DATA_DIR, settings
+import gitmeta
 from self_ops import (
     PORT_BUSY_EXIT_CODE,
     RESTART_EXIT_CODE,
@@ -103,7 +105,7 @@ def _git_env() -> dict[str, str]:
 def _git(*args: str) -> tuple[int, str]:
     try:
         proc = subprocess.run(
-            ["git", "-C", str(BASE_DIR), *args],
+            ["git", "-C", str(BASE_DIR), *gitmeta.net_args(BASE_DIR), *args],
             cwd=str(BASE_DIR),
             env=_git_env(),
             capture_output=True,
@@ -156,7 +158,11 @@ def _refresh_stale_last_good(state: dict[str, Any], head: str) -> None:
     """
     if not head:
         return
-    rc, remote = _git("rev-parse", "--verify", "origin/main")
+    # 跟着当前分支走：在 Smila_FZ 上就别拿 origin/main 来比，否则永远不刷新。
+    upstream = gitmeta.upstream_ref(BASE_DIR)
+    if not upstream:
+        return
+    rc, remote = _git("rev-parse", "--verify", upstream)
     if rc != 0 or remote != head:
         return
     stale = str(state.get("last_good_commit") or "").strip()
@@ -164,7 +170,7 @@ def _refresh_stale_last_good(state: dict[str, Any], head: str) -> None:
         return
     rc2, behind = _git("rev-list", "--count", f"{stale}..{remote}")
     if rc2 == 0 and behind.isdigit() and int(behind) > 0:
-        logger.info("稳定版本 %s 已落后于 origin/main，刷新为 %s", stale[:7], head[:7])
+        logger.info("稳定版本 %s 已落后于 %s，刷新为 %s", stale[:7], upstream, head[:7])
         state["last_good_commit"] = head
         state["failed_commit"] = ""
         state["crash_streak"] = 0
@@ -188,16 +194,28 @@ def _rollback_to_commit(last_good_commit: str, start_commit: str) -> tuple[bool,
     if dirty:
         return False, "工作区有未提交改动，拒绝回滚（避免吞掉未落盘的修改）"
 
-    # 闸门 3：稳定版本落后于已推送的 origin/main 时绝不回滚。否则一次环境
+    # 闸门 3：稳定版本落后于当前分支上游时绝不回滚。否则一次环境
     # 故障就能把本地打回「behind N」，还会和自动 pull 来回拉锯。
-    rc, remote = _git("rev-parse", "--verify", "origin/main")
-    if rc == 0 and remote:
-        rc2, behind = _git("rev-list", "--count", f"{last_good_commit}..origin/main")
-        if rc2 == 0 and behind.isdigit() and int(behind) > 0:
-            return False, (
-                f"稳定版本 {last_good_commit[:7]} 比 origin/main 落后 {behind} 个提交，"
-                "拒绝回滚（不能把已推送的代码打回去）"
-            )
+    upstream = gitmeta.upstream_ref(BASE_DIR)
+    if upstream:
+        rc, remote = _git("rev-parse", "--verify", upstream)
+        if rc == 0 and remote:
+            rc2, behind = _git("rev-list", "--count", f"{last_good_commit}..{upstream}")
+            if rc2 == 0 and behind.isdigit() and int(behind) > 0:
+                return False, (
+                    f"稳定版本 {last_good_commit[:7]} 比 {upstream} 落后 {behind} 个提交，"
+                    "拒绝回滚（不能把已推送的代码打回去）"
+                )
+
+    # 闸门 4：稳定版本不在当前版本的历史里 —— 多半是刚切了分支，此时 reset --hard
+    # 会把分支指针挪到另一条线上，看起来就像「分支上的提交丢了」。只认
+    # 「稳定版本是当前版本的祖先」这一种安全回退，其它一律不碰 git。
+    rc, _ = _git("merge-base", "--is-ancestor", last_good_commit, start_commit)
+    if rc != 0:
+        return False, (
+            f"稳定版本 {last_good_commit[:7]} 不在当前版本 {start_commit[:7]} 的历史里"
+            "（可能刚切过分支），拒绝回滚，留给人工处理"
+        )
 
     for git_cmd in (
         ["git", "reset", "--hard", last_good_commit],
