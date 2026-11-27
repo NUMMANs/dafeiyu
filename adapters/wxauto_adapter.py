@@ -434,12 +434,17 @@ class WxAutoAdapter:
                 wx.StartListening()
 
             notice = consume_restart_notice()
-            # 重启播报默认关闭：重启是运维动作，群里不该看到「鱼重启回来啦」。
-            # 深夜本来就跳过；白天也一并不发，只在日志里留一行。
-            if notice and notice.get("msg") and not settings.RESTART_NOTICE_ON:
-                logger.info("🔇 重启播报已关，跳过重启通知: %s", notice["msg"][:60])
-                notice = None
+            # 重启播报默认关闭：重启/切分支是运维动作，群里不该看到「鱼重启回来啦」。
+            # 但崩溃/回滚告警（notice 里打 alert 标记）是故障信号，仍按 RESTART_ALERT_ON 发。
             if notice and notice.get("msg"):
+                _is_alert = bool(notice.get("alert"))
+                if _is_alert and not settings.RESTART_ALERT_ON:
+                    logger.warning("🩹 崩溃告警播报已关，跳过: %s", notice["msg"][:60])
+                    notice = None
+                elif not _is_alert and not settings.RESTART_NOTICE_ON:
+                    logger.info("🔇 重启播报已关，仅记日志: %s", notice["msg"][:60])
+                    notice = None
+            if notice and notice.get("msg") and not notice.get("alert"):
                 _hour = datetime.now().hour
                 if _hour >= 23 or _hour < settings.QUIET_END_HOUR:
                     logger.info("🌙 深夜启动，跳过重启播报: %s", notice["msg"][:40])

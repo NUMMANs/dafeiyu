@@ -352,6 +352,7 @@ def save_restart_notice(group_id: str, msg: str, alert: bool = False) -> None:
     payload = {
         "group_id": (group_id or "").strip(),
         "msg": (msg or "").strip(),
+        "alert": bool(alert),
         "ts": time.time(),
     }
     if not payload["msg"]:
