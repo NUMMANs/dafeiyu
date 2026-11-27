@@ -73,6 +73,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "TOPIC_SHARE_COOLDOWN_MIN": (20, 480),
     # 分享正文最多多少字（超出按句截断）。群聊里 50 字上下最像真人。
     "TOPIC_SHARE_MAX_CHARS": (30, 120),
+    # 分享时带原帖链接的概率（0~1）。调高 = 更像随手转发，调低 = 更像自己随口一说。
+    "TOPIC_SHARE_LINK_PROB": (0.0, 1.0),
 
     # ---- 注入方式（夜间「记忆与人格」任务负责）----
     # L3 注文：后台工具读懂链接/图片后留下的话，每轮最多几条、每条多少字、总开关。
@@ -95,6 +97,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "IMAGE_REPLY_PROB", "PROACTIVE_ENERGY_MIN", "TRIGGER_DEBOUNCE_SEC",
         "TRIGGER_BURST_MAX_ITEMS", "VISION_SUMMARY_CHARS",
         "TOPIC_SHARE_SILENCE_MIN", "TOPIC_SHARE_COOLDOWN_MIN", "TOPIC_SHARE_MAX_CHARS",
+        "TOPIC_SHARE_LINK_PROB",
     ),
     "mind": (
         "RECALL_SCORE_THRESHOLD", "MIN_LITERAL_HITS", "RECALL_TOP_N", "RECALL_MAX_CHARS",
@@ -118,6 +121,7 @@ STEP_LIMITS: dict[str, float] = {
     "TOPIC_SHARE_SILENCE_MIN": 30,
     "TOPIC_SHARE_COOLDOWN_MIN": 30,
     "TOPIC_SHARE_MAX_CHARS": 15,
+    "TOPIC_SHARE_LINK_PROB": 0.2,
     "L3_NOTE_MAX_ITEMS": 1,
     "L3_NOTE_MAX_CHARS": 60,
     "L3_INJECT_ON": 1,

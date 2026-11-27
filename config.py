@@ -87,6 +87,9 @@ class Settings:
     ENABLE_TOPIC_SHARE: bool = _parse_bool(os.getenv("ENABLE_TOPIC_SHARE"), True)
     TOPIC_SHARE_SILENCE_MIN: int = int(os.getenv("TOPIC_SHARE_SILENCE_MIN", "90"))
     TOPIC_SHARE_COOLDOWN_MIN: int = int(os.getenv("TOPIC_SHARE_COOLDOWN_MIN", "120"))
+    # 分享时带原帖链接的概率（0~1，默认 0.35）：带链接更像「随手转发」，
+    # 但每次都贴就像营销号，所以按概率来。热调键同名，归 0:15 感官任务管。
+    TOPIC_SHARE_LINK_PROB: float = float(os.getenv("TOPIC_SHARE_LINK_PROB", "0.35"))
     # 静默期：默认只从凌晨 1 点睡到 8 点，0 点这段留着发每日统计
     QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "1"))
     QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "8"))

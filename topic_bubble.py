@@ -8,7 +8,7 @@
 - 抓取放在后台线程里跑（见 ``bot_core._topic_share_worker``），不阻塞 1 秒一次的
   去抖/投递巡检。
 
-调参：安静多久触发、两次间隔、正文长度都在 ``tuning`` 的 sense 组；
+调参：安静多久触发、两次间隔、正文长度、带不带原帖链接都在 ``tuning`` 的 sense 组；
 想换「她爱看什么」，改 ``roles/judges/topic_share.md``（热加载，不用重启）。
 """
 
@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +60,15 @@ _VAGUE_RE = re.compile(
 
 # 搜索结果超过这个天数就不要了。分享的卖点是「新」，一年半前的旧闻发进群很尴尬。
 MAX_AGE_DAYS = 540
+
+# 搜索结果行尾的链接标记（由 web_search 的 with_url 模式追加，正文里不出现）。
+_LINK_TAG_RE = re.compile(r"\s*⟨(https?://[^⟩\s]+)⟩\s*$")
+# 这些不是「原帖」：搜索引擎跳转页/站内搜索页，发出去也不像人话。
+_BAD_LINK_HOSTS = ("bing.com", "google.com", "baidu.com", "sogou.com", "so.com", "sm.cn")
+_BAD_LINK_EXT = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".zip", ".rar",
+    ".exe", ".apk", ".mp4", ".pdf",
+)
 
 _state_lock = threading.Lock()
 
@@ -107,11 +118,17 @@ def recent_topics_across(limit: int = 12) -> list[str]:
     return [str(it.get("topic") or "") for it in rows[-limit:] if it.get("topic")]
 
 
-def _record_share(group_id: str, topic: str, text: str, source: str) -> None:
+def _record_share(group_id: str, topic: str, text: str, source: str, link: str = "") -> None:
     with _state_lock:
         state = _load_state()
         state["groups"].setdefault(group_id, []).append(
-            {"ts": time.time(), "topic": topic, "text": text[:120], "source": source[:80]}
+            {
+                "ts": time.time(),
+                "topic": topic,
+                "text": text[:120],
+                "source": source[:80],
+                "link": link[:200],
+            }
         )
         _save_state(state)
 
@@ -176,7 +193,7 @@ def clean_share_text(text: str, max_chars: int) -> str:
     return body[: max_chars - 1].rstrip("，、；： ") + "…"
 
 
-def _search_with_deadline(query: str, timeout: float = 20.0) -> str:
+def _search_with_deadline(query: str, timeout: float = 20.0, with_url: bool = False) -> str:
     """web_search 内部会逐个引擎串行重试，最坏能拖到半分钟；这里到点就不要了。
 
     线程是 daemon，超时后让它自生自灭，不影响主流程。
@@ -185,7 +202,7 @@ def _search_with_deadline(query: str, timeout: float = 20.0) -> str:
 
     def _run() -> None:
         try:
-            box["text"] = web_search(query, max_results=4)
+            box["text"] = web_search(query, max_results=4, with_url=with_url)
         except Exception as exc:  # noqa: BLE001 - 搜索失败不该影响冒泡主流程
             box["err"] = str(exc)
 
@@ -206,6 +223,94 @@ def _usable(material: str) -> bool:
     if "未能" in material and "查到" in material:
         return False
     return True
+
+
+def is_shareable_url(url: str) -> bool:
+    """这条链接像不像「一条能点开的原帖」。
+
+    排除：搜索引擎自己的跳转/站内页、图片和安装包直链、超长带空格串。
+    链接发群里是要让人真的点得开，宁可这一轮不带，也不要甩一条打不开的。
+    """
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")) or len(url) > 200:
+        return False
+    if any(ch in url for ch in " \t\r\n\"'<>"):
+        return False
+    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    host = (parts.netloc or "").lower()
+    if "." not in host:
+        return False
+    if any(host == bad or host.endswith("." + bad) for bad in _BAD_LINK_HOSTS):
+        return False
+    if (parts.path or "").lower().endswith(_BAD_LINK_EXT):
+        return False
+    return True
+
+
+def split_sources(material: str) -> tuple[str, list[dict]]:
+    """把结果行尾的 ⟨链接⟩ 摘掉：正文给模型，链接留给代码决定要不要发。
+
+    模型看不到链接，就不会把它抄进正文（``clean_share_text`` 也会兜一层）。
+    """
+    clean_lines: list[str] = []
+    sources: list[dict] = []
+    for line in (material or "").splitlines():
+        body, url = line, ""
+        match = _LINK_TAG_RE.search(line)
+        if match:
+            body = line[: match.start()].rstrip()
+            url = match.group(1).rstrip(".,;)]}'\"")
+        if url and is_shareable_url(url):
+            sources.append({"url": url, "line": body})
+        clean_lines.append(body)
+    return "\n".join(clean_lines).strip(), sources
+
+
+def pick_source_url(evidence: str, sources: list[dict], threshold: float = 0.5) -> str:
+    """找出模型引用的那句话出自哪条结果，返回那条结果的原帖链接。
+
+    证据必须能定位到具体来源才给链接：链接和正文对不上，比不带链接更假。
+    """
+    e = _norm(evidence)
+    if len(e) < 6 or not sources:
+        return ""
+    for item in sources:
+        if e in _norm(item.get("line") or ""):
+            return str(item.get("url") or "")
+    # 证据可能横跨标题行和摘要行，退一步按二元组重合度挑最像的一条
+    want = _bigrams(evidence)
+    best_url, best_score = "", 0.0
+    for item in sources:
+        have = _bigrams(item.get("line") or "")
+        if not have:
+            continue
+        score = len(want & have) / max(1, min(len(want), len(have)))
+        if score > best_score:
+            best_url, best_score = str(item.get("url") or ""), score
+    return best_url if best_score >= threshold else ""
+
+
+def choose_link(evidence: str, sources: list[dict]) -> str:
+    """按概率决定这一轮带不带原帖链接；要带就必须指向正文真正引用的那条。
+
+    默认三成左右带链接：每次都贴链接像营销号，一次都不贴又少了「随手转发」的真实感。
+    链接由代码追加，模型自己写链接会被 ``clean_share_text`` 去掉。
+    """
+    prob = tuning.get_float("TOPIC_SHARE_LINK_PROB", settings.TOPIC_SHARE_LINK_PROB)
+    if prob <= 0 or not sources:
+        return ""
+    if random.random() >= prob:
+        logger.info("🌐 冷场找话题：这一轮按概率不带链接（%.0f%%）", prob * 100)
+        return ""
+    url = pick_source_url(evidence, sources)
+    if not url:
+        logger.info("🌐 冷场找话题：抽中带链接，但证据定位不到具体来源，本轮不带")
+        return ""
+    logger.info("🌐 冷场分享带原帖链接（%s）：%s", prob * 100, url[:100])
+    return url
 
 
 def _fresh_enough(line: str, now: datetime | None = None) -> bool:
@@ -277,15 +382,20 @@ def compose(brain, group_id: str, recent_lines: list[str]) -> dict | None:
         return None
 
     material_parts: list[str] = []
+    sources: list[dict] = []
     used_queries: list[str] = []
     for q in queries:
         if is_sensitive(q):
             logger.info("🌐 冷场找话题：关键词命中敏感方向，跳过「%s」", q)
             continue
-        text = _search_with_deadline(q)
+        text = _search_with_deadline(q, with_url=True)
         text = filter_fresh(text) if _usable(text) else ""
         if _usable(text):
-            material_parts.append(text)
+            clean, found = split_sources(text)
+            if not _usable(clean):
+                continue
+            material_parts.append(clean)
+            sources.extend(found)
             used_queries.append(q)
         if len(material_parts) >= 2:
             break
@@ -326,16 +436,23 @@ def compose(brain, group_id: str, recent_lines: list[str]) -> dict | None:
             logger.info("🌐 冷场找话题：正文里的数字在材料里找不到，丢：%s", text[:40])
             continue
 
-        _record_share(group_id, topic, text, used_queries[0] if used_queries else "")
+        evidence = str(out.get("evidence") or "")
+        link = choose_link(evidence, sources)
+        # 链接单独一行：微信里会显示成独立一条，像是顺手把原帖甩过来
+        full_text = f"{text}\n{link}" if link else text
+        _record_share(
+            group_id, topic, full_text, used_queries[0] if used_queries else "", link
+        )
         return {
-            "text": text,
+            "text": full_text,
             "topic": topic,
             "mood": mood
             if mood in {"happy", "smug", "shocked", "angry", "sleepy", "gaming", "love", "hungry"}
             else "happy",
             "source": used_queries[0] if used_queries else "",
             "queries": used_queries,
-            "evidence": str(out.get("evidence") or "")[:60],
+            "evidence": evidence[:60],
+            "link": link,
             "at": datetime.now().strftime("%H:%M"),
         }
     logger.info("🌐 冷场找话题：两次都没写出可核实的内容，本轮不发声")

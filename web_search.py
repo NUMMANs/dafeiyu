@@ -43,6 +43,18 @@ def _strip_tags(raw: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", raw)).strip()
 
 
+# 带链接模式：在结果行尾追加 ⟨url⟩，由调用方（冷场找话题）自己摘掉，
+# 正文里不出现链接，避免模型把它抄进群里。默认关闭，其它调用方行为不变。
+_URL_TAG = "⟨{}⟩"
+
+
+def _url_tag(url: str, with_url: bool) -> str:
+    url = (url or "").strip()
+    if not with_url or not url.startswith(("http://", "https://")):
+        return ""
+    return " " + _URL_TAG.format(url)
+
+
 def _extract_domain(url: str) -> str:
     try:
         return urllib.parse.urlparse(url).netloc
@@ -125,7 +137,9 @@ def _save_cache(cache: dict[str, dict]) -> None:
 _DISK_CACHE = _load_cache()
 
 
-def search_zhipu(query: str, max_results: int = 5, timeout: float = 10.0) -> str | None:
+def search_zhipu(
+    query: str, max_results: int = 5, timeout: float = 10.0, with_url: bool = False
+) -> str | None:
     """国内免翻墙高速搜索：优先智谱直连 /v4/web_search（~3秒），失败则回退免费 glm-4-flash 联网"""
     if not settings.ZHIPU_API_KEY:
         return None
@@ -160,7 +174,10 @@ def search_zhipu(query: str, max_results: int = 5, timeout: float = 10.0) -> str
             pub = (item.get("publish_date") or "")[:10]
             media = item.get("media") or _extract_domain(item.get("link", ""))
             kept += 1
-            lines.append(f"{kept}. {title} [{media} {pub}] — {content[:280]}")
+            lines.append(
+                f"{kept}. {title} [{media} {pub}] — {content[:280]}"
+                + _url_tag(item.get("link", ""), with_url)
+            )
         if kept > 0:
             return "\n".join(lines)
     except Exception as exc:
@@ -204,11 +221,16 @@ def search_zhipu(query: str, max_results: int = 5, timeout: float = 10.0) -> str
         pub = (item.get("publish_date") or "")[:10]
         media = item.get("media") or _extract_domain(item.get("link", ""))
         kept += 1
-        lines.append(f"{kept}. {title} [{media} {pub}] — {content[:260]}")
+        lines.append(
+            f"{kept}. {title} [{media} {pub}] — {content[:260]}"
+            + _url_tag(item.get("link", ""), with_url)
+        )
     return "\n".join(lines) if kept > 0 else None
 
 
-def search_tavily(query: str, max_results: int = 5, timeout: float = 6.0) -> str | None:
+def search_tavily(
+    query: str, max_results: int = 5, timeout: float = 6.0, with_url: bool = False
+) -> str | None:
     """Tavily AI 搜索（每月 1000 次免费，无需绑卡）"""
     if not settings.TAVILY_API_KEY:
         return None
@@ -239,11 +261,16 @@ def search_tavily(query: str, max_results: int = 5, timeout: float = 6.0) -> str
         if not _passes_quality_gate(query, title, content):
             continue
         domain = _extract_domain(item.get("url", ""))
-        lines.append(f"{idx}. {title} [{domain}] — {content[:260]}")
+        lines.append(
+            f"{idx}. {title} [{domain}] — {content[:260]}"
+            + _url_tag(item.get("url", ""), with_url)
+        )
     return "\n".join(lines) if len(lines) > 1 else None
 
 
-def search_serper(query: str, max_results: int = 5, timeout: float = 5.0) -> str | None:
+def search_serper(
+    query: str, max_results: int = 5, timeout: float = 5.0, with_url: bool = False
+) -> str | None:
     """Serper Google 结构化搜索（注册送 2500 次免费，无需绑卡）"""
     if not settings.SERPER_API_KEY:
         return None
@@ -267,11 +294,15 @@ def search_serper(query: str, max_results: int = 5, timeout: float = 5.0) -> str
         pub = item.get("date") or ""
         domain = _extract_domain(item.get("link", ""))
         meta = f"[{domain} {pub}]".strip()
-        lines.append(f"{idx}. {title} {meta} — {snippet[:260]}")
+        lines.append(
+            f"{idx}. {title} {meta} — {snippet[:260]}" + _url_tag(item.get("link", ""), with_url)
+        )
     return "\n".join(lines) if len(lines) > 1 else None
 
 
-def search_bocha(query: str, max_results: int = 5, timeout: float = 5.0) -> str | None:
+def search_bocha(
+    query: str, max_results: int = 5, timeout: float = 5.0, with_url: bool = False
+) -> str | None:
     """博查 AI 搜索（国内中文结构化 JSON）"""
     if not settings.BOCHA_API_KEY:
         return None
@@ -299,11 +330,16 @@ def search_bocha(query: str, max_results: int = 5, timeout: float = 5.0) -> str 
             continue
         pub = (item.get("datePublished") or "")[:10]
         site = item.get("siteName") or _extract_domain(item.get("url", ""))
-        lines.append(f"{idx}. {title} [{site} {pub}] — {summary[:280]}")
+        lines.append(
+            f"{idx}. {title} [{site} {pub}] — {summary[:280]}"
+            + _url_tag(item.get("url", ""), with_url)
+        )
     return "\n".join(lines) if len(lines) > 1 else None
 
 
-def search_bing_rss(query: str, max_results: int = 4, timeout: float = 4.5) -> str | None:
+def search_bing_rss(
+    query: str, max_results: int = 4, timeout: float = 4.5, with_url: bool = False
+) -> str | None:
     """零 Key 免费兜底：必应 RSS + 严格质量门禁（无关垃圾页直接丢弃）"""
     url = "https://cn.bing.com/search?format=rss&q=" + urllib.parse.quote(query)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -325,22 +361,29 @@ def search_bing_rss(query: str, max_results: int = 4, timeout: float = 4.5) -> s
         pub = (it.findtext("pubDate") or "").strip()[:16]
         domain = _extract_domain(it.findtext("link") or "")
         kept += 1
-        lines.append(f"{kept}. {title} [{domain} {pub}] — {desc[:260]}")
+        lines.append(
+            f"{kept}. {title} [{domain} {pub}] — {desc[:260]}"
+            + _url_tag(it.findtext("link") or "", with_url)
+        )
         if kept >= max_results:
             break
     return "\n".join(lines) if kept > 0 else None
 
 
-def web_search(query: str, max_results: int = 4) -> str:
+def web_search(query: str, max_results: int = 4, with_url: bool = False) -> str:
     """
     智能检索入口：年份归一化 -> 24h 磁盘缓存 -> 多引擎路由 + 严格质量门禁。
+
+    ``with_url=True`` 时每条结果行尾多一个 ``⟨原帖链接⟩`` 标记，供「冷场找话题」
+    决定要不要带链接；默认关闭，正文里不出现任何 URL。
     """
     q = _normalize_query(query)
     if not q:
         return "搜索关键词为空。"
 
     now = time.time()
-    cached = _DISK_CACHE.get(q)
+    cache_key = q if not with_url else f"{q}\u0001link"
+    cached = _DISK_CACHE.get(cache_key)
     if cached and (now - float(cached.get("ts", 0))) < CACHE_TTL:
         return str(cached["text"])
 
@@ -353,7 +396,7 @@ def web_search(query: str, max_results: int = 4) -> str:
         ("BingRSS", search_bing_rss),
     ):
         try:
-            result_text = fn(q, max_results=max_results)
+            result_text = fn(q, max_results=max_results, with_url=with_url)
             if result_text:
                 logger.info("🔍 联网搜索命中 [%s]: %s", engine_name, q)
                 break
@@ -363,6 +406,6 @@ def web_search(query: str, max_results: int = 4) -> str:
     if not result_text:
         return f"未能在网上查到关于「{q}」的可靠结果（已拦截无关垃圾页，请直接告知群友暂未查到确切消息，不要瞎编）。"
 
-    _DISK_CACHE[q] = {"ts": now, "text": result_text}
+    _DISK_CACHE[cache_key] = {"ts": now, "text": result_text}
     _save_cache(_DISK_CACHE)
     return result_text
