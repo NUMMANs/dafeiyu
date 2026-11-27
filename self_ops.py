@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import BASE_DIR, DATA_DIR
+from config import BASE_DIR, DATA_DIR, settings
 import gitmeta
 
 logger = logging.getLogger("dafeiyu.self_ops")
@@ -343,13 +343,25 @@ def self_edit_code(rel_path: str, target: str, replacement: str) -> str:
     return f"已成功写入 {norm_rel}。"
 
 
-def save_restart_notice(group_id: str, msg: str) -> None:
+def save_restart_notice(group_id: str, msg: str, alert: bool = False) -> None:
+    """登记重启后要发到群里的那句话（真的发不发由调用侧的开关决定）。
+
+    这里就更早一步拦掉：不开播报时连 notice 文件都不写，免得重启后另一个
+    进程读到旧文件又补发一条。日志一定留，方便回查什么时候重启过、为什么。
+    """
     payload = {
         "group_id": (group_id or "").strip(),
         "msg": (msg or "").strip(),
         "ts": time.time(),
     }
     if not payload["msg"]:
+        return
+    if alert:
+        if not settings.RESTART_ALERT_ON:
+            logger.warning("🩹 崩溃告警播报已关，仅记日志: %s", payload["msg"])
+            return
+    elif not settings.RESTART_NOTICE_ON:
+        logger.info("🔇 重启播报已关，仅记日志: %s", payload["msg"])
         return
     try:
         _atomic_write_text(

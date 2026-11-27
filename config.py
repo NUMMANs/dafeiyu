@@ -106,6 +106,11 @@ class Settings:
     # 和 AUTO_GIT_UPDATE 分开：那个管「去远程拉更新」，这个管「本地工作区换了分支」，
     # 所以关掉自动拉取也照样能切分支。
     AUTO_BRANCH_WATCH: bool = _parse_bool(os.getenv("AUTO_BRANCH_WATCH"), True)
+    # 重启 / 切分支 / 拉更新时是否往群里播报。默认关：这些是运维动作，
+    # 群里不该看到「鱼重启回来啦」「已切到分支 xxx」这种机械汇报，日志留痕就够。
+    RESTART_NOTICE_ON: bool = _parse_bool(os.getenv("RESTART_NOTICE_ON"), False)
+    # 崩溃 / 版本回滚告警是故障信号，不是例行重启，默认仍然播报。
+    RESTART_ALERT_ON: bool = _parse_bool(os.getenv("RESTART_ALERT_ON"), True)
 
     # 后台工兵（DSH / CodeBuddy 沙箱执行）
     ENABLE_DSH: bool = _parse_bool(os.getenv("ENABLE_DSH"), True)
