@@ -95,6 +95,25 @@ def _git(*args: str, input_text: str = "", check: bool = True) -> str:
     return (proc.stdout or "").strip()
 
 
+def _push_branch(branch: str, attempts: int = 3) -> None:
+    """把当前分支推到同名远程分支，失败重试。
+
+    代理偶尔会对 github.com 返回 502（CONNECT tunnel failed），一次抖动就让整轮
+    夜间改动没上云、台账还记成失败。这里退避重试三次，能吃掉大部分瞬时故障；
+    真推不上去才抛错，调用方按原来的方式汇报。
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            _git("push", "--quiet", "--set-upstream", "origin", branch)
+            return
+        except RuntimeError as exc:
+            last = exc
+            if i + 1 < attempts:
+                time.sleep(4 * (i + 1))
+    raise last or RuntimeError(f"推送 {branch} 失败")
+
+
 def _ps(script: str) -> tuple[int, str]:
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -424,7 +443,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
                     raise RuntimeError("当前处于 detached HEAD，拒绝提交（不知道要推到哪个分支）")
                 _git("commit", "-F", "-", input_text=args.message.strip() + "\n")
                 commit = _git("rev-parse", "HEAD")[:7]
-                _git("push", "--quiet", "--set-upstream", "origin", branch)
+                _push_branch(branch)
                 pushed_branch = branch
         except RuntimeError as exc:
             _emit({"ok": False, "stage": "git", "error": str(exc), **result,
@@ -539,7 +558,7 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         if not branch or branch == "HEAD":
             raise RuntimeError("当前处于 detached HEAD，拒绝 revert（不知道要推到哪个分支）")
         _git("revert", "--no-edit", "HEAD")
-        _git("push", "--quiet", "origin", branch)
+        _push_branch(branch)
     except RuntimeError as exc:
         _emit({"ok": False, "error": str(exc)})
         return 3
