@@ -1,37 +1,14 @@
 """
-夜间改动护栏 —— 两个 WorkBuddy 定时任务共用的「放开权限但不失控」底座。
+夜间改动护栏 —— 防膨胀收权版（严禁夜间自动改代码）。
 
-2026-11-26 起，两个夜间任务被允许改代码、改小 LLM 提示词、改人格卡模板、
-甚至调整唤醒层/工具层的架构。权限放开后必须有机器可执行的护栏，因为凌晨没人盯着：
-
-1. 跨进程文件锁：两个任务（0:15 感官 / 0:45 记忆）绝不能同时改同一批文件、
-   同时 commit+push。谁先拿到锁谁改，另一个等待。
-2. 改动面检查：黑名单（.env / watchdog.py / main.py / self_ops.py / DB / state）
-   一律拒绝；未跟踪的新文件默认拒绝；改过的 .py 必须能 py_compile；
-   人格模板改了必须能通过 build_card 的 6000 字上限；tuning.json 的每个键
-   必须在 tuning.BOUNDS 内、且单晚变动不超过 tuning.STEP_LIMITS。
-3. 安全提交：只 add 明确列出的白名单文件，commit 后立刻 push。
-   本项目 AUTO_GIT_UPDATE 每 60 秒会 `git stash push` + `git pull --ff-only`，
-   pull 失败不会自动 pop —— 不立刻提交并推送，改动就会被吞掉甚至被 reset --hard 抹掉。
-   绝不使用 git stash / reset --hard / push --force。
-4. 平滑重启：改了 .py 必须重启才生效。只杀 main.py 子进程，绝不碰 watchdog.py 父进程；
-   子进程 uptime < 20s 时不动手（否则看门狗判定「启动即崩」会 reset --hard）。
-5. 台账：每天写了什么、为什么、落在哪个 commit，全部记进 data/nightly_changes/，
-   调参前后值也留一行快照，第二天可以对照，出事可以按 commit 回滚。
-
-用法（解释器必须用 C:/Users/CfLks/AppData/Local/Programs/Python/Python312/python.exe）：
-
-    python tools/nightly_guard.py begin  --owner sense --wait 900
-    # ... 这期间改文件、跑脚本、跑测试 ...
-    python tools/nightly_guard.py check                    # 输出 JSON，ok=false 就别提交
-    python tools/nightly_guard.py finish --owner sense --message "本轮改了什么" [--restart]
-    python tools/nightly_guard.py abort  --owner sense    # 中途放弃，释放锁
-    python tools/nightly_guard.py status                 # 锁 / HEAD / 最近台账
-    python tools/nightly_guard.py health                # 重启后验证看门狗状态
-    python tools/nightly_guard.py rollback              # revert 最近一次提交并 push
-
-owner 只能是 sense（感官与工具助手）或 mind（记忆与人格）。
-所有命令都只读/只写自己的锁与台账，不会主动往群里发消息，也不会派后台任务。
+【架构防膨胀铁律（2026-11-27 生效）】
+夜间定时任务（0:15 sense / 0:45 mind）已被收回修改 `.py` 源码、脚本与核心人格模板的权限！
+夜间只允许做轻量的群友记忆沉淀与运行期参数微调：
+  1. 群友记忆沉淀：调用 `python tools/nightly_memory.py` 写入 L1 识海与 L2 观察笔记；
+  2. 数值微调：写入 `data/tuning.json`（受 `tuning.BOUNDS` 与 `STEP_LIMITS` 约束，热加载免重启）；
+  3. 判定补充：仅允许微调 `roles/judges/l2.md`、`roles/judges/l2_5.md`、`roles/judges/tool_router.md`（热加载免重启）。
+任何针对 `.py` / `.bat` / `.cmd` / `roles/大肥鱼.人格.md` / `roles/大肥鱼.操作.md` 的修改都会被 `check` 拦截拒绝提交；
+若发现代码缺陷，只写进 `data/nightly_changes/` 报告留待人工处理，严禁自动打代码补丁或新增模块！
 """
 from __future__ import annotations
 
@@ -62,20 +39,21 @@ WATCHDOG_STATE = DATA_DIR / "watchdog_state.json"
 OWNERS = ("sense", "mind")
 STALE_SEC = 2700  # 锁超过 45 分钟没人释放，视作上一轮崩了
 
-# 动了这些就别提交：要么是密钥/进程模型/运行时数据，要么会破坏看门狗。
+# 动了这些就别提交：禁止夜间自动化修改任何代码、启动脚本、密钥、核心人格模板与运行时数据。
 NEVER_EXACT = {
     ".env", ".env.bak", "watchdog.py", "main.py", "self_ops.py",
-    "start_wechat.bat", "start_web.bat", "requirements.txt",
+    "start_wechat.bat", "start_web.bat", "start_qq.bat", "requirements.txt",
     "mcp.json", "dafeiyu.db", "data/dafeiyu.db",
+    "roles/大肥鱼.人格.md", "roles/大肥鱼.操作.md", "roles/大肥鱼.md",
 }
 NEVER_PREFIX = (
     "data/", "state/", "stickers/", "wechatauto_logs/", ".git/",
-    ".workbuddy/", "logs/", "__pycache__/",
+    ".workbuddy/", "logs/", "__pycache__/", "tools/", "adapters/", "static/",
 )
-NEVER_SUFFIX = (".db", ".db.bak", ".bak", ".pyc", ".log")
+NEVER_SUFFIX = (".py", ".bat", ".cmd", ".ps1", ".sh", ".db", ".db.bak", ".bak", ".pyc", ".log")
 
-ALLOW_ROOT_SUFFIX = (".py", ".md", ".txt", ".json", ".bat")
-ALLOW_DIRS = ("roles/", "tools/", "adapters/", "docs/", "static/")
+ALLOW_ROOT_SUFFIX: tuple[str, ...] = ()
+ALLOW_DIRS = ("roles/judges/", "docs/")
 
 PERSONA_FILES = ("roles/大肥鱼.人格.md", "roles/大肥鱼.操作.md")
 
@@ -184,12 +162,10 @@ def _allowed(path: str) -> tuple[bool, str]:
     if p.startswith("./"):
         p = p[2:]
     if p in NEVER_EXACT or p.startswith(NEVER_PREFIX) or p.endswith(NEVER_SUFFIX):
-        return False, "命中禁改清单（密钥 / 进程模型 / 运行时数据）"
-    if p == ".gitignore":
-        return True, ""
+        return False, "命中禁改清单（夜间任务严禁改 .py 代码、核心人设或运行时数据）"
     if "/" in p:
-        return (True, "") if p.startswith(ALLOW_DIRS) else (False, "不在允许的子目录（roles/tools/adapters/docs/static）")
-    return (True, "") if p.endswith(ALLOW_ROOT_SUFFIX) else (False, "根目录只允许 .py/.md/.txt/.json/.bat")
+        return (True, "") if p.startswith(ALLOW_DIRS) else (False, "夜间只允许修改 roles/judges/*.md 或 docs/")
+    return (False, "夜间禁止修改项目根目录文件")
 
 
 def _verify_persona() -> list[str]:

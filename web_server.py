@@ -14,7 +14,7 @@ from sticker_manager import GENERATED_DIR, sticker_manager
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="大肥鱼 · DeepSeek 微信群养成控制台")
+app = FastAPI(title="大肥鱼 · Grok 微信群锐评核查控制台")
 
 app.mount("/stickers", StaticFiles(directory=str(STICKERS_DIR)), name="stickers")
 app.mount("/generated_stickers", StaticFiles(directory=str(GENERATED_DIR)), name="generated_stickers")
@@ -36,7 +36,7 @@ def api_status(group_id: str = "大肥鱼模拟群"):
     st = pet_engine.get_status()
     return {
         "pet": st.to_dict(),
-        "leaderboard": pet_engine.get_leaderboard(group_id=group_id, limit=5),
+        "leaderboard": [],
         "stickers": sticker_manager.list_all(),
         "config": {
             "bot_name": settings.BOT_NAME,
@@ -103,5 +103,5 @@ async def api_chat(
         "mood": resp.mood,
         "uploaded_image_url": uploaded_url,
         "pet": st.to_dict(),
-        "leaderboard": pet_engine.get_leaderboard(group_id=group_id, limit=5),
+        "leaderboard": [],
     }
