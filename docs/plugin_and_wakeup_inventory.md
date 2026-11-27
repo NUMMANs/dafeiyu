@@ -843,3 +843,22 @@ TRIGGER_DEBOUNCE_MAX_WAIT_SEC=12
 
 **权衡**：闲聊时模型看不到电脑工具，纯聊天不受影响；但若有人用很隐晦的说法让它操作电脑
 （完全不含上述关键词），它就不会去调工具。关键词表已放宽到 90 余个，覆盖常见说法。
+
+---
+
+## 2026-11-27 分支跟随
+
+自动更新与夜间提交不再写死 `main`：
+
+- `self_ops.check_remote_update` / `git_pull_and_check` 跟随**当前分支的上游**。
+  以前写死 `origin/main`，切到 `Smila_FZ` 后 60 秒内就会被 `--ff-only` 拉平回 main；
+  现在在分支上只比对 `origin/Smila_FZ`，而且用 ahead/behind 判断，
+  本地有未推送提交时不再误判成「远程有新提交」并触发重启。
+- `adapters/wxauto_adapter` 增加分支守护（`AUTO_BRANCH_WATCH`，默认开）：
+  分支变了就重启；HEAD 变了但只动热加载文件（`roles/judges/*.md`）则不重启。
+- `tools/nightly_guard.finish` / `rollback` 改为 push **当前分支**。
+  以前在分支上 push 的其实是本地 `main`，git 返回 `Everything up-to-date` 且 exit 0，
+  护栏以为推送成功，commit 却只留在本地分支上。
+- `watchdog` 回滚闸门改用当前分支上游，并新增「稳定版本不在当前分支历史里就拒绝 reset」。
+- 新增 `gitmeta.py`：代理探活（配置里的代理死了就地 `-c key=` 清空，不改用户配置）、
+  当前分支/上游、`touches_code`（差异里有没有 `.py`）。
