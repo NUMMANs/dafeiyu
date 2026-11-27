@@ -48,6 +48,13 @@ _WS_RE = re.compile(r"[ \t\u3000]+")
 _PUNCT_RE = re.compile(r"[^\u4e00-\u9fffa-zA-Z0-9]")
 _DATE_RE = re.compile(r"\[[^\]]*?(\d{4})-(\d{2})-(\d{2})[^\]]*\]")
 _ITEM_RE = re.compile(r"^\s*\d+[.、]")
+# 「一个味道」「特别怪的东西」这种说了等于没说的写法：分享必须让人知道是什么，
+# 含糊不清的宁可换一条（实测模型会说「出了个特别怪的味道薯片」却不说是什么味）。
+_VAGUE_RE = re.compile(
+    r"(一个|某个|某种|这个|那个|特别怪|很奇怪|奇奇怪怪)的?(味道|口味|东西|零食|游戏|地方|玩意)"
+    r"|什么[\u4e00-\u9fff]{0,3}(味|口味|东西|玩意|游戏|零食)"
+    r"|出了个什么"
+)
 
 # 搜索结果超过这个天数就不要了。分享的卖点是「新」，一年半前的旧闻发进群很尴尬。
 MAX_AGE_DAYS = 540
@@ -138,6 +145,11 @@ def is_sensitive(text: str) -> str:
         if term in probe:
             return term
     return ""
+
+
+def is_vague(text: str) -> bool:
+    """说了等于没说（「一个味道」「某个东西」）：群友看完不知道是什么，就不必发。"""
+    return bool(_VAGUE_RE.search(text or ""))
 
 
 def clean_share_text(text: str, max_chars: int) -> str:
@@ -299,6 +311,9 @@ def compose(brain, group_id: str, recent_lines: list[str]) -> dict | None:
         if is_repeat(topic, avoid):
             logger.info("🌐 冷场找话题：主题「%s」近期分享过，丢弃", topic)
             return None
+        if is_vague(text):
+            logger.info("🌐 冷场找话题：写得太含糊（没说清是什么），重试：%s", text[:40])
+            continue
         if not evidence_supported(str(out.get("evidence") or ""), material):
             logger.info(
                 "🌐 冷场找话题：第 %d 次写的内容对不上原文，丢：%s（证据 %r）",
