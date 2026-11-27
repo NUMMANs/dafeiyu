@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -39,9 +40,22 @@ RESTART_DELAY_SECONDS = 1.5
 PORT_WAIT_SECONDS = 60.0
 LOCK_FILE = DATA_DIR / "watchdog.lock"
 
+# 子进程写 logs/bot.log，父进程单独一份——多进程写同一个轮转文件会互相抢，
+# 两边各管各的，出问题时也不会因为对方在轮转而丢行。
+_LOG_DIR = DATA_DIR.parent / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            _LOG_DIR / "watchdog.log",
+            maxBytes=2 * 1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+        ),
+    ],
 )
 logger = logging.getLogger("dafeiyu.watchdog")
 

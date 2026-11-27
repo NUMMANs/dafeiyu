@@ -1,18 +1,32 @@
 import argparse
 import logging
+import logging.handlers
 import threading
 
 import uvicorn
 
 from adapters.ilink_adapter import ILinkAdapter
 from adapters.wxauto_adapter import WxAutoAdapter
-from config import settings
+from config import BASE_DIR, settings
 from self_ops import PORT_BUSY_EXIT_CODE, is_port_in_use
 from web_server import app
 
+# 日志同时落盘：从 start_wechat.bat 启动时控制台一关就什么都没有，
+# 想回头查「那句话到底怎么发出去的」只能翻数据库。轮转 5MB × 3 份够用。
+_LOG_DIR = BASE_DIR / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            _LOG_DIR / "bot.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+    ],
 )
 logger = logging.getLogger("dafeiyu.main")
 

@@ -501,10 +501,30 @@ def compose(brain, group_id: str, recent_lines: list[str]) -> dict | None:
     }
 
 
-def context_line(max_items: int = 4) -> str:
+def _slot_sentence(slot: dict) -> str:
+    """把一段生活线写成一句能直接说出口的话：「中午吃了顿麻辣烫，宽粉还给我漏了」。
+
+    两件事刻意不做：
+    一是**不加 `12:40 吃：` 这种前缀**——带前缀的清单式素材，模型会连排版一起搬进回复。
+    实测过一次，它把三段原样抄出来、中间还留着换行，最后拆成「翻了两遍袋子确认没漏
+    下午大乱斗连输四把」这种一条塞两件事的气泡。
+    二是**不把 title 和 detail 拼起来**——title 是 detail 的概括，拼了就是「连输四把，
+    连输四把，队友一个劲往人堆里冲」。detail 本身已经是完整的一句，直接用。
+    """
+    detail = str(slot.get("detail") or "").strip().rstrip("。")
+    title = str(slot.get("title") or "").strip().rstrip("。")
+    if not detail:
+        return title
+    # detail 太短（像个半句）时，才用 title 兜一下，让人看得出在说哪件事
+    if len(detail) < 8 and title and title not in detail:
+        return f"{title}，{detail}"
+    return detail
+
+
+def context_line(max_items: int = 3) -> str:
     """给正常回复用的「你今天」块：让别人问起「在干嘛」时她前后对得上。
 
-    只放已经发生的事，最多 4 条——既是省 token，也是防她张口就把一整天的流水账念出来。
+    只放已经发生的事，最多 3 条——既是省 token，也是防她张口就把一整天的流水账念出来。
     """
     now = datetime.now()
     state = _load()
@@ -517,14 +537,13 @@ def context_line(max_items: int = 4) -> str:
     ][-max_items:]
     if not passed:
         return ""
-    lines = []
-    for slot in passed:
-        detail = str(slot.get("detail") or "").strip()
-        tail = f"，{detail}" if detail else ""
-        lines.append(f"- {slot.get('at')} {slot.get('kind')}：{slot.get('title')}{tail}")
+    lines = [f"- {sent}" for sent in (_slot_sentence(s) for s in passed) if sent]
+    if not lines:
+        return ""
     return (
-        "【你今天】（你自己过的日子，不是群里谁说的。别人问起或者正好聊到就自然用，"
-        "没人问别提，也别一次性念成清单）\n" + "\n".join(lines)
+        "【你今天】（你自己过的日子，不是群里谁说的。下面是素材不是稿子："
+        "别人问起就挑最想说的一两件讲，别按时间顺序一条条念，也别把整天倒出来）\n"
+        + "\n".join(lines)
     )
 
 
@@ -534,10 +553,11 @@ def today_str(now: datetime | None = None) -> str:
 
 # 「在干嘛」这类问句。必须有主语或时间词兜着，否则「你干嘛啊」这种责怪、
 # 「干嘛要这样」这种反问也会被当成询问，白白塞一段生活线进上下文。
+# 所以第一组不收光秃秃的「干嘛」，只认「干嘛了/干嘛呢」这种带疑问收尾的。
 _ASK_LIFE_RE = re.compile(
     r"(?:你|你们|鱼|肥鱼|大肥鱼|现在|这会儿|今天|刚刚|刚才)[^，。！？\n]{0,6}?"
-    r"(?:在忙|忙不忙|在做|在干|干啥|干什么|做什么|做啥|忙啥|忙什么)"
-    r"|(?:在干嘛|干嘛呢|干啥呢|做啥呢|在忙吗|忙啥呢|忙什么呢|在忙什么|在做什么)"
+    r"(?:在忙|忙不忙|在做|在干|干啥|干点啥|干了啥|干什么|做什么|做啥|忙啥|忙什么)"
+    r"|(?:在干嘛|干嘛呢|干嘛了|干啥呢|干啥了|做啥呢|在忙吗|在忙啥|忙不忙|忙啥呢|忙什么呢|在忙什么|在做什么)"
 )
 
 
@@ -581,21 +601,21 @@ def question_hint(text: str, now: datetime | None = None) -> str:
             f"（{nxt.get('at')} 才{nxt.get('kind')}）。照「还没起／在床上赖着」这种答，"
             "一句话，别编别的行程。"
         )
-    detail = str(cur.get("detail") or "").strip()
-    tail = f"，{detail}" if detail else ""
+    detail = str(cur.get("detail") or "").strip().rstrip("。")
     soon = ""
     if nxt:
         gap = _at_minutes(str(nxt.get("at") or "")) - _now_minutes(now)
         if 0 < gap <= 60:
-            soon = f"再过一会儿打算{nxt.get('kind')}。"
+            soon = f"再过一会儿该{nxt.get('kind')}了。"
     logger.info(
         "🐟 有人在问「在干嘛」，按生活线作答：%s %s",
         cur.get("at"),
         str(cur.get("title"))[:20],
     )
+    cur_sent = _slot_sentence(cur) or str(cur.get("title") or "").strip()
     return (
-        "【本轮：对方在问你现在在干嘛】就照今天这一段答，别另编行程：\n"
-        f"- 现在大概是：{cur.get('at')} {cur.get('kind')}，{cur.get('title')}{tail}\n"
+        "【本轮：对方在问你现在在干嘛】就照这一段答，别另编行程：\n"
+        f"- 现在大概在：{cur_sent}\n"
         f"{soon}"
         "一句话说完，像随口说的；别报备，也别把今天其它几段一起倒出来。"
     )

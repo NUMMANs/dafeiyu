@@ -275,12 +275,57 @@ def _split_long_bubble(text: str, limit: int) -> list[str]:
     return final
 
 
+# 「另一件事开始了」的信号：时段、语气转折、换了说话对象。
+# 模型没写 `||` 时会顺手把素材抄成多行，换行常常断在半句话中间，空格后面才是新的一段——
+# 只按换行切，就会切出「翻了两遍袋子确认没漏 下午大乱斗连输四把」这种一条塞两件事的气泡。
+_BEAT_WORDS = (
+    "凌晨", "早上", "早晨", "上午", "中午", "下午", "傍晚", "晚上",
+    "夜里", "深夜", "半夜", "今早", "今晚", "昨天",
+    "现在", "刚才", "后来", "然后", "结果", "反正", "对了", "话说",
+    "你们", "大家", "咱们", "咱",
+)
+_BEAT_BREAK_RE = re.compile(
+    r"(?<=[\s，,。！？!?…~～])(?=%s)" % "|".join(_BEAT_WORDS)
+)
+_SENT_TAIL = "。！？!?…~～"
+
+
+def _reflow_lines(raw: str, limit: int) -> list[str]:
+    """没有 `||` 时，把换行和空格处的断点重排成「一件事一条气泡」。
+
+    两步：先按「另一件事开头」把每行再切开，再把不是新事开头的碎片接回上一条
+    （合起来不超过 limit 字）。硬折行留下的半句会被接回去，跨时段的两件事会被拆开。
+    """
+    pieces: list[str] = []
+    for line in raw.replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        pieces.extend(p.strip() for p in _BEAT_BREAK_RE.split(line) if p.strip())
+
+    merged: list[str] = []
+    for piece in pieces:
+        prev = merged[-1] if merged else ""
+        # 上一条已经说到句号、这一条又是新事开头，就该断开；否则能接就接
+        can_join = (
+            bool(prev)
+            and not piece.startswith(_BEAT_WORDS)
+            and prev[-1] not in _SENT_TAIL
+            and len(prev) + 1 + len(piece) <= limit
+        )
+        if can_join:
+            merged[-1] = f"{prev.rstrip(_TRAIL_JUNK)}，{piece}"
+        else:
+            merged.append(piece)
+    return merged
+
+
 def split_human_bubbles(text: str) -> list[str]:
     """把一条回复拆成几条微信气泡，模拟真人手机打字连发。
 
     拆分顺序（模型怎么编排、代码怎么兜底）：
     1. 模型自己用 `||` 分段时，按 `||` 走——她编排的分段最自然，代码只管长度兜底；
-    2. 没有 `||` 就按换行分；
+    2. 没有 `||` 就按换行/空格重排（`_reflow_lines`）：断在半句的接回去，跨时段的两件事拆开；
     3. 每一段再按 `BUBBLE_MAX_CHARS`（默认 30 字，tuning 可热调）拆：先句末，
        再逗号，最后才硬切——保证发出去的每一条都不会是一大坨；
     4. 最多 `BUBBLE_MAX_COUNT`（默认 6）条，超出的并进最后一条，防止刷屏。
@@ -294,8 +339,10 @@ def split_human_bubbles(text: str) -> list[str]:
     max_chars = tuning.get_int("BUBBLE_MAX_CHARS", BUBBLE_MAX_CHARS_DEFAULT)
     max_count = max(1, tuning.get_int("BUBBLE_MAX_COUNT", BUBBLE_MAX_COUNT_DEFAULT))
 
-    sep = "||" if "||" in raw else "\n"
-    parts = [p.strip() for p in raw.split(sep) if p.strip()]
+    if "||" in raw:
+        parts = [p.strip() for p in raw.split("||") if p.strip()]
+    else:
+        parts = _reflow_lines(raw, max_chars)
 
     expanded: list[str] = []
     for part in parts:
@@ -312,6 +359,9 @@ def split_human_bubbles(text: str) -> list[str]:
     if len(cleaned) > max_count:
         tail = "，".join(cleaned[max_count - 1:]).strip().rstrip(_TRAIL_JUNK)
         cleaned = cleaned[: max_count - 1] + ([tail] if tail else [])
+    if len(cleaned) > 1:
+        logger.info("💬 气泡 %d 条: %s", len(cleaned), " ¦ ".join(cleaned))
+    logger.debug("💬 原文: %r", raw)
     return cleaned
 
 
@@ -817,17 +867,19 @@ class DaFeiYuBrain:
             if group_id and tuning.get_int("L3_INJECT_ON", 1)
             else []
         )
-        # 她今天自己的生活（只放已发生、最近 4 段）：让「你在干嘛」这种回答前后一致
+        # 她今天自己的生活：让「你在干嘛」这种回答前后一致
         life_note = ""
         life_hint = ""
         if tuning.get_int("LIFE_INJECT_ON", 1):
             try:
                 import daily_life
 
-                life_note = daily_life.context_line()
                 # 有人直接问「你在干嘛」时，再补一条「就照现在这一段答」的指令；
                 # 光有生活线，模型容易顺着当天话题编，或者回一句没内容的「在刷手机」。
                 life_hint = daily_life.question_hint(text)
+                # 被问时素材只给最近两段：摆三五条在眼前，它就会一口气全念出来，
+                # 变成「中午…下午…晚上…」的行程汇报。念不全反而更像聊天。
+                life_note = daily_life.context_line(max_items=2 if life_hint else 3)
                 if not life_note:
                     # 今天还没生成过：后台补一条，这轮先不带，下次问起就能对上
                     daily_life.ensure_today_async(self)
