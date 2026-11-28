@@ -62,6 +62,29 @@ def _logical_day(ts: float) -> str:
     return (datetime.fromtimestamp(ts) - timedelta(hours=LOGICAL_DAY_START_HOUR)).strftime("%Y-%m-%d")
 
 
+def _subject_key(text: str) -> str:
+    """一句话的主语/主题键，用来在召回结果里做「同一件事只留一条」。
+
+    识海里躺着四五条「我对萌王一心一意是…」，句子各不相同、说的是同一个人，
+    文本相似度抓不住（0.39），但开头是同一个主语。这里取「引号里的名字」，
+    没有引号就取开头一段（去掉标点），最长 12 字。
+    """
+    body = (text or "").strip()
+    quoted = re.search(r"「([^」]{1,12})」", body)
+    if quoted:
+        return "「" + quoted.group(1) + "」"
+    body = re.sub(r"^[\s\W_]+", "", body, flags=re.UNICODE)
+    return body[:8]
+
+
+def _token_jaccard(a: str, b: str) -> float:
+    """两个句子的二元组重合度（0~1）。主语相同 + 用词重合才算「同一件事的两种说法」。"""
+    ta, tb = _tokenize(a), _tokenize(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
 def _same_fact(a: str, b: str) -> bool:
     """两条记忆是不是同一件事。
 
@@ -164,6 +187,30 @@ class FourLayerMemory:
         self.graph_path = graph_path
         self.diary_path = diary_path
         self._graph = self._load_graph()
+        self._graph_mtime = self._current_mtime()
+
+    def _current_mtime(self) -> float:
+        try:
+            return self.graph_path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _maybe_reload_locked(self) -> None:
+        """文件被外部改过（整理脚本 / 手工编辑）就重新加载。
+
+        以前 `_save_graph_locked` 每次都把内存里那份整份写回：夜间跑完 prune 删掉的
+        重复节点，机器人下一句话一强化就被旧图覆盖回来。现在写盘前先看一眼 mtime。
+        """
+        mtime = self._current_mtime()
+        if mtime and mtime > self._graph_mtime + 0.5:
+            graph = self._load_graph()
+            self._graph = graph
+            self._graph_mtime = mtime
+            logger.info(
+                "🔄 识海文件被外部更新（%s），已重新加载 %d 条节点",
+                self.graph_path.name,
+                len(graph.get("nodes") or []),
+            )
 
     def _load_graph(self) -> dict[str, Any]:
         if self.graph_path.is_file():
@@ -179,6 +226,7 @@ class FourLayerMemory:
 
     def _save_graph_locked(self) -> None:
         _atomic_write_json(self.graph_path, self._graph)
+        self._graph_mtime = self._current_mtime()
 
     def _rebuild_edges_for_node_locked(self, new_node: dict[str, Any]) -> None:
         new_id = new_node["id"]
@@ -238,6 +286,7 @@ class FourLayerMemory:
         clean_tags = [str(t).strip()[:16] for t in (tags or []) if str(t).strip()][:6]
 
         with self._lock:
+            self._maybe_reload_locked()
             now = time.time()
             if (
                 source == "self"
@@ -303,13 +352,22 @@ class FourLayerMemory:
     ) -> list[dict[str, Any]]:
         """
         L1 识海召回算法：
-        分词（过滤虚词）-> 字面命中分 -> 沿标签边 2 跳图扩散 (×0.6) -> 有效权重加权 -> 低于 0.25 丢弃 -> 命中强化
+        分词（过滤虚词）-> 字面命中（按 IDF 加权，专有名词一个词就够）-> 标签召回
+        -> 沿标签边 2 跳图扩散 (×0.6) -> 有效权重加权 -> 低于阈值丢弃 -> 命中强化
+
+        2026-11-28：原来只有「字面命中 ≥2 个二元组」一条路，而识海里多是
+        「谁是谁/规则」这类元信息，群里聊装机、游戏时字面几乎零命中，注入率掉到 2%。
+        现在两条路并行：
+        - IDF 加权：一个高区分度的词（型号、人名、产品名）命中就够，不再要求凑两个；
+        - 标签召回：夜间提炼打的 tags（DLSS5/A卡/周浩楠/群梗…）直接参与打分，
+          太泛的分类标签（身份/习惯/项目，超过三成节点都有）自动忽略。
         """
         q_tokens = _tokenize(query)
         if not q_tokens:
             return []
 
         with self._lock:
+            self._maybe_reload_locked()
             now = time.time()
             nodes = self._graph["nodes"]
             if not nodes:
@@ -329,18 +387,53 @@ class FourLayerMemory:
             if not valid_nodes:
                 return []
 
-            denom = min(len(q_tokens), 4)
+            # 每个词的 IDF：越少节点提到它，它越能证明「这句就是在说这件事」
+            df: dict[str, int] = {}
+            for n in valid_nodes.values():
+                for tok in _tokenize(n["text"] + " " + " ".join(n.get("tags") or [])):
+                    df[tok] = df.get(tok, 0) + 1
+            node_total = len(valid_nodes)
+            idf = {tok: math.log((node_total + 1) / (cnt + 0.5)) for tok, cnt in df.items()}
+            max_idf = math.log((node_total + 1) / 1.5) or 1.0
+
             # 查询很短（1~2 个词）时命中 1 个就够，否则要求命中 min_literal 个
             min_hits = 1 if len(q_tokens) <= 2 else min_literal
             literal_scores: dict[str, float] = {}
             for nid, n in valid_nodes.items():
                 doc_tokens = _tokenize(n["text"] + " " + " ".join(n.get("tags") or []))
-                hits = len(q_tokens & doc_tokens)
-                if hits >= min_hits:
-                    literal_scores[nid] = min(1.0, hits / denom)
+                matched = q_tokens & doc_tokens
+                if not matched:
+                    continue
+                # 命中词的区分度之和决定这条记忆够不够格：
+                # 「大肥鱼」「群」这种到处都是的词几乎不加分，「dlss5」「枕猫」一个就顶用
+                rel = min(1.0, sum(idf.get(t, 0.0) for t in matched) / (2 * max_idf))
+                if len(matched) >= min_hits or rel >= 0.45:
+                    literal_scores[nid] = rel
 
-            if not literal_scores:
+            # 标签召回：tags 是夜间提炼时人工挑的词，比 2 字滑窗准
+            tag_index: dict[str, list[str]] = {}
+            for nid, n in valid_nodes.items():
+                for tag in n.get("tags") or []:
+                    body = str(tag).strip().lower()
+                    if len(body) >= 2:
+                        tag_index.setdefault(body, []).append(nid)
+            too_common = max(3, int(node_total * 0.3))
+            q_low = (query or "").lower()
+            tag_scores: dict[str, float] = {}
+            for tag, ids in tag_index.items():
+                if len(ids) > too_common:
+                    continue  # 分类标签（身份/习惯/项目），区分度为零
+                if tag not in q_low and not any(tok in tag for tok in q_tokens):
+                    continue
+                for nid in ids:
+                    tag_scores[nid] = min(0.85, tag_scores.get(nid, 0.0) + 0.55)
+
+            if not literal_scores and not tag_scores:
                 return []
+
+            relevance = dict(literal_scores)
+            for nid, sc in tag_scores.items():
+                relevance[nid] = max(relevance.get(nid, 0.0), sc)
 
             # 构建邻接表进行 2 跳图扩散
             adj: dict[str, list[tuple[str, float]]] = {}
@@ -377,7 +470,26 @@ class FourLayerMemory:
                     scored.append((final_score, node))
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            top_items = scored[:top_n]
+            # 同一件事/同一个主语不必占好几个位置：识海里常年躺着四五条「萌王是主开发者」，
+            # 以前 top5 全被它占满，等于每轮都在重复同一句话，还把真正相关的记忆挤掉。
+            top_items: list[tuple[float, dict[str, Any]]] = []
+            used_subjects: set[str] = set()
+            for sc, node in scored:
+                subject = _subject_key(node["text"])
+                if subject and subject in used_subjects:
+                    continue
+                if any(_same_fact(node["text"], picked["text"]) for _, picked in top_items):
+                    continue
+                top_items.append((sc, node))
+                if subject:
+                    used_subjects.add(subject)
+                if len(top_items) >= top_n:
+                    break
+            # 只留跟最相关那条分数差不多的：图扩散会把一串「沾点边」的旧事带上来，
+            # 全塞进提示词等于给模型一堆无关素材，反而带偏回复。
+            if len(top_items) > 1:
+                floor = max(score_threshold, top_items[0][0] * 0.55)
+                top_items = [(sc, n) for sc, n in top_items if sc >= floor]
 
             if reinforce and top_items:
                 for _, node in top_items:
@@ -391,10 +503,11 @@ class FourLayerMemory:
                 self._save_graph_locked()
 
             logger.info(
-                "L1 召回 %d 条｜阈值 %.2f｜字面 %d｜query=%s",
+                "L1 召回 %d 条｜阈值 %.2f｜字面 %d 条｜标签 %d 条｜query=%s",
                 len(top_items),
                 score_threshold,
-                min_literal,
+                len(literal_scores),
+                len(tag_scores),
                 " ".join((query or "").split())[:24],
             )
             return [
@@ -435,6 +548,7 @@ class FourLayerMemory:
         2. 非 core 且有效权重 < 0.06 淘汰
         """
         with self._lock:
+            self._maybe_reload_locked()
             now = time.time()
             nodes = self._graph["nodes"]
             merged_count = 0
@@ -662,6 +776,7 @@ class FourLayerMemory:
 
     def stats(self, group_id: str | None = None) -> dict[str, Any]:
         with self._lock:
+            self._maybe_reload_locked()
             nodes = self._graph["nodes"]
             dist = {"core": 0, "important": 0, "normal": 0}
             for n in nodes:
@@ -682,6 +797,117 @@ class FourLayerMemory:
                 "today_self_writes": self._count_today_self_writes_locked(time.time()),
                 "daily_limit": DAILY_SELF_LIMIT,
             }
+
+    # ------------------------------------------------------------------
+    # 维护接口（给 tools/nightly_memory.py 的 list / prune / forget 用）
+    # 以前识海里堆积的同义节点、违反「不记自己是什么」的元信息节点只能人工开 JSON 删，
+    # 现在统一走这里：先 dry-run 出清单，确认后再 apply，删前自动备份。
+    # ------------------------------------------------------------------
+    def list_nodes(self, group_id: str | None = None) -> list[dict[str, Any]]:
+        """节点快照（只读），按权重从高到低。"""
+        with self._lock:
+            self._maybe_reload_locked()
+            rows = [
+                {
+                    "id": n.get("id", ""),
+                    "text": n.get("text", ""),
+                    "level": n.get("level", "normal"),
+                    "tags": list(n.get("tags") or []),
+                    "group_id": n.get("group_id", ""),
+                    "hits": int(n.get("hits", 0)),
+                    "weight": float(n.get("weight", 1.0)),
+                    "created": float(n.get("created", 0)),
+                }
+                for n in self._graph["nodes"]
+                if not group_id or not n.get("group_id") or n.get("group_id") == group_id
+            ]
+        rows.sort(key=lambda r: (r["weight"], r["hits"]), reverse=True)
+        return rows
+
+    def find_duplicate_groups(
+        self, group_id: str | None = None, *, by_subject: bool = False
+    ) -> list[list[dict[str, Any]]]:
+        """找出本该合并的节点组，每组第一个是建议保留的那条（权重/命中更高）。
+
+        by_subject=True 时再认「同一个主语」：识海里那几条「我对萌王一心一意是…」
+        句子各不相同、文本相似度只有 0.39，_same_fact 抓不到，但开头是同一个主语。
+        """
+        with self._lock:
+            self._maybe_reload_locked()
+            snapshot = [
+                dict(n) for n in self._graph["nodes"]
+                if not group_id or not n.get("group_id") or n.get("group_id") == group_id
+            ]
+        snapshot.sort(key=lambda n: (float(n.get("weight", 1.0)), int(n.get("hits", 0))), reverse=True)
+
+        groups: list[list[dict[str, Any]]] = []
+        for node in snapshot:
+            for g in groups:
+                head = g[0]
+                if head.get("level") != node.get("level"):
+                    continue
+                if head.get("group_id", "") != node.get("group_id", ""):
+                    continue
+                same = _same_fact(head.get("text", ""), node.get("text", ""))
+                if not same and by_subject:
+                    # 只认「同一个主语 + 用词也重合」：光同主语会把「ㅤㅤㅤ爱装机」和
+                    # 「ㅤㅤㅤ想用 scrcpy」并成一条，那是两件事，不是同义节点。
+                    same = (
+                        _subject_key(head.get("text", "")) == _subject_key(node.get("text", ""))
+                        and _token_jaccard(head.get("text", ""), node.get("text", "")) >= 0.18
+                    )
+                if same:
+                    g.append(node)
+                    break
+            else:
+                groups.append([node])
+        return [g for g in groups if len(g) > 1]
+
+    def merge_nodes(self, keep_id: str, drop_ids: list[str]) -> int:
+        """把 drop_ids 并进 keep_id（命中数相加、标签取并集），返回删掉几条。
+
+        不做备份由调用方负责——整理脚本会先调用 backup_memory()。
+        """
+        drop = {i for i in drop_ids if i and i != keep_id}
+        if not drop:
+            return 0
+        with self._lock:
+            keep = next((n for n in self._graph["nodes"] if n.get("id") == keep_id), None)
+            if keep is None:
+                return 0
+            removed = [n for n in self._graph["nodes"] if n.get("id") in drop]
+            keep["hits"] = int(keep.get("hits", 0)) + sum(int(n.get("hits", 0)) for n in removed)
+            keep["weight"] = max(
+                [float(keep.get("weight", 1.0))] + [float(n.get("weight", 1.0)) for n in removed]
+            )
+            keep["tags"] = list(
+                dict.fromkeys((keep.get("tags") or []) + [t for n in removed for t in (n.get("tags") or [])])
+            )[:8]
+            keep["updated"] = time.time()
+            self._graph["nodes"] = [n for n in self._graph["nodes"] if n.get("id") not in drop]
+            kept_ids = {n.get("id") for n in self._graph["nodes"]}
+            self._graph["edges"] = [
+                e for e in self._graph["edges"] if e[0] in kept_ids and e[1] in kept_ids
+            ]
+            self._save_graph_locked()
+            return len(removed)
+
+    def forget(self, ids: list[str]) -> int:
+        """按 id 删节点（连带清边），返回删掉的条数。备份由调用方负责。"""
+        drop = {i for i in ids if i}
+        if not drop:
+            return 0
+        with self._lock:
+            before = len(self._graph["nodes"])
+            self._graph["nodes"] = [n for n in self._graph["nodes"] if n.get("id") not in drop]
+            kept_ids = {n.get("id") for n in self._graph["nodes"]}
+            self._graph["edges"] = [
+                e for e in self._graph["edges"] if e[0] in kept_ids and e[1] in kept_ids
+            ]
+            removed = before - len(self._graph["nodes"])
+            if removed:
+                self._save_graph_locked()
+            return removed
 
 
 memory_store = FourLayerMemory()
