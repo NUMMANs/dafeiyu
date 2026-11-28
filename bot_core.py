@@ -1,3 +1,4 @@
+import difflib
 import logging
 import json
 import random
@@ -162,6 +163,14 @@ def humanize_job_announcement(text: str, limit: int = 120) -> str:
     return out
 
 
+def _norm_for_dup(text: str) -> str:
+    """复读比对用的归一化：去掉空白、标点、emoji，只留字和数字。
+
+    「笑死，这也太离谱了」和「笑死 这也太离谱了！」算同一句。
+    """
+    return re.sub(r"[\s\W_]+", "", text or "", flags=re.UNICODE)
+
+
 @dataclass
 class BotResponse:
     should_reply: bool
@@ -313,6 +322,63 @@ class DaFeiYuBotCore:
         now = time.time()
         self._sticker_sent_ts = [t for t in self._sticker_sent_ts if now - t < 3600]
         return len(self._sticker_sent_ts) < settings.STICKER_MAX_PER_HOUR
+
+    def _ensure_group_baselines(self, group_id: str, now: float | None = None) -> None:
+        """把「群里最后一次动静」「我最后一次说话」从聊天记录补回内存。
+
+        2026-11-28 复盘：wxauto 一整天每 3~5 分钟重连一次，实例跟着重建，两个内存
+        时间戳每次都被清零。冷场分享因此永远从「此刻」重新计时，全天 0 次触发；
+        晚间问候那条更严重——`get(group_id, 0.0)` 默认 0，重启后直接当成「安静了 50 年」。
+        聊天记录里的 created_ts 是持久化的，用它把基线补回来。
+        """
+        now = time.time() if now is None else now
+        if not self._last_group_activity_ts.get(group_id):
+            ts = pet_engine.last_message_ts(group_id)
+            self._last_group_activity_ts[group_id] = ts or now
+        if not self._last_bot_reply_ts.get(group_id):
+            ts = pet_engine.last_message_ts(group_id, role="assistant")
+            if ts:
+                self._last_bot_reply_ts[group_id] = ts
+
+    def _looks_like_repeat(
+        self, group_id: str, text: str, *, window_sec: float = 2700.0, limit: int = 6
+    ) -> str:
+        """这句话是不是她刚说过（原样或只换了标点）。撞上了就返回那句原话，否则空串。
+
+        2026-11-27 夜间复盘：同一句「咸蛋黄冰淇淋」在半小时里连发 4 遍。
+        群友不会用同一句话回答四个不同的问题，宁可这一轮不开口。
+        太短的（“哈哈哈”“就这”）不拦——那是口头禅，重复是正常的。
+        """
+        body = _norm_for_dup(text)
+        if len(body) < 8:
+            return ""
+        now = time.time()
+        for row in reversed(pet_engine.get_recent_history(group_id, limit=limit)):
+            if (row.get("role") or "") != "assistant":
+                continue
+            created = float(row.get("created_ts") or 0)
+            if created and (now - created) > window_sec:
+                break
+            prev_text = str(row.get("content") or "")
+            prev = _norm_for_dup(prev_text)
+            if len(prev) < 8:
+                continue
+            if prev == body or difflib.SequenceMatcher(None, prev, body).ratio() >= 0.9:
+                return prev_text
+        return ""
+
+    def _guard_repeat(self, group_id: str, text: str) -> bool:
+        """复读闸门：命中就记日志并返回 True（调用方据此不发）。"""
+        hit = self._looks_like_repeat(group_id, text)
+        if not hit:
+            return False
+        logger.info(
+            "[%s] 🙅 这句刚说过，这轮不开口（避免复读）: %s ｜ 原话: %s",
+            group_id,
+            " ".join(text.split())[:40],
+            " ".join(hit.split())[:40],
+        )
+        return True
 
     def _resolve_sticker(
         self,
@@ -1917,6 +1983,12 @@ class DaFeiYuBotCore:
                 brain_reply.vision_summary,
             )
 
+        # 6.5 复读闸门：同一句话半小时内说过就别再说一遍
+        # （2026-11-27 复盘：同一句「咸蛋黄冰淇淋」连发 4 遍）。放在记账之前，
+        # 免得「没说出口的话」也被算成一次发言、把 120 秒粘性窗口顶起来。
+        if self._guard_repeat(group_id, brain_reply.text):
+            return BotResponse(should_reply=False, mood="sleepy", status=status)
+
         # 7. 更新养成数值（吃掉 Token = 吃白饭）
         new_status = pet_engine.record_interaction(
             group_id=group_id,
@@ -2006,6 +2078,9 @@ class DaFeiYuBotCore:
             exp_delta=5,
             affinity_delta=0,
         )
+        # 补刀也过一遍复读闸门：热力高时她一晚上能补好几次，最容易说出同一句
+        if self._guard_repeat(group_id, chime.text):
+            return BotResponse(should_reply=False, mood="sleepy", status=new_status)
         sticker_path = self._resolve_sticker(
             chime.mood, chime.sticker_request, chime.sticker_caption or None, context=chime.text
         )
@@ -2379,6 +2454,8 @@ class DaFeiYuBotCore:
         now = time.time()
         dt = datetime.now()
         status = pet_engine.get_status()
+        # 重启后内存基线是空的，先从聊天记录补回来，否则下面所有「安静多久」都从此刻重新算
+        self._ensure_group_baselines(group_id, now)
 
         # 0. 每晚 23:45 之后自动执行四层记忆夜间养护（写 L2 日记 + L1 巩固合并淘汰 + 周日周结 + 自动备份）
         self._maybe_run_nightly_maintenance(group_id, status)
@@ -2435,7 +2512,8 @@ class DaFeiYuBotCore:
         dt = datetime.now()
         today = dt.strftime("%Y-%m-%d")
         if dt.hour == 20 and self._last_evening_bubble_date.get(group_id) != today:
-            last_act = self._last_group_activity_ts.get(group_id, 0.0)
+            # 默认值不能给 0.0：重启后会被当成「安静了几十年」，一上线就发晚间问候
+            last_act = self._last_group_activity_ts.get(group_id) or now
             if (now - last_act) >= 5400:
                 self._last_evening_bubble_date[group_id] = today
                 bubble = brain.generate_autonomous_bubble("evening", status)
@@ -2479,9 +2557,10 @@ class DaFeiYuBotCore:
                 return
         last_act = self._last_group_activity_ts.get(group_id)
         if last_act is None:
-            # 进程刚重启时没有基线：以此刻为起点，别一上线就往群里塞话题
-            self._last_group_activity_ts[group_id] = now
-            return
+            # 进程刚重启时没有基线：先用聊天记录里最后一条消息的时间
+            # （以前直接以此刻为起点，等于每次重连都重新等 60 分钟，冷场分享永远是 0 次）
+            last_act = pet_engine.last_message_ts(group_id) or now
+            self._last_group_activity_ts[group_id] = last_act
         silence_sec = tuning.get_int(
             "TOPIC_SHARE_SILENCE_MIN", settings.TOPIC_SHARE_SILENCE_MIN
         ) * 60

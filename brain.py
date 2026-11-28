@@ -1559,6 +1559,12 @@ class DaFeiYuBrain:
                 raw_content, "shocked" if used_vision else status.mood_tag
             )
             bubbles = split_human_bubbles(cleaned or f"网卡了一下 刚才说啥来着{tail_word}")
+            # 智谱视觉挂了、退回 DeepSeek 原生看图时没走 describe 那一步，vision_summary 是空的，
+            # 图片摘要就永远写不回历史，下次追问她等于失忆。用她这轮的回复兜底当摘要。
+            if not vision_summary and used_vision and image_path is not None:
+                vision_summary = re.sub(r"\s+", " ", cleaned or "").strip()[
+                    : tuning.get_int("VISION_SUMMARY_CHARS", 220)
+                ]
             return BrainReply(
                 text="\n".join(bubbles),
                 bubbles=bubbles,
@@ -1684,11 +1690,12 @@ class DaFeiYuBrain:
             f"我刚说完话之后的群聊：\n{ctx}\n\n"
             f"待判断的新消息 [{sender}]：{probe}\n"
             f"这条新消息同时 @ 了群里其他人：{'是' if at_others else '否'}\n\n"
-            f"满足以下任一才输出 YES：\n"
-            f"1) 在回应、追问或点评我刚才说的内容；\n"
-            f"2) 上下文中只有我刚说过话，这句明显是接着我的话往下说。\n\n"
+            f"满足以下三条**全部**才输出 YES，缺一条就 NO：\n"
+            f"1) 这句是在回应、追问或点评我刚说的具体内容（只是聊到同一类话题不算）；\n"
+            f"2) 说话人明显在等我接（问我、点名我、接着我原话吐槽或反驳、催我干活）；\n"
+            f"3) 我上一句之后还没有别人替我把话接过去（对方已经得到回答就算过去了）。\n\n"
             f"其余一律输出 NO，例如：跟其他群友互相聊天、明显在 @ 别人、开新话题、"
-            f"自言自语、单纯发感叹或表情、在议论第三个人。\n"
+            f"自言自语、单纯发感叹或表情、在议论第三个人、只是碰巧聊到我喜欢的游戏吃喝。\n"
             f"{extra_block}\n"
             f"只输出 YES 或 NO，不要解释。"
         )

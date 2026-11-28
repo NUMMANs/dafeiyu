@@ -48,7 +48,18 @@ class WxAutoAdapter:
         self._warned_groups: set[str] = set()
         # 启动后真的收到过消息的群。用于判断群名是否正确：
         # 从没收到过消息的群，SendMsg 很可能因为「找不到会话」而漂移到当前打开的聊天窗口。
+        # 2026-11-28：微信连接每几分钟就重连一次、实例跟着重建，只靠「本进程收到过消息」
+        # 会让这个集合一直是空的 → 主动冒泡全天被跳过。聊天记录里有过消息的群同样说明群名是真的，
+        # 所以启动时用 db 回填一次。
         self._seen_groups: set[str] = set()
+        try:
+            for g in self.groups:
+                if pet_engine.last_message_ts((g or "").strip()) > 0:
+                    self._seen_groups.add((g or "").strip())
+        except Exception as exc:  # noqa: BLE001 - 回填失败不该拖垮适配器
+            logger.warning("群活性基线回填失败（不影响收发，只是先不主动冒泡）: %s", exc)
+        if self._seen_groups:
+            logger.info("📚 已有聊天记录的群（可直接主动冒泡）: %s", sorted(self._seen_groups))
 
     # ------------------------------------------------------------------
     # 群白名单：所有「主动发消息」都必须先过这一关
@@ -581,7 +592,7 @@ class WxAutoAdapter:
                             if group not in self._warned_groups:
                                 self._warned_groups.add(group)
                                 logger.warning(
-                                    "[%s] 启动后从未收到该群消息，暂不主动冒泡（请确认群名与微信里完全一致）",
+                                    "[%s] 本进程没收到过该群消息、聊天记录里也查不到，先不主动冒泡（请确认群名与微信里完全一致）",
                                     group,
                                 )
                             continue

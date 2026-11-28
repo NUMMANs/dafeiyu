@@ -364,6 +364,25 @@ class PetEngine:
             )
             self._conn.commit()
 
+    def last_message_ts(self, group_id: str, role: str | None = None) -> float:
+        """这个群最后一条历史消息的时间（可限定 role="assistant" 只看她自己说的）。
+
+        用途：进程刚重启时内存里的「群里最后一次动静」是空的，而 wxauto 一天会重连
+        几十次、回回重建实例——以前每次重启都从「此刻」重新计时，冷场分享永远等不够，
+        现在用 db 里的真实时间戳把基线补回来。
+        """
+        sql = "SELECT MAX(created_ts) FROM chat_history WHERE group_id = ?"
+        args: list[Any] = [group_id]
+        if role:
+            sql += " AND role = ?"
+            args.append(role)
+        with self._lock:
+            row = self._conn.execute(sql, args).fetchone()
+        try:
+            return float(row[0] or 0.0)
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+
     def get_recent_history(self, group_id: str, limit: int = 12) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

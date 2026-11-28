@@ -50,6 +50,34 @@ MIN_LITERAL_HITS = 2
 REINFORCE_CAP_MULT = 2.0
 REINFORCE_STEP = 0.08
 
+# 逻辑日以 04:00 为界。
+# 夜间任务（0:15 / 0:45）写的是「昨天」的事，时间戳却落在新的一天；
+# 按自然日算额度的话，零点后的每一条写入都会吃掉新一天的 DAILY_SELF_LIMIT，
+# 白天再想记东西就被「今天已达上限」挡住。
+LOGICAL_DAY_START_HOUR = 4
+
+
+def _logical_day(ts: float) -> str:
+    """时间戳属于哪个逻辑日（凌晨 0~4 点算前一天）。"""
+    return (datetime.fromtimestamp(ts) - timedelta(hours=LOGICAL_DAY_START_HOUR)).strftime("%Y-%m-%d")
+
+
+def _same_fact(a: str, b: str) -> bool:
+    """两条记忆是不是同一件事。
+
+    除文本相似度外，再认一种「包含关系」：短的那句整句出现在长句里
+    （「我对萌王一心一意」/「萌王是主开发者，我对萌王一心一意」）。
+    0.78 的相似度阈值对这类改写不敏感，2026-11-27 的复盘里就积了 3 条同义节点。
+    """
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    if SequenceMatcher(None, a, b).ratio() >= 0.78:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 8 and short in long
+
 # 虚词过滤表（避免“她的/这个/就是”误召回无关记忆）
 STOPWORDS = {
     "的", "了", "是", "在", "我", "你", "他", "她", "它", "们", "这", "那",
@@ -170,12 +198,13 @@ class FourLayerMemory:
                 existing_pairs.add((new_id, oid))
 
     def _count_today_self_writes_locked(self, now: float) -> int:
-        today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        # 按逻辑日（04:00 为界）算，别让夜间任务把新一天的额度吃掉
+        today = _logical_day(now)
         cnt = 0
         for n in self._graph["nodes"]:
             if n.get("source") == "self":
                 ts = float(n.get("created", 0))
-                if ts > 0 and datetime.fromtimestamp(ts).strftime("%Y-%m-%d") == today:
+                if ts > 0 and _logical_day(ts) == today:
                     cnt += 1
         return cnt
 
@@ -217,11 +246,10 @@ class FourLayerMemory:
             ):
                 return False, f"今天主动记忆已达上限（{DAILY_SELF_LIMIT} 条），防膨胀拒绝写入"
 
-            # 去重：如果已有高度相似节点（>=0.82），直接强化旧节点而不是重复写
+            # 去重：同一件事（高相似或整句包含）就强化旧节点，不再重复写
             for existing in self._graph["nodes"]:
                 if existing.get("group_id", "") == group_id:
-                    sim = SequenceMatcher(None, existing["text"], clean_text).ratio()
-                    if sim >= 0.82:
+                    if _same_fact(existing["text"], clean_text):
                         existing["updated"] = now
                         existing["hits"] = int(existing.get("hits", 0)) + 1
                         existing["weight"] = round(float(existing.get("weight", 1.0)) + 0.2, 3)
@@ -403,7 +431,7 @@ class FourLayerMemory:
         """
         夜间养护：
         0. 权重归一（把历史命中强化堆出来的超高权重压回等级上限）
-        1. 同 level 同群文本相似度 >= 0.78 合并
+        1. 同 level 同群「同一件事」的合并（相似度 ≥0.78，或短句整句被长句包含）
         2. 非 core 且有效权重 < 0.06 淘汰
         """
         with self._lock:
@@ -421,13 +449,13 @@ class FourLayerMemory:
                     n["weight"] = cap
                     clamped_count += 1
 
-            # 1. 同 level 内相似度 >= 0.78 合并
+            # 1. 同 level 内是同一件事的就合并（高相似，或短句整句被长句包含）
             kept: list[dict[str, Any]] = []
             for node in sorted(nodes, key=lambda n: _effective_weight(n, now), reverse=True):
                 found_dup = False
                 for k in kept:
                     if k["level"] == node["level"] and k.get("group_id", "") == node.get("group_id", ""):
-                        if SequenceMatcher(None, k["text"], node["text"]).ratio() >= 0.78:
+                        if _same_fact(k["text"], node["text"]):
                             k["hits"] = int(k.get("hits", 0)) + int(node.get("hits", 0))
                             k["tags"] = list(dict.fromkeys((k.get("tags") or []) + (node.get("tags") or [])))[:8]
                             merged_count += 1
