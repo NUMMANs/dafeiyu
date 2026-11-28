@@ -12,7 +12,13 @@ STICKERS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 加载 .env（如不存在则回退环境变量）
-load_dotenv(BASE_DIR / ".env")
+#
+# override=True 是必须的：`load_dotenv` 默认不覆盖已存在的环境变量，而看门狗
+# 进程自己也是 Python、启动时已经把当时的 .env 读进了 os.environ。它拉起主进程时
+# 这些变量被继承下去，于是「改了 .env → 重启 → 还是老配置」（2026-11-28 实测：
+# 白名单从两个群改成一个群，重启后日志仍打印两个群）。.env 才是这个项目的配置来源，
+# 让它覆盖继承来的旧值。
+load_dotenv(BASE_DIR / ".env", override=True)
 
 
 def _parse_bool(val: str | None, default: bool = True) -> bool:
