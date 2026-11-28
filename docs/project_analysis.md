@@ -485,19 +485,27 @@ uvicorn.run(app, host=settings.WEB_HOST, port=settings.WEB_PORT)
 - 每日自写上限 8 条；AI 不能写 `core`（`source=self` 时降级为 important）；
 - 隐私正则拦截 `sk-*`、password、身份证、银行卡；
 - 容量上限 5000，超出按 `(是否 core, 有效权重)` 排序裁剪；
-- 夜间 `consolidate`：同 level 相似度 ≥0.78 合并，非 core 且有效权重 <0.06 淘汰。
+- 夜间 `consolidate`：同 level「同一件事」合并（相似度 ≥0.78，或短句整句被长句包含），非 core 且有效权重 <0.06 淘汰；
+- 每日自写额度按**逻辑日（04:00 为界）**计，夜间任务写「昨天」的事不吃当天的额度。
 
 #### 3.7.2 召回算法
 
 `recall()`（`:226-323`）流程：
 
-1. 查询分词：中文 2 字滑窗 + 单字 + 英文/数字词，过滤虚词；
+1. 查询分词：中文 2 字二元组 + 英文/数字词，过滤虚词（不产单字，单字是噪声主源）；
 2. 群隔离：只保留当前群 + 全局（`group_id==""`）节点；
-3. 字面分：`min(1.0, 命中 token 数 / min(query token 数, 4))`；
-4. 图扩散：沿标签边 1 跳、2 跳，边权 0.6 累乘；
-5. 有效权重：`base * owner_mult * exp(-days/half_life)`；
-6. 最终分：`relevance * (0.5 + min(eff_w,12)/24)`，阈值 0.25，取 top 5；
-7. 命中强化：hits+1、weight+0.08、updated=now，并**立即全量写回 JSON**。
+3. 字面分（IDF 加权）：`rel = min(1.0, Σidf(命中词) / (2×max_idf))`，`idf = log((N+1)/(df+0.5))`；
+   命中数够 `MIN_LITERAL_HITS` 或区分度足够（`rel≥0.45`，一个型号/人名即可）就算命中；
+4. 标签召回：夜间提炼打的 tags 直接打分（命中 0.55，两条封顶 0.85），
+   出现率 >30% 的分类标签（身份/习惯/项目/约定）忽略，避免满屏召回；
+5. 图扩散：沿标签边 1 跳、2 跳，边权 0.6 累乘；
+6. 有效权重：`base * owner_mult * exp(-days/half_life)`；
+7. 最终分：`relevance * (0.5 + min(eff_w,12)/24)`，阈值 0.25，取 top 5；
+   取 top 前先按「同主语只留一条」（`_subject_key`）去重，并丢掉低于最高分 55% 的扩散尾巴；
+8. 命中强化：hits+1、weight+0.08、updated=now，并**立即全量写回 JSON**
+   （写盘前先比对文件 mtime，外部脚本改过就重新加载，不会被内存旧图覆盖）；
+9. 维护入口：`tools/nightly_memory.py nodes / prune / forget`，`prune` 默认干跑、
+   `--apply` 前自动备份（合并同义、删「我是机器人」类元信息、可选清技术待办）。
 
 #### 3.7.3 优点与隐患
 
